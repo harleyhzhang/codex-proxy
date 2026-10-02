@@ -1,0 +1,19 @@
+{
+  "name": "codex-subscription-proxy",
+  "version": "1.0.0",
+  "description": "Use your Claude and Grok subscriptions as models inside OpenAI Codex, alongside GPT, in the same chat.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "bin": { "codex-subscription-proxy": "src/main.ts" },
+  "exports": "./src/index.ts",
+  "engines": { "bun": ">=1.2" },
+  "scripts": {
+    "start": "bun src/main.ts",
+    "catalog": "bun src/catalog.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun run typecheck && bun test"
+  },
+  "devDependencies": { "@types/bun": "^1.2.0", "typescript": "^5.9.2" }
+}
