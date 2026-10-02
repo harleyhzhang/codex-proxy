@@ -10,6 +10,7 @@ import { assertRoutable, backendFor, isLocalModel } from '../backends/registry';
 import { isRecord, randomId, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
+import { pendingResponse, pendingStream } from '../protocol/pending';
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
@@ -31,6 +32,8 @@ export type RouterOptions = {
   upstreamFetch?: UpstreamFetch;
   /** Whole-request cap for GPT calls; long compactions can exceed several minutes. */
   upstreamTimeoutMs?: number;
+  /** Progress cadence for buffered subscription responses. */
+  heartbeatMs?: number;
   bridgeModels?: readonly string[];
 };
 
@@ -157,6 +160,11 @@ export function startRouter(options: RouterOptions) {
     return compacted;
   }
 
+  const pendingFailure = (error: unknown): Record<string, unknown> => {
+    const network = transportError(error);
+    return network ? transportFailureEvent(network) : terminalEvent(error instanceof BackendError ? error : new BackendError(GENERIC_FAILURE));
+  };
+
   async function handleHttp(req: Request, path: string): Promise<Response> {
     if (req.method !== 'POST') return invalidRequest('Unsupported method', 405);
     let streaming = false;
@@ -165,11 +173,13 @@ export function startRouter(options: RouterOptions) {
       streaming = raw.stream === true;
       const body = await normalize(raw, req.headers);
       if (isCompaction(body)) {
+        if (body.stream && isLocalModel(body.model)) return pendingStream(body, signal => compact(body, req.headers, signal), req.signal, pendingFailure, response => history.remember(body, response), options.heartbeatMs);
         const response = await compact(body, req.headers, req.signal);
         return body.stream ? streamResponse(response) : Response.json(response);
       }
       if (isLocalModel(body.model)) {
         if (path !== '/v1/responses') return invalidRequest('Use Codex local compaction for subscription models');
+        if (body.stream) return pendingStream(body, signal => localResponse(body, signal), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
         const response = await localResponse(body, req.signal);
         if (body.generate !== false) history.remember(body, response);
         return body.stream ? streamResponse(response) : Response.json(response);
@@ -226,7 +236,6 @@ export function startRouter(options: RouterOptions) {
     ws.data.abort = controller;
     ws.data.busy = true;
     const live = () => !controller.signal.aborted;
-    const replay = (response: ResponseObject) => sseEvents(streamResponse(response), (event) => live() && send(event));
 
     try {
       if (typeof data !== 'string' || Buffer.byteLength(data) > MAX_BODY_BYTES) throw new Error('Invalid message size');
@@ -242,11 +251,10 @@ export function startRouter(options: RouterOptions) {
         history.remember(body, warm);
         await sseEvents(streamResponse(warm), send);
       } else if (isCompaction(body)) {
-        await sseEvents(streamResponse(await compact(body, ws.data.headers, controller.signal)), send);
+        if (isLocalModel(body.model)) await pendingResponse(body, signal => compact(body, ws.data.headers, signal), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
+        else await sseEvents(streamResponse(await compact(body, ws.data.headers, controller.signal)), send);
       } else if (isLocalModel(body.model)) {
-        const response = await localResponse(body, controller.signal);
-        history.remember(body, response);
-        await replay(response);
+        await pendingResponse(body, signal => localResponse(body, signal), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
       } else {
         await relayUpstreamStream(body, ws.data.headers, controller.signal, (event) => live() && send(event), send);
       }

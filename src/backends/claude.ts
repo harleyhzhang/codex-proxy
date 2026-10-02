@@ -6,7 +6,7 @@ import { positiveInt } from '../env';
 import { isRecord, randomId } from '../json';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
-import { transportError } from '../transport';
+import { reconnectTransport, transportError } from '../transport';
 import { claudeLimits, ClaudeUsageLimitError } from './claude-limits';
 import { estimateVisibleTokens, type SubscriptionBackend } from './contract';
 
@@ -362,6 +362,10 @@ function parseStructured(result: ClaudeResult): StructuredOutput {
 }
 
 export async function runClaude(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+  return reconnectTransport(() => runClaudeOnce(request, signal), signal);
+}
+
+async function runClaudeOnce(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
   signal?.throwIfAborted();
   claudeLimits.assertAvailable(request.model);
   const { worker, result } = await runTurn(request, signal);

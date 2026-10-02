@@ -18,7 +18,7 @@ const NETWORK_MESSAGE =
 
 /** A dropped or timed-out connection. Codex retries these on its own. */
 export class ProxyTransportError extends Error {
-  constructor(timedOut = false) {
+  constructor(readonly timedOut = false, readonly reconnectable = !timedOut) {
     super(
       timedOut
         ? 'Model connection timed out. Retrying.'
@@ -40,7 +40,8 @@ export function transportError(error: unknown): ProxyTransportError | undefined 
     seen.add(current);
     const code = typeof current.code === 'string' ? current.code : '';
     const message = typeof current.message === 'string' ? current.message : '';
-    if (current.name === 'TimeoutError' || TIMEOUT_CODES.has(code)) return new ProxyTransportError(true);
+    if (current.name === 'TimeoutError') return new ProxyTransportError(true);
+    if (TIMEOUT_CODES.has(code)) return new ProxyTransportError(true, true);
     if (NETWORK_CODES.has(code) || NETWORK_MESSAGE.test(message)) return new ProxyTransportError();
     if (message.startsWith('Claude CLI timed out after')) return new ProxyTransportError(true);
     current = current.cause;
@@ -66,4 +67,28 @@ export function failureStream(event: unknown): Response {
   return new Response(`event: response.failed\ndata: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`, {
     headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
   });
+}
+
+// Buffered backends have not delivered text or tool calls yet. Keep the same request pending
+// through an outage instead of consuming Codex's finite stream-reconnect budget. A real model
+// timeout, auth/quota refusal or cancellation still follows its existing terminal/retry path.
+export async function reconnectTransport<T>(attempt: () => Promise<T>, signal?: AbortSignal,
+  options: { initialDelayMs?: number; maxDelayMs?: number } = {}): Promise<T> {
+  let delay = options.initialDelayMs ?? 1000;
+  const maxDelay = options.maxDelayMs ?? 30_000;
+  for (;;) {
+    signal?.throwIfAborted();
+    try { return await attempt(); }
+    catch (error) {
+      if (signal?.aborted) throw transportError(error) ? signal.reason : error;
+      const network = transportError(error);
+      if (!network || !network.reconnectable) throw error;
+      await new Promise<void>((resolve, reject) => {
+        const cancel = () => { clearTimeout(timer); reject(signal!.reason); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, delay);
+        signal?.addEventListener('abort', cancel, { once: true });
+      });
+      delay = Math.min(delay * 2, maxDelay);
+    }
+  }
 }

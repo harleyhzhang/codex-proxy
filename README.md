@@ -40,6 +40,18 @@ model_catalog_json = "/Users/you/.codex-subscription-proxy/models.json"  # absol
 Restart Codex. Claude and Grok now appear in the model picker. Re-run `bun run catalog` after
 Codex updates its own model list.
 
+## Connection recovery
+
+Claude requests stay pending through temporary connection failures. The proxy retries with
+backoff from 1 to 30 seconds and sends progress events every 10 seconds, so an outage does not
+consume Codex's stream reconnect budget. Recovery preserves the original request and tool
+receipts. Stop/cancel also stops the pending request and retries.
+
+Authentication, quota and validation errors still fail promptly. The per-turn model deadline
+remains separate from connection timeouts. GPT stream failures continue through Codex's own
+reconnect path; this change applies to buffered Claude requests. Reload a running proxy after
+updating its source.
+
 ## Configuration
 
 Everything has a default; set only what you need.
