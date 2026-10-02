@@ -23,8 +23,8 @@ Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT mode
 ## Quick start
 
 ```sh
-git clone https://github.com/harleyhzhang/codex-subscription-proxy
-cd codex-subscription-proxy
+git clone https://github.com/harleyhzhang/codex-proxy
+cd codex-proxy
 bun install
 bun run catalog   # writes ~/.codex-subscription-proxy/models.json
 bun start         # listens on http://127.0.0.1:3468
