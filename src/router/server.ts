@@ -7,7 +7,7 @@ import { onClaudeRateLimit } from '../backends/claude';
 import { claudeLimits, claudeUsageSnapshot, type ClaudeUsage } from '../backends/claude-limits';
 import { BackendError, terminalEvent } from '../backends/contract';
 import { assertRoutable, backendFor, isLocalModel } from '../backends/registry';
-import { isRecord, randomId, type JsonRecord } from '../json';
+import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
 import { pendingResponse, pendingStream } from '../protocol/pending';
@@ -91,12 +91,17 @@ export function startRouter(options: RouterOptions) {
   const codec = options.summaryKeyFile ? new SummaryCodec(readFileSync(options.summaryKeyFile)) : undefined;
   if (stateDir) trackClaudeUsage(join(stateDir, 'claude-usage.json'));
 
+  const bridgeFlights = new Map<string, Promise<string>>();
+
   /** A bridge that reads OpenAI ciphertext with the caller's own credentials. */
   const bridgeFor = (headers: Headers): CompactionBridge | undefined => {
     if (!codec || !stateDir) return undefined;
+    const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
+    // Only identical effective request contexts share a flight; keep credentials out of its key.
+    const scope = sha256(JSON.stringify(Array.from(forwarded.entries()).sort(([a], [b]) => a.localeCompare(b))));
     const call = (body: ResponsesBody) =>
-      postJson(upstreamFetch, '/responses', jsonHeaders(headers, { stripCodexMetadata: true }), body, AbortSignal.timeout(BRIDGE_TIMEOUT_MS));
-    return new CompactionBridge(codec, join(stateDir, 'bridged'), call, options.bridgeModels ?? DEFAULT_BRIDGE_MODELS);
+      postJson(upstreamFetch, '/responses', forwarded, body, AbortSignal.timeout(BRIDGE_TIMEOUT_MS));
+    return new CompactionBridge(codec, join(stateDir, 'bridged'), call, options.bridgeModels ?? DEFAULT_BRIDGE_MODELS, { scope, jobs: bridgeFlights });
   };
 
   /** Validates routing, expands history and makes GPT-only content readable for the target model. */
