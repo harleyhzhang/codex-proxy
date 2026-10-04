@@ -6,6 +6,7 @@ import { pendingResponse, pendingStream } from '../src/protocol/pending';
 import { responseObject } from '../src/protocol/output';
 import { startRouter } from '../src/router/server';
 import { sseEvents } from '../src/protocol/stream';
+import type { ResponsesBody } from '../src/protocol/types';
 import { claudeLimits, claudeUsageSnapshot } from '../src/backends/claude-limits';
 import { runClaude } from '../src/backends/claude';
 
@@ -40,16 +41,30 @@ test('auth, quota, validation and model timeouts do not become endless offline r
 });
 
 test('heartbeats preserve one response id and emit validated tool calls exactly once', async () => {
-  const request = { model: 'claude-opus-5-5', input: 'original' };
+  const request: ResponsesBody = {
+    model: 'claude-opus-5-5',
+    input: 'original',
+    tools: [{ type: 'function', name: 'step' }, { type: 'custom', name: 'patch' }, { type: 'tool_search' }],
+  };
+  const patch = '*** Begin Patch\n+snowman ☃; literal \\n\n*** End Patch';
   const events: Record<string, unknown>[] = [];
   let remembered = '';
   await pendingResponse(request, async () => {
     await Bun.sleep(35);
-    return responseObject(request, { text: 'Recovered', toolCalls: [{ name: 'step', arguments: '{}', callId: 'call_once' }], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } });
+    return responseObject(request, { text: 'Recovered', toolCalls: [
+      { name: 'step', arguments: '{}', callId: 'call_once' },
+      { name: 'patch', arguments: patch, callId: 'call_patch' },
+      { name: '__codex_tool_search', arguments: '{"query":"read files","limit":8}', callId: 'call_search' },
+    ], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } });
   }, new AbortController().signal, event => events.push(event), response => { remembered = response.id; }, 5);
   expect(events.filter(event => event.type === 'response.in_progress').length).toBeGreaterThan(0);
   expect(events.filter(event => event.type === 'response.created')).toHaveLength(1);
   expect(events.filter(event => event.type === 'response.output_item.done' && (event.item as { type: string }).type === 'function_call')).toHaveLength(1);
+  expect(events.find(event => event.type === 'response.custom_tool_call_input.delta')?.delta).toBe(patch);
+  const completedItems = events.filter(event => event.type === 'response.output_item.done').map(event => event.item);
+  expect(completedItems).toHaveLength(4);
+  expect(completedItems[2]).toMatchObject({ type: 'custom_tool_call', call_id: 'call_patch', input: patch });
+  expect(completedItems[3]).toMatchObject({ type: 'tool_search_call', call_id: 'call_search', arguments: { query: 'read files', limit: 8 } });
   for (const event of events.filter(event => event.response)) expect((event.response as { id: string }).id).toBe(remembered);
   expect(events.map(event => event.sequence_number)).toEqual(events.map((_, index) => index));
   expect(events.at(-1)?.type).toBe('response.completed');

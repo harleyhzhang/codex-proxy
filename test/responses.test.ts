@@ -1,5 +1,4 @@
 import { describe, expect, test } from "bun:test";
-import {  } from './support';
 import { responseObject, streamResponse } from '../src/protocol/output';
 
 describe("Responses API output", () => {
