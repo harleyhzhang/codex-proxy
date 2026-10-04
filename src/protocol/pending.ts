@@ -1,5 +1,5 @@
-import { responseObject, streamResponse } from './output';
-import type { ResponsesBody, ResponseObject } from './types';
+import { responseEvents, responseObject } from './output';
+import { EMPTY_OUTPUT, type ResponsesBody, type ResponseObject } from './types';
 type Event = Record<string, unknown>;
 
 // Local backends buffer output until it is validated. Native progress events keep the client
@@ -11,7 +11,7 @@ export async function pendingResponse(request: ResponsesBody,
   const heartbeatAbort = new AbortController();
   signal = AbortSignal.any([signal, heartbeatAbort.signal]);
   signal.throwIfAborted();
-  const empty = responseObject(request, { text: '', toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } });
+  const empty = responseObject(request, EMPTY_OUTPUT);
   const pending = { ...empty, status: 'in_progress', output: [], usage: null };
   let sequence = 0;
   const send = (event: Event) => {
@@ -33,11 +33,7 @@ export async function pendingResponse(request: ResponsesBody,
     const response = { ...generated, id: empty.id, created_at: empty.created_at };
     remember?.(response);
     // Reuse the output protocol, omitting the already-sent response.created frame.
-    const frames = (await streamResponse(response).text()).split('\n\n');
-    for (const frame of frames) {
-      const data = frame.split('\n').find(line => line.startsWith('data: '))?.slice(6);
-      if (!data || data === '[DONE]') continue;
-      const event = JSON.parse(data) as Event;
+    for (const event of responseEvents(response)) {
       if (event.type !== 'response.created') send(event);
     }
     return response;

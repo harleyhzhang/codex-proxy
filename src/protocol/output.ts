@@ -1,7 +1,7 @@
 // Renders a backend's output as a Responses API object and as the equivalent SSE stream.
 import { randomId } from '../json';
 import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
-import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, ToolCall } from './types';
+import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, StreamEvent, ToolCall } from './types';
 
 type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown };
 
@@ -111,39 +111,43 @@ export function responseObject(request: RequestShape, output: ProxyOutput): Resp
 }
 
 /** Replays a finished response as the event sequence a streaming upstream would have sent. */
-export function streamResponse(response: ResponseObject): Response {
+export function* responseEvents(response: ResponseObject): Generator<StreamEvent> {
   let sequence = 0;
-  const chunks: string[] = [];
-  const emit = (type: string, data: Record<string, unknown>) => {
-    chunks.push(`event: ${type}\ndata: ${JSON.stringify({ type, sequence_number: sequence++, ...data })}\n\n`);
-  };
+  const event = (type: string, data: Record<string, unknown>): StreamEvent =>
+    ({ type, sequence_number: sequence++, ...data });
 
-  emit('response.created', { response: { ...response, status: 'in_progress', output: [], usage: null } });
-  response.output.forEach((item, output_index) => {
+  yield event('response.created', { response: { ...response, status: 'in_progress', output: [], usage: null } });
+  for (const [output_index, item] of response.output.entries()) {
     const added: OutputItem = { ...item, status: 'in_progress' };
     if (item.type === 'message') added.content = [];
     if (item.type === 'function_call') added.arguments = '';
     if (item.type === 'custom_tool_call') added.input = '';
-    emit('response.output_item.added', { output_index, item: added });
+    yield event('response.output_item.added', { output_index, item: added });
 
     const at = { item_id: item.id, output_index };
     if (item.type === 'message') {
       const part = (item.content as Array<{ text: string }>)[0] ?? { text: '' };
       const content = { ...at, content_index: 0 };
-      emit('response.content_part.added', { ...content, part: { ...part, text: '' } });
-      emit('response.output_text.delta', { ...content, delta: part.text });
-      emit('response.output_text.done', { ...content, text: part.text });
-      emit('response.content_part.done', { ...content, part });
+      yield event('response.content_part.added', { ...content, part: { ...part, text: '' } });
+      yield event('response.output_text.delta', { ...content, delta: part.text });
+      yield event('response.output_text.done', { ...content, text: part.text });
+      yield event('response.content_part.done', { ...content, part });
     } else if (item.type === 'function_call') {
-      emit('response.function_call_arguments.delta', { ...at, delta: item.arguments });
-      emit('response.function_call_arguments.done', { ...at, arguments: item.arguments });
+      yield event('response.function_call_arguments.delta', { ...at, delta: item.arguments });
+      yield event('response.function_call_arguments.done', { ...at, arguments: item.arguments });
     } else if (item.type === 'custom_tool_call') {
-      emit('response.custom_tool_call_input.delta', { ...at, call_id: item.call_id, delta: item.input });
-      emit('response.custom_tool_call_input.done', { ...at, call_id: item.call_id, input: item.input });
+      yield event('response.custom_tool_call_input.delta', { ...at, call_id: item.call_id, delta: item.input });
+      yield event('response.custom_tool_call_input.done', { ...at, call_id: item.call_id, input: item.input });
     }
-    emit('response.output_item.done', { output_index, item });
-  });
-  emit('response.completed', { response });
+    yield event('response.output_item.done', { output_index, item });
+  }
+  yield event('response.completed', { response });
+}
+
+/** Encodes the shared Responses event sequence for an HTTP client. */
+export function streamResponse(response: ResponseObject): Response {
+  const chunks = Array.from(responseEvents(response), event =>
+    `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`);
   chunks.push('data: [DONE]\n\n');
 
   return new Response(chunks.join(''), {
