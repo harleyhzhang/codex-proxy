@@ -77,20 +77,20 @@ export type UpstreamCall = (body: ResponsesBody) => Promise<Response>;
 
 /** Reads OpenAI ciphertext through GPT once per payload, caching each result sealed on disk. */
 export class CompactionBridge {
-  private readonly pending = new Map<string, Promise<string>>();
-
   constructor(
     private readonly codec: SummaryCodec,
     private readonly dir: string,
     private readonly fetchUpstream: UpstreamCall,
     private readonly models: readonly string[] = DEFAULT_BRIDGE_MODELS,
+    private readonly flights: { scope: string; jobs: Map<string, Promise<string>> } = { scope: '', jobs: new Map() },
   ) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
   /** The text of an OpenAI-encrypted compaction. */
   summary(encrypted: string): Promise<string> {
-    return this.once(sha256(encrypted), () => this.load(sha256(encrypted), encrypted));
+    const key = sha256(encrypted);
+    return this.once(key, () => this.load(key, encrypted));
   }
 
   /** The text of an encrypted message from a GPT subagent. */
@@ -102,10 +102,12 @@ export class CompactionBridge {
 
   /** Concurrent requests for the same payload share one upstream call. */
   private once(key: string, job: () => Promise<string>): Promise<string> {
-    let pending = this.pending.get(key);
+    const flightKey = `${this.flights.scope}:${key}`;
+    const jobs = this.flights.jobs;
+    let pending = jobs.get(flightKey);
     if (!pending) {
-      pending = job().finally(() => this.pending.delete(key));
-      this.pending.set(key, pending);
+      pending = job().finally(() => jobs.delete(flightKey));
+      jobs.set(flightKey, pending);
     }
     return pending;
   }
