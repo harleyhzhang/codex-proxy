@@ -52,6 +52,52 @@ remains separate from connection timeouts. GPT stream failures continue through 
 reconnect path; this change applies to buffered Claude requests. Reload a running proxy after
 updating its source.
 
+## Optional second Codex account
+
+Add an isolated native Codex login alongside the primary account. The router
+discovers available GPT models from that profile's native catalog; labels and
+namespaces are configurable. Existing installations keep their current behavior
+unless these options are enabled.
+
+```sh
+export ACCOUNT_CODEX_HOME="$HOME/.codex-secondary"
+export ACCOUNT_CODEX_BINARY=codex
+export ACCOUNT_MODEL_PREFIX=secondary
+export ACCOUNT_LABEL=Secondary
+
+CODEX_HOME="$ACCOUNT_CODEX_HOME" codex -c 'cli_auth_credentials_store="file"' login
+bun run account-cache  # reads the native model list; starts no model generation
+bun run catalog
+bun start
+```
+
+Keep these variables set for both catalog generation and the router. Reopen Codex
+to load the new picker rows. For example, `secondary-gpt-6-astra` appears with a
+`(Secondary)` label. To expose only selected models, set `ACCOUNT_MODELS` to a
+comma-separated list of native slugs. Optional `ACCOUNT_EXPECTED_EMAIL` and
+`ACCOUNT_EXPECTED_WORKSPACE` pin the intended identity and workspace. The secondary
+profile must differ from the primary `CODEX_HOME` and use file-based credentials.
+
+Speed policies are independently opt-in:
+
+- `ACCOUNT_SPEED_POLICY=fastest` selects Ultrafast, Fast, or Standard according to
+  the secondary profile's cached model entitlements.
+- `PRIMARY_SPEED_POLICY=standard` fixes primary GPT response requests to Standard,
+  even when a prior model left a Fast/Ultrafast selection. It works without a second
+  account, too.
+- Omit either policy, or set it to `client`, to preserve the client's selected tier.
+
+Fixed policies hide the corresponding speed controls during catalog generation;
+reasoning settings remain available. Re-run `bun run account-cache` and
+`bun run catalog` when secondary model availability changes. See
+[.env.example](.env.example) for optional settings.
+
+Only namespaced response-model calls use the secondary account. Native search/image
+passthrough endpoints retain primary-account routing. Native Codex owns token refresh
+in the isolated profile. Missing/mismatched auth or an unavailable secondary model
+fails without falling back to primary usage. Neither profile's credentials belong
+in this repository.
+
 ## Configuration
 
 Everything has a default; set only what you need.
@@ -65,6 +111,15 @@ Everything has a default; set only what you need.
 | `SUMMARY_KEY_FILE` | `$PROXY_STATE_DIR/summary.key` | 32-byte key for compaction capsules, created on first start |
 | `UPSTREAM_TIMEOUT_MS` | `900000` | Timeout for requests to `chatgpt.com` |
 | `BRIDGE_MODELS` | `gpt-6.1-sol,gpt-6-sol,gpt-6-astra` | GPT models allowed to summarise Claude/Grok history |
+| `ACCOUNT_CODEX_HOME` | unset | Isolated secondary native Codex profile; enables account aliases |
+| `ACCOUNT_CODEX_BINARY` | `codex` | Native Codex executable for cache retrieval and token renewal |
+| `ACCOUNT_MODEL_PREFIX` | `secondary` | Distinct lowercase namespace for secondary model aliases |
+| `ACCOUNT_LABEL` | `Secondary` | Suffix displayed in the model picker |
+| `ACCOUNT_MODELS` | unset | Optional comma-separated native-model allowlist |
+| `ACCOUNT_EXPECTED_EMAIL` | unset | Optional secondary login identity pin |
+| `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
+| `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
+| `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
 | `CLAUDE_BIN` | `claude` | Claude CLI path |
 | `CLAUDE_CWD` | current directory | Working directory for the Claude CLI |
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-turn Claude timeout |

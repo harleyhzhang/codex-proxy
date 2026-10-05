@@ -15,6 +15,7 @@ import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
 import { NativeAuth } from './auth';
+import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, restoreAgentMessages } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
@@ -35,6 +36,8 @@ export type RouterOptions = {
   /** Progress cadence for buffered subscription responses. */
   heartbeatMs?: number;
   bridgeModels?: readonly string[];
+  secondaryAccount?: AccountOptions;
+  primaryStandard?: boolean;
 };
 
 const RESPONSE_PATHS = new Set(['/v1/responses', '/v1/responses/compact', '/v1/responses/lite']);
@@ -83,7 +86,9 @@ function trackClaudeUsage(file: string): void {
 export function startRouter(options: RouterOptions) {
   const auth = new NativeAuth(options.authFile);
   const history = new HistoryCache();
-  const upstreamFetch: UpstreamFetch = options.upstreamFetch ?? ((url, init) => fetch(url, init));
+  const base: UpstreamFetch = options.upstreamFetch ?? ((url, init) => fetch(url, init));
+  const routed = options.secondaryAccount ? new AccountUpstream(options.secondaryAccount, base).fetch : base;
+  const upstreamFetch = options.primaryStandard ? standardPrimaryFetch(routed) : routed;
   const timeoutMs = options.upstreamTimeoutMs ?? 900_000;
   const deadline = (signal: AbortSignal) => AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
 
@@ -108,6 +113,7 @@ export function startRouter(options: RouterOptions) {
   async function normalize(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
     const body = raw as ResponsesBody;
     assertRoutable(body.model);
+    if (options.secondaryAccount) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
     const backend = backendFor(body.model);
     if (body.generate !== false && backend && typeof body.model === 'string') {
       backend.assertAvailable?.(backend.models[body.model] as string);

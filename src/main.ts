@@ -37,5 +37,7 @@ const server = startRouter({
   summaryKeyFile: config.summaryKeyFile,
   upstreamTimeoutMs: config.upstreamTimeoutMs,
   bridgeModels: config.bridgeModels,
+  secondaryAccount: config.secondaryAccount,
+  primaryStandard: config.primaryStandard,
 });
 console.log(`codex-subscription-proxy listening on http://127.0.0.1:${server.port}`);

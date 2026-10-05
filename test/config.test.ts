@@ -18,6 +18,9 @@ describe('loadConfig', () => {
       summaryKeyFile: '/home/user/.codex-subscription-proxy/summary.key',
       upstreamTimeoutMs: 900_000,
       bridgeModels: DEFAULT_BRIDGE_MODELS,
+      secondaryAccount: undefined,
+      secondaryLabel: 'Secondary',
+      primaryStandard: false,
     });
   });
 
@@ -52,6 +55,19 @@ describe('loadConfig', () => {
     expect(positiveInt('GROK_TIMEOUT_MS', 5, {})).toBe(5);
     expect(positiveInt('GROK_TIMEOUT_MS', 5, { GROK_TIMEOUT_MS: '60000' })).toBe(60_000);
     expect(() => positiveInt('GROK_TIMEOUT_MS', 5, { GROK_TIMEOUT_MS: 'NaN' })).toThrow('GROK_TIMEOUT_MS');
+  });
+
+  test('secondary account options are opt-in and primary policy works independently', () => {
+    const primary = loadConfig({ HOME: '/h', PRIMARY_SPEED_POLICY: 'standard' });
+    expect(primary.primaryStandard).toBe(true); expect(primary.secondaryAccount).toBeUndefined();
+    const config = loadConfig({ HOME: '/h', ACCOUNT_CODEX_HOME: '/second', ACCOUNT_MODEL_PREFIX: 'team', ACCOUNT_LABEL: 'Team', ACCOUNT_MODELS: 'gpt-demo, gpt-next', ACCOUNT_SPEED_POLICY: 'fastest' });
+    expect(config.secondaryAccount).toMatchObject({ home: '/second', prefix: 'team', fastest: true, models: ['gpt-demo', 'gpt-next'] });
+    expect(config.secondaryLabel).toBe('Team'); expect(config.primaryStandard).toBe(false);
+    expect(() => loadConfig({ HOME: '/h', CODEX_HOME: '/same', ACCOUNT_CODEX_HOME: '/same/.' })).toThrow('must differ');
+    expect(() => loadConfig({ HOME: '/h', ACCOUNT_CODEX_HOME: '/second', ACCOUNT_MODEL_PREFIX: 'gpt' })).toThrow('distinct lowercase');
+    expect(() => loadConfig({ HOME: '/h', ACCOUNT_SPEED_POLICY: 'typo' })).toThrow('ACCOUNT_SPEED_POLICY');
+    expect(() => loadConfig({ HOME: '/h', PRIMARY_SPEED_POLICY: 'typo' })).toThrow('PRIMARY_SPEED_POLICY');
+    expect(() => loadConfig({ HOME: '/h', ACCOUNT_MODELS: 'unrelated-model' })).toThrow('native GPT');
   });
 });
 

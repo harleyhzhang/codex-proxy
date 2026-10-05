@@ -9,9 +9,9 @@ src/
   catalog.ts     builds models.json from Codex's model cache + backend catalogs
   protocol/      Responses API types, prompt building, output and SSE
   backends/      contract.ts (SubscriptionBackend), claude.ts, grok.ts, registry.ts
-  router/        server.ts (HTTP + WebSocket), auth, history, capsule, bridge, upstream
+  router/        server.ts (HTTP + WebSocket), auth, account-upstream, history, capsule, bridge, upstream
 test/            bun test; support.ts has shared fixtures
-scripts/         grok-deny-native.py (Grok PreToolUse hook)
+scripts/         account-cache.ts (native secondary catalog), grok-deny-native.py (Grok PreToolUse hook)
 ```
 
 Rules:
