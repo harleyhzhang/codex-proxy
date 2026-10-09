@@ -6,7 +6,7 @@ import type { ServerWebSocket } from 'bun';
 import { onClaudeRateLimit } from '../backends/claude';
 import { claudeLimits, claudeUsageSnapshot, type ClaudeUsage } from '../backends/claude-limits';
 import { BackendError, terminalEvent } from '../backends/contract';
-import { assertRoutable, backendFor, isLocalModel } from '../backends/registry';
+import { assertRoutable, backendFor, isLocalModel, secondaryClaude } from '../backends/registry';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
@@ -94,7 +94,14 @@ export function startRouter(options: RouterOptions) {
 
   const stateDir = options.summaryKeyFile ? dirname(options.summaryKeyFile) : undefined;
   const codec = options.summaryKeyFile ? new SummaryCodec(readFileSync(options.summaryKeyFile)) : undefined;
-  if (stateDir) trackClaudeUsage(join(stateDir, 'claude-usage.json'));
+  if (stateDir) {
+    trackClaudeUsage(join(stateDir, 'claude-usage.json'));
+    if (secondaryClaude) {
+      const file = join(stateDir, `claude-${process.env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary'}-usage.json`);
+      try { secondaryClaude.account.limits.restore(JSON.parse(readFileSync(file, 'utf8')) as ClaudeUsage); } catch {}
+      secondaryClaude.account.onRateLimit(info => { void Bun.write(file, JSON.stringify(claudeUsageSnapshot(info), null, 2)).catch(() => {}); });
+    }
+  }
 
   const bridgeFlights = new Map<string, Promise<string>>();
 
@@ -113,7 +120,7 @@ export function startRouter(options: RouterOptions) {
   async function normalize(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
     const body = raw as ResponsesBody;
     assertRoutable(body.model);
-    if (options.secondaryAccount) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
+    if (options.secondaryAccount && !isLocalModel(body.model)) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
     const backend = backendFor(body.model);
     if (body.generate !== false && backend && typeof body.model === 'string') {
       backend.assertAvailable?.(backend.models[body.model] as string);

@@ -1,10 +1,12 @@
 // The single list of subscription backends. Adding a family is one entry here plus its adapter
 // module; routing, compaction, handoffs, the catalog and the shared contract tests read this list.
-import { claudeBackend } from './claude';
+import { claudeBackend, configuredClaudeAccount } from './claude';
 import { BackendError, type SubscriptionBackend } from './contract';
 import { grokBackend } from './grok';
 
-export const BACKENDS: readonly SubscriptionBackend[] = [claudeBackend, grokBackend];
+export const secondaryClaude = configuredClaudeAccount();
+
+export const BACKENDS: readonly SubscriptionBackend[] = [claudeBackend, grokBackend, ...(secondaryClaude ? [secondaryClaude.backend] : [])];
 
 export function backendFor(model: unknown): SubscriptionBackend | undefined {
   if (typeof model !== 'string') return undefined;
@@ -19,7 +21,8 @@ export function isLocalModel(model: unknown): boolean {
 /** Refuses a slug inside a backend's reserved namespace that is not one of its models. */
 export function assertRoutable(model: unknown): void {
   if (typeof model !== 'string') throw new BackendError('Model is required');
-  const owner = BACKENDS.find((backend) => model.startsWith(backend.reservedPrefix));
+  if (backendFor(model)) return;
+  const owner = BACKENDS.filter(backend => model.startsWith(backend.reservedPrefix)).sort((a,b) => b.reservedPrefix.length - a.reservedPrefix.length)[0];
   if (owner && !Object.hasOwn(owner.models, model)) throw new BackendError(`Unsupported ${owner.name} model`);
 }
 

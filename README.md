@@ -98,6 +98,38 @@ in the isolated profile. Missing/mismatched auth or an unavailable secondary mod
 fails without falling back to primary usage. Neither profile's credentials belong
 in this repository.
 
+### A second Claude subscription
+
+Keep the second Claude login in a separate configuration directory. The same CLI
+binary can serve both accounts; a second desktop app is unnecessary.
+
+```sh
+export CLAUDE_ACCOUNT_CONFIG_DIR="$HOME/.claude-secondary"
+export CLAUDE_ACCOUNT_MODEL_PREFIX=secondary
+export CLAUDE_ACCOUNT_LABEL=Secondary
+mkdir -p "$CLAUDE_ACCOUNT_CONFIG_DIR"
+chmod 700 "$CLAUDE_ACCOUNT_CONFIG_DIR"
+CLAUDE_CONFIG_DIR="$CLAUDE_ACCOUNT_CONFIG_DIR" claude auth login --claudeai
+CLAUDE_CONFIG_DIR="$CLAUDE_ACCOUNT_CONFIG_DIR" claude auth status
+bun run catalog
+bun start
+```
+
+Keep these variables set for both catalog generation and the router, then reopen
+Codex. The picker adds **Opus 5.5 (Secondary)** and **Fable 5.1 (Secondary)** while
+preserving the primary entries. Each account has its own subprocess environment,
+warm tool continuations and persisted quota snapshot. Switching accounts replays
+the shared Codex history to the selected account. A failed login or exhausted
+account never falls back to the other subscription.
+
+Only enable models that the second subscription can use. `CLAUDE_ACCOUNT_MODELS`
+optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1`.
+`CLAUDE_ACCOUNT_EXPECTED_EMAIL` and `CLAUDE_ACCOUNT_EXPECTED_ORG` can pin the
+identity returned by `auth status`; they are checked before starting each new
+worker. The second profile must differ from the primary `CLAUDE_CONFIG_DIR`
+(or `~/.claude`), including through symlinks. These options are independent of
+the optional second native Codex account and disabled by default.
+
 ## Configuration
 
 Everything has a default; set only what you need.
@@ -121,6 +153,14 @@ Everything has a default; set only what you need.
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
 | `CLAUDE_BIN` | `claude` | Claude CLI path |
+| `CLAUDE_CONFIG_DIR` | CLI default | Primary Claude login/configuration directory |
+| `CLAUDE_EXPECTED_EMAIL`, `CLAUDE_EXPECTED_ORG` | unset | Optional primary Claude identity pins |
+| `CLAUDE_ACCOUNT_CONFIG_DIR` | unset | Enables a separate second Claude login |
+| `CLAUDE_ACCOUNT_MODEL_PREFIX` | `secondary` | Prefix for second-account Claude slugs |
+| `CLAUDE_ACCOUNT_LABEL` | `Secondary` | Picker label for the second Claude account |
+| `CLAUDE_ACCOUNT_MODELS` | both supported Claude models | Optional second-account model subset |
+| `CLAUDE_ACCOUNT_BIN`, `CLAUDE_ACCOUNT_CWD` | primary CLI settings | Optional second-account binary and working directory |
+| `CLAUDE_ACCOUNT_EXPECTED_EMAIL`, `CLAUDE_ACCOUNT_EXPECTED_ORG` | unset | Optional second Claude identity pins |
 | `CLAUDE_CWD` | current directory | Working directory for the Claude CLI |
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-turn Claude timeout |
 | `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude session stays warm |

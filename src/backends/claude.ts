@@ -1,3 +1,6 @@
+import { realpathSync, existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { resolve, join, isAbsolute } from 'node:path';
 // Claude through the official Claude Code CLI. Each turn is one `claude -p` stream-json session
 // with every native tool disabled; Codex's tools are described in the prompt and requested
 // through structured output. A session that returned tool calls stays alive briefly so the next
@@ -7,8 +10,8 @@ import { isRecord, randomId } from '../json';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { reconnectTransport, transportError } from '../transport';
-import { claudeLimits, ClaudeUsageLimitError } from './claude-limits';
-import { estimateVisibleTokens, type SubscriptionBackend } from './contract';
+import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
+import { BackendError, estimateVisibleTokens, type SubscriptionBackend } from './contract';
 
 const MODEL_ALIASES: Readonly<Record<string, string>> = {
   opus: 'opus',
@@ -19,21 +22,6 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = {
   'claude-haiku': 'haiku',
 };
 const EFFORTS = ['low', 'medium', 'high'] as const;
-
-/** Variables that would let the CLI bypass the signed-in subscription or leak another credential. */
-const BLOCKED_ENV = new Set([
-  'CLAUDECODE',
-  'PROXY_API_KEY',
-  'CLAUDE_CODE_EFFORT_LEVEL',
-  'OPENAI_API_KEY',
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_BASE_URL',
-  'CLAUDE_CODE_OAUTH_TOKEN',
-  'CLAUDE_CODE_USE_BEDROCK',
-  'CLAUDE_CODE_USE_VERTEX',
-  'CLAUDE_CODE_USE_FOUNDRY',
-]);
 
 const SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
 
@@ -93,22 +81,49 @@ export function buildClaudeArgs(request: ResponsesRequest): string[] {
   ];
 }
 
-function claudeEnvironment(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !BLOCKED_ENV.has(key)) env[key] = value;
+export type ClaudeAccountOptions = {
+  configDir?: string; binary?: string; cwd?: string;
+  expectedEmail?: string; expectedOrg?: string;
+};
+
+/** Each login owns its warm workers, quota snapshot and usage sink. */
+export class ClaudeAccount {
+  readonly workers = new Map<string, ClaudeWorker>();
+  rateLimitSink?: (info: unknown) => void;
+  readonly options: Readonly<ClaudeAccountOptions>;
+  constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
+  onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
+  environment(): Record<string, string> {
+    const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined &&
+      !['CLAUDECODE', 'PROXY_API_KEY', 'CLAUDE_CODE_EFFORT_LEVEL', 'OPENAI_API_KEY',
+        'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
+        'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+        'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_GATEWAY', 'CLAUDE_CODE_HOST_GATEWAY_LINEAGE'].includes(key))) as Record<string, string>;
+    if (this.options.configDir) env.CLAUDE_CONFIG_DIR = this.options.configDir;
+    return env;
   }
-  return env;
+  binary(): string { return this.options.binary ?? process.env.CLAUDE_BIN ?? 'claude'; }
+  async verifyIdentity(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    if (!this.options.expectedEmail && !this.options.expectedOrg) return;
+    const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: 20000, signal});
+    const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
+    let status: unknown;
+    try { status = JSON.parse(output); } catch {}
+    const info = isRecord(status) ? status : undefined;
+    if (exitCode !== 0 || !info?.loggedIn ||
+      (this.options.expectedEmail && info.email !== this.options.expectedEmail) ||
+      (this.options.expectedOrg && info.orgId !== this.options.expectedOrg)) {
+      throw new BackendError('Claude account identity does not match its configured login');
+    }
+  }
+  run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+    return reconnectTransport(() => runClaudeOnce(request, signal, this), signal);
+  }
 }
 
-// Receives the CLI's plan-usage snapshot (`rate_limit_event.rate_limit_info`) after each turn.
-let rateLimitSink: ((info: unknown) => void) | undefined;
-export function onClaudeRateLimit(sink: (info: unknown) => void): void {
-  rateLimitSink = sink;
-}
-
-/** Live sessions that can continue a turn, keyed by the tool call ids they issued. */
-const workersByCallId = new Map<string, ClaudeWorker>();
+export const primaryClaudeAccount = new ClaudeAccount({expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG}, claudeLimits);
+export function onClaudeRateLimit(sink: (info: unknown) => void): void { primaryClaudeAccount.onRateLimit(sink); }
 
 type PendingTurn = { resolve: (result: ClaudeResult) => void; reject: (error: Error) => void };
 
@@ -122,15 +137,15 @@ class ClaudeWorker {
   private idleTimer?: ReturnType<typeof setTimeout>;
   private closed = false;
 
-  constructor(request: ResponsesRequest) {
+  constructor(request: ResponsesRequest, readonly account: ClaudeAccount) {
     this.model = request.model;
     this.signature = sessionSignature(request);
-    this.process = Bun.spawn([process.env.CLAUDE_BIN ?? 'claude', ...buildClaudeArgs(request)], {
+    this.process = Bun.spawn([account.binary(), ...buildClaudeArgs(request)], {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      cwd: process.env.CLAUDE_CWD || process.cwd(),
-      env: claudeEnvironment(),
+      cwd: account.options.cwd ?? process.env.CLAUDE_CWD ?? process.cwd(),
+      env: account.environment(),
     });
     const stdoutDone = this.readStdout().catch((cause: unknown) => this.fail(cause));
     void this.readStderr();
@@ -197,7 +212,7 @@ class ClaudeWorker {
     this.detach();
     for (const callId of callIds) {
       this.callIds.add(callId);
-      workersByCallId.set(callId, this);
+      this.account.workers.set(callId, this);
     }
     this.idleTimer = setTimeout(() => this.close(), positiveInt('CLAUDE_SESSION_IDLE_MS', 900_000));
     this.idleTimer.unref?.();
@@ -229,7 +244,7 @@ class ClaudeWorker {
 
   private detach(): void {
     for (const callId of this.callIds) {
-      if (workersByCallId.get(callId) === this) workersByCallId.delete(callId);
+      if (this.account.workers.get(callId) === this) this.account.workers.delete(callId);
     }
     this.callIds.clear();
   }
@@ -255,14 +270,14 @@ class ClaudeWorker {
     }
     if (!isRecord(record)) return;
     if (record.type === 'rate_limit_event' && record.rate_limit_info) {
-      claudeLimits.update(record.rate_limit_info);
+      this.account.limits.update(record.rate_limit_info);
       try {
-        rateLimitSink?.(record.rate_limit_info);
+        this.account.rateLimitSink?.(record.rate_limit_info);
       } catch {}
       return;
     }
     if (record.type === 'assistant' && record.error === 'rate_limit') {
-      this.fail(claudeLimits.blocked(this.model) ?? new ClaudeUsageLimitError());
+      this.fail(this.account.limits.blocked(this.model) ?? new ClaudeUsageLimitError());
       return;
     }
     if (record.type !== 'result' || !this.pending) return;
@@ -304,12 +319,18 @@ function sessionSignature(request: ResponsesRequest): string {
   });
 }
 
-/** The live session that issued the newest tool call in this request, if it can continue. */
-function continuationWorker(request: ResponsesRequest): ClaudeWorker | undefined {
+async function startClaudeWorker(request: ResponsesRequest, account: ClaudeAccount, signal?: AbortSignal): Promise<ClaudeWorker> {
+  await account.verifyIdentity(signal);
+  signal?.throwIfAborted();
+  return new ClaudeWorker(request, account);
+}
+
+/** The live session from this account that issued the newest tool call, if it can continue. */
+function continuationWorker(request: ResponsesRequest, account: ClaudeAccount): ClaudeWorker | undefined {
   if (typeof request.input === 'string') return undefined;
   for (let index = request.input.length - 1; index >= 0; index--) {
     const callId = request.input[index]?.call_id;
-    const worker = callId ? workersByCallId.get(callId) : undefined;
+    const worker = callId ? account.workers.get(callId) : undefined;
     if (worker?.model !== request.model) continue;
     if (worker.signature === sessionSignature(request)) return worker;
     worker.close();
@@ -318,8 +339,8 @@ function continuationWorker(request: ResponsesRequest): ClaudeWorker | undefined
   return undefined;
 }
 
-async function runTurn(request: ResponsesRequest, signal?: AbortSignal): Promise<{ worker: ClaudeWorker; result: ClaudeResult }> {
-  const continuing = continuationWorker(request);
+async function runTurn(request: ResponsesRequest, signal: AbortSignal | undefined, account: ClaudeAccount): Promise<{ worker: ClaudeWorker; result: ClaudeResult }> {
+  const continuing = continuationWorker(request, account);
   const delta = continuing ? continuationRequest(request, continuing.callIds) : undefined;
   if (continuing && delta) {
     const prepared = preparePrompt(delta);
@@ -337,7 +358,7 @@ async function runTurn(request: ResponsesRequest, signal?: AbortSignal): Promise
   }
 
   const prepared = preparePrompt(request);
-  const worker = new ClaudeWorker(request);
+  const worker = await startClaudeWorker(request, account, signal);
   try {
     return { worker, result: await worker.run(prepared.prompt, prepared.images, signal) };
   } catch (error) {
@@ -362,18 +383,18 @@ function parseStructured(result: ClaudeResult): StructuredOutput {
 }
 
 export async function runClaude(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
-  return reconnectTransport(() => runClaudeOnce(request, signal), signal);
+  return primaryClaudeAccount.run(request, signal);
 }
 
-async function runClaudeOnce(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+async function runClaudeOnce(request: ResponsesRequest, signal: AbortSignal | undefined, account: ClaudeAccount): Promise<ProxyOutput> {
   signal?.throwIfAborted();
-  claudeLimits.assertAvailable(request.model);
-  const { worker, result } = await runTurn(request, signal);
+  account.limits.assertAvailable(request.model);
+  const { worker, result } = await runTurn(request, signal, account);
 
   try {
     if (result.is_error) {
       if (USAGE_LIMIT_TEXT.test(result.result ?? '')) {
-        throw claudeLimits.blocked(request.model) ?? new ClaudeUsageLimitError();
+        throw account.limits.blocked(request.model) ?? new ClaudeUsageLimitError();
       }
       const error = new Error(result.result || 'Claude CLI returned an error');
       throw transportError(error) ?? error;
@@ -429,3 +450,38 @@ export const claudeBackend: SubscriptionBackend = {
   assertAvailable: (model) => claudeLimits.assertAvailable(model),
   run: runClaude,
 };
+
+export type SecondaryClaudeOptions = ClaudeAccountOptions & { configDir: string; prefix: string; label: string; models?: readonly string[] };
+
+/** Opt-in second subscription, with native model ids behind distinct public slugs. */
+export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
+  if (!/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt', 'grok', 'claude'].includes(options.prefix) || /^(gpt|grok)-/.test(options.prefix))
+    throw new Error('CLAUDE_ACCOUNT_MODEL_PREFIX must be a distinct lowercase namespace');
+  if (!isAbsolute(options.configDir)) throw new Error('CLAUDE_ACCOUNT_CONFIG_DIR must be an absolute path');
+  const canonical = (path: string) => existsSync(path) ? realpathSync(path) : resolve(path);
+  const primary = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
+  if (canonical(options.configDir) === canonical(primary)) throw new Error('CLAUDE_ACCOUNT_CONFIG_DIR must differ from the primary Claude profile');
+  const account = new ClaudeAccount(options);
+  const selected = [...new Set(options.models ?? ['claude-opus-5-5', 'claude-fable-5-1'])];
+  if (!selected.length || selected.some(model => !['claude-opus-5-5', 'claude-fable-5-1'].includes(model)))
+    throw new Error('CLAUDE_ACCOUNT_MODELS must contain supported native Claude model slugs');
+  const models = Object.fromEntries(selected.map(model => [`${options.prefix}-${model}`, model]));
+  const backend: SubscriptionBackend = {
+    name: `Claude (${options.label})`, models, reservedPrefix: `${options.prefix}-claude-`,
+    catalog: selected.map(model => claudeModel(`${options.prefix}-${model}`, `${model === 'claude-opus-5-5' ? 'Opus 5.5' : 'Fable 5.1'} (${options.label})`)),
+    assertAvailable: model => account.limits.assertAvailable(model),
+    run: (request, signal) => account.run(request, signal),
+  };
+  return { account, backend };
+}
+
+export function configuredClaudeAccount(env: Readonly<Record<string, string | undefined>> = process.env) {
+  if (!env.CLAUDE_ACCOUNT_CONFIG_DIR) return undefined;
+  return createClaudeAccountBackend({
+    configDir: env.CLAUDE_ACCOUNT_CONFIG_DIR, prefix: env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary',
+    label: env.CLAUDE_ACCOUNT_LABEL || 'Secondary', binary: env.CLAUDE_ACCOUNT_BIN || env.CLAUDE_BIN,
+    cwd: env.CLAUDE_ACCOUNT_CWD, expectedEmail: env.CLAUDE_ACCOUNT_EXPECTED_EMAIL,
+    expectedOrg: env.CLAUDE_ACCOUNT_EXPECTED_ORG,
+    models: env.CLAUDE_ACCOUNT_MODELS?.split(',').map(model => model.trim()).filter(Boolean),
+  });
+}

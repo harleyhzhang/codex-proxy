@@ -6,3 +6,4 @@ export { BACKENDS, backendFor, isLocalModel } from './backends/registry';
 export { SummaryCodec } from './router/capsule';
 export { type RouterOptions, startRouter } from './router/server';
 export { AccountUpstream, type AccountOptions, accountModels, nativeAccountRequest, standardPrimaryFetch } from './router/account-upstream';
+export { ClaudeAccount, createClaudeAccountBackend, configuredClaudeAccount, type ClaudeAccountOptions, type SecondaryClaudeOptions } from './backends/claude';
