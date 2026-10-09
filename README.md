@@ -1,16 +1,18 @@
 # codex-subscription-proxy
 
-Use Claude and Grok inside [OpenAI Codex](https://github.com/openai/codex), next to GPT, in the same chat.
+Use Claude, Grok and optional Cursor models inside [OpenAI Codex](https://github.com/openai/codex), next to GPT, in the same chat.
 
 The proxy sits between Codex and `chatgpt.com`. GPT requests pass straight through. Requests for a
 Claude or Grok model are answered by the official `claude` or `grok` CLI, signed in with your own
 subscription. Codex keeps running every tool, so approvals, sandboxing and history work as usual,
-and you can switch models mid-chat.
+and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
+Grok and GPT models from a Cursor subscription without changing the Codex app.
 
 ```
 Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT models)
                            ├──► claude CLI           (claude-*)
-                           └──► grok CLI             (grok-*)
+                           ├──► grok CLI             (grok-*)
+                           └──► Cursor SDK bridge    (cursor-*, optional)
 ```
 
 ## Requirements
@@ -120,7 +122,8 @@ Codex. The picker adds **Opus 5.5 (Secondary)** and **Fable 5.1 (Secondary)** wh
 preserving the primary entries. Each account has its own subprocess environment,
 warm tool continuations and persisted quota snapshot. Switching accounts replays
 the shared Codex history to the selected account. A failed login or exhausted
-account never falls back to the other subscription.
+account never falls back to the other Claude subscription. The optional Cursor
+quota policy below applies only to secondary Opus when explicitly enabled.
 
 Only enable models that the second subscription can use. `CLAUDE_ACCOUNT_MODELS`
 optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1`.
@@ -129,6 +132,85 @@ identity returned by `auth status`; they are checked before starting each new
 worker. The second profile must differ from the primary `CLAUDE_CONFIG_DIR`
 (or `~/.claude`), including through symlinks. These options are independent of
 the optional second native Codex account and disabled by default.
+
+## Optional Cursor subscription
+
+Use the official [SDK bridge](https://github.com/cursor/sdk-bridge), pinned to
+**v1.0.37**. Verify the archive against that release's `SHA256SUMS.txt`, unpack it
+outside this repository, and hash `bin/cursor-sdk-bridge`. The proxy itself keeps
+zero runtime package dependencies. The ordinary Cursor CLI remains separate:
+its print mode exposes native tools and is not used for this adapter.
+
+Authenticate with the official [SDK browser login](https://cursor.com/docs/sdk/typescript#cursorauth).
+For this one-time login, install `@cursor/sdk@1.0.37` in a separate setup directory
+and run a script there:
+
+```ts
+import { Cursor, FileCredentialStore } from '@cursor/sdk';
+const login = await Cursor.auth.login({
+  apiKeyName: 'Codex model router',
+  store: new FileCredentialStore('/absolute/private/path/cursor-auth.json'),
+});
+const user = await Cursor.me({apiKey: login.apiKey});
+console.log({email: user.userEmail, userId: user.userId}); // never print login.apiKey
+```
+
+This mints an expiring user API key (90 days by default); it does not read or
+extract the desktop/CLI OAuth token. Keep the credential JSON owner-only and
+outside Git. The SDK login is independent of standalone CLI login changes.
+Renew it with the same official flow when it expires.
+
+Set these variables for both the catalog and router, supplying your own account
+pins. `Cursor.me()` / the bridge's `Me` returns the stable user ID:
+
+```sh
+export CURSOR_BRIDGE_BIN=/absolute/path/bin/cursor-sdk-bridge
+export CURSOR_BRIDGE_SHA256="$(shasum -a 256 "$CURSOR_BRIDGE_BIN" | cut -d ' ' -f 1)"
+export CURSOR_AUTH_FILE=/absolute/private/path/cursor-auth.json
+export CURSOR_CWD=/absolute/private/path/empty-requests
+export CURSOR_EXPECTED_EMAIL=account@example.com
+export CURSOR_EXPECTED_USER_ID="your-user-id"
+export CURSOR_MODEL_PREFIX=cursor
+export CURSOR_LABEL=Work
+# Optional: use the fastest available Cursor variants. Kimi has no Fast variant.
+export CURSOR_SPEED_POLICY=fastest
+mkdir -p "$CURSOR_CWD"
+chmod 700 "$CURSOR_CWD"
+bun run catalog
+bun start
+```
+
+The picker adds **Kimi K3 (Work)**, **Grok 4.7 (Work)** and
+**GPT-5.6 Sol (Work)**, with their own supported reasoning choices. Entries are
+text-only with a conservative 200K catalog cap. GPT-5.6 Sol is a separate model;
+it is not a fallback alias for GPT-6.1. Reopen Codex after catalog changes.
+
+Each request verifies the pinned executable and authenticated account, uses credential-bound account/catalog discovery cached for five minutes,
+validates the exact model parameters, and starts a new private local agent
+with an empty built-in tool list, no setting sources, no MCP and no subagents.
+Codex tool calls are parsed and validated before returning any actions. Native
+Cursor tool/compaction events, unsupported attachments, model substitutions,
+partial output and failed streams are refused. Cancellation ends only that
+request's dedicated bridge. The temporary agent store is removed on every exit.
+Cursor's SDK sandbox helper is unavailable in the tested standalone macOS build;
+this adapter enforces no native actions through the tool list and event guard.
+Codex's own execution sandbox and approvals still apply to returned calls.
+
+To enable **secondary Opus only → Cursor Opus** on a typed Claude quota refusal:
+
+```sh
+export CURSOR_CLAUDE_ACCOUNT_FALLBACK=1
+```
+
+Both the secondary Claude account and Cursor must be configured. Primary Opus
+stays on its own account, and secondary Fable does not fall back. Auth/network
+errors, timeouts, cancellation and malformed output never select Cursor. The
+fallback preserves the full verified history and effort, selects the same Opus
+model, and adds a supplier notice. Later requests return to direct Claude once
+its known quota gate expires. Cursor refusals stop the turn; there is no further
+supplier chain. This policy consumes the Cursor account's existing allowance
+and obeys its server-side billing limits; it does not establish an included-only
+billing guarantee or change spending settings.
 
 ## Configuration
 
@@ -192,6 +274,7 @@ Create `~/Library/LaunchAgents/codex-subscription-proxy.plist` with `ProgramArgu
   `Origin` header (browsers) are rejected.
 - Claude and Grok run with their own tools, MCP servers, hooks and plugins disabled, and with API
   keys stripped from their environment, so they can only answer through Codex.
+- Cursor uses its separately stored SDK credential and the no-native-tools policy described above.
 - Logs record event names, sizes and counts, never prompt or response content.
 - Compaction capsules for Claude/Grok chats are sealed with AES-256-GCM using a local key.
 
@@ -205,8 +288,8 @@ See [AGENTS.md](AGENTS.md) for the layout.
 
 ## Disclaimer
 
-Unofficial and not affiliated with OpenAI, Anthropic or xAI. It only drives the official CLIs
-with your own accounts; you are responsible for following each provider's terms.
+Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It drives official CLIs
+and the optional official Cursor SDK bridge with your own accounts; you are responsible for following each provider's terms.
 
 ## License
 
