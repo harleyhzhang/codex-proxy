@@ -14,7 +14,6 @@ import { BackendError, estimateVisibleTokens, retryOnce, type SubscriptionBacken
 export const CURSOR_MODELS = {
   'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '' },
   'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k' },
-  'gpt-5.6-sol': { name: 'GPT-5.6 Sol', efforts: ['none', 'low', 'medium', 'high', 'xhigh', 'max'], parameter: 'reasoning', context: '272k' },
   'claude-opus-5-5': { name: 'Opus 5.5', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '300k' },
 } as const;
 export type CursorModel = keyof typeof CURSOR_MODELS;
@@ -281,7 +280,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
 
 export function createCursorBackend(options: CursorOptions): SubscriptionBackend {
   if (![options.binary, options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt','grok','claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId || !/^[a-f0-9]{64}$/.test(options.binaryHash)) throw new Error('Cursor requires absolute paths, a pinned bridge, account identity and a model namespace');
-  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'gpt-5.6-sol'];
+  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7'];
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),

@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { join } from 'node:path';
-import { buildCatalog } from '../src/catalog';
+import { buildCatalog, pinEfforts } from '../src/catalog';
 import { loadConfig } from '../src/config';
 import { positiveInt } from '../src/env';
 import { BACKENDS } from '../src/backends/registry';
@@ -21,6 +21,7 @@ describe('loadConfig', () => {
       secondaryAccount: undefined,
       secondaryLabel: 'Secondary',
       primaryStandard: false,
+      pinnedEfforts: [],
     });
   });
 
@@ -101,6 +102,28 @@ describe('buildCatalog', () => {
   test('refuses an empty or malformed cache', () => {
     for (const cache of [undefined, {}, { models: [] }, { models: ['x', 1] }]) {
       expect(() => buildCatalog(cache)).toThrow('Codex models cache has no models');
+    }
+  });
+
+  test('pinned efforts leave one level per row, falling back to the strongest', () => {
+    const levels = (...efforts: string[]) => efforts.map((effort) => ({ effort, description: effort }));
+    const { models } = pinEfforts({
+      models: [
+        { slug: 'claude-opus', default_reasoning_level: 'high', supported_reasoning_levels: levels('low', 'medium', 'high') },
+        { slug: 'work-grok', default_reasoning_level: 'high', supported_reasoning_levels: levels('low', 'high', 'xhigh') },
+        { slug: 'other', default_reasoning_level: 'low', supported_reasoning_levels: levels('low', 'high') },
+        { slug: 'bare' },
+      ],
+    }, [['claude', 'medium'], ['grok', 'max']]);
+    expect(models.map((row) => row.default_reasoning_level)).toEqual(['medium', 'xhigh', 'low', undefined]);
+    expect(models.slice(0, 3).map((row) => (row.supported_reasoning_levels as unknown[]).length)).toEqual([1, 1, 1]);
+  });
+
+  test('CATALOG_EFFORTS parses fragment=effort pairs and rejects anything else', () => {
+    expect(loadConfig({ HOME: '/h', CATALOG_EFFORTS: 'claude=medium, gpt=high' }).pinnedEfforts).toEqual([['claude', 'medium'], ['gpt', 'high']]);
+    expect(loadConfig({ HOME: '/h' }).pinnedEfforts).toEqual([]);
+    for (const bad of ['claude', 'claude=', '=high', 'a=b=c', 'Claude=medium']) {
+      expect(() => loadConfig({ HOME: '/h', CATALOG_EFFORTS: bad })).toThrow('CATALOG_EFFORTS');
     }
   });
 });

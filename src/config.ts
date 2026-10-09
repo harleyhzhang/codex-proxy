@@ -18,6 +18,7 @@ export type Config = {
   secondaryAccount?: AccountOptions;
   secondaryLabel: string;
   primaryStandard: boolean;
+  pinnedEfforts: readonly (readonly [string, string])[];
 };
 
 export function loadConfig(env: Env = process.env): Config {
@@ -35,6 +36,8 @@ export function loadConfig(env: Env = process.env): Config {
     if (value !== undefined && !choices.some(choice => choice === value)) throw new Error(`${name} must be ${choices.join(' or ')}`);
   }
   const prefix = env.ACCOUNT_MODEL_PREFIX || 'secondary';
+  const pinnedEfforts = (env.CATALOG_EFFORTS ?? '').split(',').map(rule => rule.trim()).filter(Boolean).map(rule => rule.split('='));
+  if (pinnedEfforts.some(rule => rule.length !== 2 || !/^[a-z0-9.-]+$/.test(rule[0] ?? '') || !/^[a-z]+$/.test(rule[1] ?? ''))) throw new Error('CATALOG_EFFORTS must be comma-separated fragment=effort pairs');
   const models = (env.ACCOUNT_MODELS ?? '').split(',').map(model => model.trim()).filter(Boolean);
   if (models.some(model => !/^gpt-[a-z0-9][a-z0-9.-]*$/.test(model))) throw new Error('ACCOUNT_MODELS must contain native GPT model slugs');
   if (env.ACCOUNT_CODEX_HOME) {
@@ -52,6 +55,7 @@ export function loadConfig(env: Env = process.env): Config {
     bridgeModels: bridgeModels.length ? bridgeModels : DEFAULT_BRIDGE_MODELS,
     secondaryLabel: env.ACCOUNT_LABEL || 'Secondary',
     primaryStandard: env.PRIMARY_SPEED_POLICY === 'standard',
+    pinnedEfforts: pinnedEfforts.map(([fragment = '', effort = '']) => [fragment, effort] as const),
     secondaryAccount: env.ACCOUNT_CODEX_HOME ? {
       home: env.ACCOUNT_CODEX_HOME,
       prefix,

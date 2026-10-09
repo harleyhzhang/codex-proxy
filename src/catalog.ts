@@ -73,6 +73,27 @@ export function buildCatalog(nativeCache: unknown, secondary?: SecondaryCatalog,
   return { models: [...kept, ...local.map((model, index) => catalogRow(template, model, lastPriority + index + 1)), ...accountRows] };
 }
 
+/**
+ * Pins every row to one reasoning effort so Codex opens its picker on the model list. The first
+ * rule whose fragment appears in the slug wins; an unsupported effort falls back to the row's
+ * strongest level. Unmatched rows keep their default.
+ */
+export function pinEfforts(catalog: { models: JsonRecord[] }, rules: readonly (readonly [string, string])[]): { models: JsonRecord[] } {
+  return {
+    models: catalog.models.map((row) => {
+      const levels = Array.isArray(row.supported_reasoning_levels) ? row.supported_reasoning_levels.filter(isRecord) : [];
+      const strongest = levels.at(-1);
+      if (!strongest) return row;
+      const slug = typeof row.slug === 'string' ? row.slug : '';
+      const rule = rules.find(([fragment]) => slug.includes(fragment));
+      const kept = rule
+        ? levels.find((level) => level.effort === rule[1]) ?? strongest
+        : levels.find((level) => level.effort === row.default_reasoning_level) ?? strongest;
+      return { ...row, default_reasoning_level: kept.effort, supported_reasoning_levels: [kept] };
+    }),
+  };
+}
+
 if (import.meta.main) {
   const config = loadConfig();
   const cache = JSON.parse(readFileSync(join(config.codexHome, 'models_cache.json'), 'utf8')) as unknown;
@@ -83,7 +104,8 @@ if (import.meta.main) {
     fastest: config.secondaryAccount.fastest,
     models: config.secondaryAccount.models,
   } : undefined;
-  writeFileSync(config.catalogFile, `${JSON.stringify(buildCatalog(cache, secondary, config.primaryStandard), null, 2)}\n`, { mode: 0o600 });
+  const catalog = buildCatalog(cache, secondary, config.primaryStandard);
+  writeFileSync(config.catalogFile, `${JSON.stringify(config.pinnedEfforts.length ? pinEfforts(catalog, config.pinnedEfforts) : catalog, null, 2)}\n`, { mode: 0o600 });
   chmodSync(config.catalogFile, 0o600);
   console.log(`Wrote ${config.catalogFile}`);
 }

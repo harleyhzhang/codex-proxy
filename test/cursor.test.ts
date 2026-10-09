@@ -24,7 +24,7 @@ test('Cursor model parameters are family specific and unsupported effort is refu
  expect(cursorSelection('kimi-k3','max').params).toEqual([{id:'reasoning',value:'max'}]);
  expect(cursorSelection('grok-4.7','xhigh',true).params).toContainEqual({id:'fast',value:'true'});
  expect(cursorSelection('grok-4.7','xhigh').params).toContainEqual({id:'reasoning_effort',value:'xhigh'});
- expect(cursorSelection('gpt-5.6-sol','none').params).toContainEqual({id:'reasoning',value:'none'});
+ expect(()=>cursorSelection('gpt-5.6-sol','none')).toThrow();
  expect(()=>cursorSelection('kimi-k3','medium')).toThrow();expect(()=>cursorSelection('auto','high')).toThrow();
 });
 test('Cursor scrubs host credential and endpoint overrides',()=>{

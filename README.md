@@ -94,6 +94,12 @@ reasoning settings remain available. Re-run `bun run account-cache` and
 `bun run catalog` when secondary model availability changes. See
 [.env.example](.env.example) for optional settings.
 
+`CATALOG_EFFORTS` pins reasoning effort per model, for example
+`claude=medium,gpt=high,kimi=max,grok=max`. The first fragment found in a slug
+wins; when that model lacks the effort, its strongest level is used, and
+unmatched models keep their default. Every row then offers one effort, so the
+Codex picker opens straight on the model list instead of the effort slider.
+
 Only namespaced response-model calls use the secondary account. Native search/image
 passthrough endpoints retain primary-account routing. Native Codex owns token refresh
 in the isolated profile. Missing/mismatched auth or an unavailable secondary model
@@ -180,10 +186,9 @@ bun run catalog
 bun start
 ```
 
-The picker adds **Kimi K3 (Work)**, **Grok 4.7 (Work)** and
-**GPT-5.6 Sol (Work)**, with their own supported reasoning choices. Entries are
-text-only with a conservative 200K catalog cap. GPT-5.6 Sol is a separate model;
-it is not a fallback alias for GPT-6.1. Reopen Codex after catalog changes.
+The picker adds **Kimi K3 (Work)** and **Grok 4.7 (Work)**, with their own
+supported reasoning choices. Entries are text-only with a conservative 200K
+catalog cap. Reopen Codex after catalog changes.
 
 Each request verifies the pinned executable and authenticated account, uses credential-bound account/catalog discovery cached for five minutes,
 validates the exact model parameters, and starts a new private local agent
@@ -234,6 +239,7 @@ Everything has a default; set only what you need.
 | `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
+| `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |
 | `CLAUDE_BIN` | `claude` | Claude CLI path |
 | `CLAUDE_CONFIG_DIR` | CLI default | Primary Claude login/configuration directory |
 | `CLAUDE_EXPECTED_EMAIL`, `CLAUDE_EXPECTED_ORG` | unset | Optional primary Claude identity pins |
