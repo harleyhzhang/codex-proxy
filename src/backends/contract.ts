@@ -150,9 +150,18 @@ export function terminalEvent(error: BackendError) {
   return {
     type: 'response.failed',
     sequence_number: 0,
-    response: { id: randomId('resp'), status: 'failed', error: { code: 'invalid_prompt', message: error.message } },
+    response: { id: randomId('resp'), status: 'failed', error: { code: NATIVE_TERMINAL_CODES.has(error.code) ? error.code : 'invalid_prompt', message: error.message } },
   };
 }
+
+/**
+ * Codes native Codex classifies itself (codex-api sse/responses.rs): `context_length_exceeded` becomes
+ * ContextWindowExceeded, which stops retrying and tells the user to compact instead of looping.
+ */
+export const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded']);
+
+/** Subscription CLIs report a prompt over the model window in prose; match it so Codex sees the native code. */
+export const CONTEXT_OVERFLOW_TEXT = /prompt is too long|context (?:window|length)(?: limit)? (?:exceeded|reached)|exceeds? (?:the )?(?:model'?s? )?(?:maximum )?context|too many (?:input )?tokens/i;
 
 /**
  * Prepares a body for a backend: maps the public slug to the CLI model id and removes

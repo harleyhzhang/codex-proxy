@@ -28,6 +28,7 @@ while IFS= read -r input; do
     *CLI_LIMIT*) echo '{"type":"result","subtype":"error","is_error":true,"result":"Claude AI usage limit reached|1760230800"}';;
     *CLI_RATE_EVENT*) echo '{"type":"assistant","error":"rate_limit"}';;
     *CLI_ERRORED*) echo '{"type":"result","subtype":"error","is_error":true,"result":"model backend exploded"}';;
+    *CLI_OVERFLOW*) echo '{"type":"result","subtype":"error","is_error":true,"result":"Prompt is too long"}';;
     *CLI_NETWORK*) echo '{"type":"result","subtype":"error","is_error":true,"result":"fetch failed: network error"}';;
     *CLI_BADSTRUCT*) echo '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"x"}}';;
     *CLI_BADTOOL*) echo '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"","tool_calls":[{"name":"no_such_tool","arguments":"{}"}]}}';;
@@ -107,9 +108,9 @@ const expectRetryable = (seen: Seen[], message: string) => {
 };
 // Plain HTTP carries the backend's own error code; streams and sockets carry native Codex's
 // terminal `invalid_prompt` code so Codex never retries a refusal.
-const expectTerminal = (seen: Seen[], code: string, fragment: string) => {
+const expectTerminal = (seen: Seen[], code: string, fragment: string, streamCode = 'invalid_prompt') => {
   for (const cell of seen) {
-    expect(cell.code, cell.transport).toBe(cell.transport === 'http' ? code : 'invalid_prompt');
+    expect(cell.code, cell.transport).toBe(cell.transport === 'http' ? code : streamCode);
     expect(cell.message, cell.transport).toContain(fragment);
     expect(cell.message, cell.transport).not.toContain(INTERNAL);
     if (cell.transport === 'http') expect(cell.status).toBe(400);
@@ -158,6 +159,13 @@ describe('Claude CLI subprocess failures through the router', () => {
       expectTerminal(await everyTransport(app, body(MODEL, 'CLI_LIMIT')), 'claude_usage_limit_reached', 'limit');
       expectTerminal(await everyTransport(app, body(MODEL, 'CLI_RATE_EVENT')), 'claude_usage_limit_reached', 'limit');
       expectOk(await everyTransport(app, body(MODEL, 'after-limit')), 'CLI_OK');
+    } finally { await app.close(); }
+  });
+
+  test('a prompt over the context window is the native context_length_exceeded code, never retried', async () => {
+    const app = await fixtureRouter();
+    try {
+      expectTerminal(await everyTransport(app, body(MODEL, 'CLI_OVERFLOW')), 'context_length_exceeded', 'Prompt is too long', 'context_length_exceeded');
     } finally { await app.close(); }
   });
 
