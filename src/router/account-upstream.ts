@@ -122,9 +122,9 @@ export class AccountUpstream {
     if (typeof expires !== 'number') throw new Error('Invalid secondary token expiry');
     return { token, account, expires };
   }
-  private async ready(): Promise<Identity> {
+  private async ready(force = false): Promise<Identity> {
     let identity = await this.identity();
-    if (identity.expires <= Date.now() / 1000 + 300) {
+    if (force || identity.expires <= Date.now() / 1000 + 300) {
       this.refreshing ??= (this.options.refresh ?? (() => refreshAccount(this.options)))().finally(() => { this.refreshing = undefined; });
       await this.refreshing;
       identity = await this.identity();
@@ -148,10 +148,13 @@ export class AccountUpstream {
     let identity: Identity;
     try { identity = await this.ready(); }
     catch { throw new BackendError('Secondary Codex login unavailable; sign in again to its isolated profile. Primary account was not used.'); }
-    const headers = new Headers(init.headers);
-    headers.set('authorization', `Bearer ${identity.token}`);
-    headers.set('chatgpt-account-id', identity.account);
-    headers.delete('content-length');
+    const authorized = (current: Identity) => {
+      const headers = new Headers(init.headers);
+      headers.set('authorization', `Bearer ${current.token}`);
+      headers.set('chatgpt-account-id', current.account);
+      headers.delete('content-length');
+      return headers;
+    };
     let row: JsonRecord | undefined;
     try {
       const cache: unknown = await Bun.file(join(this.options.home, 'models_cache.json')).json();
@@ -164,6 +167,14 @@ export class AccountUpstream {
       tier = tiers.includes('ultrafast') ? 'ultrafast' : tiers.includes('priority') ? 'priority' : 'default';
     }
     logSafe('account-speed', { account: this.options.prefix, model: native, tier });
-    return this.upstream(url, { ...init, headers, body: JSON.stringify({ ...body, model: native, ...(tier === undefined ? {} : { service_tier: tier }) }) });
+    const outbound = JSON.stringify({ ...body, model: native, ...(tier === undefined ? {} : { service_tier: tier }) });
+    const response = await this.upstream(url, { ...init, headers: authorized(identity), body: outbound });
+    if (response.status !== 401) return response;
+    // Like native Codex, a 401 earns one forced refresh and one retry; a failed refresh keeps the original 401.
+    try { identity = await this.ready(true); }
+    catch { logSafe('account-unauthorized', { account: this.options.prefix, refreshed: false }); return response; }
+    logSafe('account-unauthorized', { account: this.options.prefix, refreshed: true });
+    await response.body?.cancel();
+    return this.upstream(url, { ...init, headers: authorized(identity), body: outbound });
   };
 }

@@ -93,6 +93,22 @@ test('concurrent expired requests share native refresh and re-read the renewed i
   expect(calls).toBe(5);
 });
 
+test('an upstream 401 forces one native refresh and one retry; a failed refresh keeps the 401', async () => {
+  const { options, write } = await fixture(); let refreshes = 0; const tokens: string[] = [];
+  options.refresh = async () => { refreshes++; await write(Date.now() / 1000 + 7200); };
+  const router = new AccountUpstream(options, async (_, init) => {
+    const token = new Headers(init.headers).get('authorization') ?? ''; tokens.push(token);
+    return tokens.length === 1 ? new Response('{"error":"expired"}', { status: 401 }) : new Response('{}');
+  });
+  expect((await router.fetch(target, request('secondary-gpt-6-astra'))).status).toBe(200);
+  expect(refreshes).toBe(1); expect(tokens).toHaveLength(2); expect(tokens[0]).not.toBe(tokens[1]);
+
+  options.refresh = async () => { throw new Error('synthetic secret must not be surfaced'); };
+  const denied = new AccountUpstream(options, async () => new Response('{"error":"revoked"}', { status: 401 }));
+  const response = await denied.fetch(target, request('secondary-gpt-6-astra'));
+  expect(response.status).toBe(401); expect(await response.text()).toContain('revoked');
+});
+
 test('account catalog inherits secondary entitlements without modifying primary rows', () => {
   const native = { models: [{ slug: 'gpt-6-astra', display_name: 'Astra', visibility: 'list', service_tiers: ['priority'], priority: 1 }] };
   const secondary = { models: [{ ...native.models[0], service_tiers: ['priority', 'ultrafast'], supported_reasoning_levels: [{ effort: 'max' }, { effort: 'ultra' }] }] };
