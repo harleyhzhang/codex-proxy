@@ -8,7 +8,14 @@ import type { ResponseObject } from '../src/protocol/types';
 import { equalSecret, NativeAuth } from '../src/router/auth';
 import { FOREIGN_HISTORY_ERROR, SummaryCodec } from '../src/router/capsule';
 import { HistoryCache, HistoryMiss } from '../src/router/history';
-import { idleDeadline, jsonHeaders, upstreamErrorDetail, upstreamHeaders, watchBody } from '../src/router/upstream';
+import { idleDeadline, jsonHeaders, upstreamErrorDetail, upstreamFailure, upstreamHeaders, watchBody } from '../src/router/upstream';
+
+test('an invalid-image 400 keeps the sentence native Codex keys its image-stripping retry on', async () => {
+  // codex-api api_bridge.rs maps a 400 containing this text to InvalidImageRequest.
+  const sentence = 'The image data you provided does not represent a valid image. Please check your input and try again.';
+  const { detail } = await upstreamFailure(new Response(JSON.stringify({ error: { message: sentence, type: 'invalid_request_error' } }), { status: 400 }));
+  expect(detail).toContain('The image data you provided does not represent a valid image');
+});
 
 describe('upstream idle deadline (native bounds streams by idle time, not length)', () => {
   const drip = (chunks: number, gapMs: number) => new Response(new ReadableStream<Uint8Array>({
