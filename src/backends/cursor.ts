@@ -141,15 +141,19 @@ function parseJsonLoosely(raw: string): unknown {
 
 /**
  * Custom tools take one raw string. Models (Kimi especially) often wrap it as {"code": "..."},
- * {"input": "..."} or {"patch": "..."}; unwrap a single-string-field object rather than refusing
- * the turn. Returns undefined when no single string can be recovered.
+ * {"input": "..."} or {"patch": "..."}; Kimi's native call markup also emits {"call_id": "...",
+ * "argument": "..."} (singular key plus an id). Unwrap a single-string-field object rather than
+ * refusing the turn, ignoring id/index metadata keys. Returns undefined when no single string can
+ * be recovered (for example only pragma numbers like yield_time_ms and no code at all).
  */
+const CUSTOM_PAYLOAD_KEYS = ['input', 'code', 'source', 'patch', 'script', 'text', 'content', 'arguments', 'argument', 'args', 'raw', 'body', 'value', 'cmd', 'command', 'js', 'javascript'];
+const CUSTOM_METADATA_KEYS = new Set(['call_id', 'callId', 'id', 'index', 'name', 'tool', 'type']);
 export function coerceCustomArguments(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (value === undefined || value === null) return '';
   if (!isRecord(value)) return undefined;
-  const keys = Object.keys(value);
-  for (const key of ['input', 'code', 'source', 'patch', 'script', 'text', 'content', 'arguments', 'raw']) if (typeof value[key] === 'string') return value[key] as string;
+  for (const key of CUSTOM_PAYLOAD_KEYS) if (typeof value[key] === 'string') return value[key] as string;
+  const keys = Object.keys(value).filter(key => !CUSTOM_METADATA_KEYS.has(key));
   const strings = keys.filter(key => typeof value[key] === 'string');
   if (keys.length === 1 && strings.length === 1) return value[strings[0]!] as string;
   return undefined;
@@ -264,7 +268,10 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     const rawArgs = inner.arguments ?? inner.input ?? inner.parameters;
     if (descriptor.type === 'custom') {
       const raw = coerceCustomArguments(rawArgs);
-      if (raw === undefined) return refuse(`passed non-string arguments to custom tool ${descriptor.proxyName}; its arguments must be one raw string, not a JSON object`, 'custom-args-type', { tool: descriptor.proxyName });
+      if (raw === undefined) {
+        const seen = isRecord(rawArgs) ? Object.keys(rawArgs).map(fieldName).join(', ') : typeof rawArgs;
+        return refuse(`passed non-string arguments to custom tool ${descriptor.proxyName} (got ${seen}) with no string payload; its arguments must be one raw string holding the whole input (for exec, the JavaScript source itself; options go in a first-line // @exec: pragma), not a JSON object`, 'custom-args-type', { tool: descriptor.proxyName });
+      }
       if (raw !== rawArgs) logSafe('cursor-custom-args-unwrapped', { tool: descriptor.proxyName });
       return { name: descriptor.proxyName, arguments: raw, callId: randomId('call') };
     }

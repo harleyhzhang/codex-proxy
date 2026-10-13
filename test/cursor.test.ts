@@ -14,6 +14,21 @@ test('Cursor unwraps object-wrapped custom tool arguments instead of refusing th
  expect(out.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['exec','text(1)']]);
 });
 
+test('Cursor unwraps Kimi native-markup custom calls that carry a call_id beside a singular argument key (October 13 refusal)',()=>{
+ // Exact shape captured in mixed/cursor-integration/invalid-output on October 13: {call_id, argument}.
+ expect(coerceCustomArguments({call_id:'call_6b3a',argument:'text(JSON.stringify(ALL_TOOLS.map(t=>t.name)));'})).toBe('text(JSON.stringify(ALL_TOOLS.map(t=>t.name)));');
+ expect(coerceCustomArguments({id:'x',index:1,payload:'raw'})).toBe('raw');
+ expect(coerceCustomArguments({cmd:'ls'})).toBe('ls');
+ // Only pragma numbers and no code at all is still unrecoverable.
+ expect(coerceCustomArguments({max_output_tokens:4000,yield_time_ms:25000})).toBeUndefined();
+ const req={model:'kimi-k3',input:'t',tools:[{type:'custom',name:'exec'}]} as const;
+ const markup='Checking ALL_TOOLS.<|open|>tools<|sep|><|open|>call tool="exec" index="1"<|sep|><|open|>argument key="call_id" type="string"<|sep|>call_6b3a<|close|>argument<|sep|><|open|>argument key="argument" type="string"<|sep|>text(ALL_TOOLS.length);<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>';
+ const out=parseCursorOutput(markup,req as never);
+ expect(out.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['exec','text(ALL_TOOLS.length);']]);
+ const bad=JSON.stringify({text:'',tool_calls:[{name:'exec',arguments:{max_output_tokens:4000,yield_time_ms:25000}}]});
+ expect(()=>parseCursorOutput(bad,req as never)).toThrow(/got max_output_tokens, yield_time_ms.*@exec: pragma/);
+});
+
 test('Cursor sanitizer drops encrypted reasoning and compaction items and replaces media parts instead of refusing the turn',()=>{
  type R=Record<string,unknown>;
  const history=[
