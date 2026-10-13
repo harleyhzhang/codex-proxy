@@ -163,6 +163,11 @@ export const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded']);
 /** Subscription CLIs report a prompt over the model window in prose; match it so Codex sees the native code. */
 export const CONTEXT_OVERFLOW_TEXT = /prompt is too long|context (?:window|length)(?: limit)? (?:exceeded|reached)|exceeds? (?:the )?(?:model'?s? )?(?:maximum )?context|too many (?:input )?tokens/i;
 
+/** Retrying an oversized prompt can never succeed, so it is terminal with the native overflow code. */
+export function contextOverflowError(backend: string): BackendError {
+  return new BackendError(`${backend}: the conversation is longer than the model's context window. Compact the conversation or start a new thread.`, { code: 'context_length_exceeded' });
+}
+
 /**
  * Prepares a body for a backend: maps the public slug to the CLI model id and removes
  * OpenAI-hosted tools, telling the model they are unavailable this turn.

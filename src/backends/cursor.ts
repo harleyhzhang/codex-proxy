@@ -9,7 +9,7 @@ import { positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
-import { BackendError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { repairJsonStrings } from './grok';
 import { logSafe } from '../log';
 
@@ -354,7 +354,10 @@ export async function* connectFrames(body: ReadableStream<Uint8Array>): AsyncGen
       pending = pending.slice(5 + length);
       if (!isRecord(value)) throw new CursorError('Cursor returned an invalid stream record');
       if (flags === 2) {
-        if (value.error) throw new CursorError('Cursor stream failed; no automatic supplier fallback');
+        if (value.error) {
+          if (CONTEXT_OVERFLOW_TEXT.test(JSON.stringify(value.error))) throw contextOverflowError('Cursor');
+          throw new CursorError('Cursor stream failed; no automatic supplier fallback');
+        }
       } else yield value;
     }
   }

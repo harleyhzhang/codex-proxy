@@ -50,6 +50,7 @@ await Bun.write('${scratch}/grok.pid', String(process.pid));
 if (key === 'GROK_CRASH') { console.error('grok: segmentation fault'); process.exit(7); }
 if (key === 'GROK_AUTH') { console.error('error: unauthorized (401) - please run grok login'); process.exit(1); }
 if (key === 'GROK_QUOTA') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'rate limit exceeded: quota'})); process.exit(0); }
+if (key === 'GROK_OVERFLOW') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'Prompt is too long: 300000 tokens > 256000 maximum'})); process.exit(0); }
 if (key === 'GROK_GARBAGE') { console.log('<<<not json>>>'); process.exit(0); }
 if (key === 'GROK_HANG') { await new Promise(() => {}); }
 if (key === 'GROK_EMPTY') { process.exit(0); }
@@ -165,7 +166,7 @@ describe('Claude CLI subprocess failures through the router', () => {
   test('a prompt over the context window is the native context_length_exceeded code, never retried', async () => {
     const app = await fixtureRouter();
     try {
-      expectTerminal(await everyTransport(app, body(MODEL, 'CLI_OVERFLOW')), 'context_length_exceeded', 'Prompt is too long', 'context_length_exceeded');
+      expectTerminal(await everyTransport(app, body(MODEL, 'CLI_OVERFLOW')), 'context_length_exceeded', 'context window', 'context_length_exceeded');
     } finally { await app.close(); }
   });
 
@@ -259,6 +260,14 @@ describe('Grok Build subprocess failures through the router', () => {
     try {
       expectTerminal(await everyTransport(app, body(MODEL, 'GROK_QUOTA')), 'invalid_request_error', 'no automatic fallback');
       expect(await invocations('GROK_QUOTA')).toBe(3);
+    } finally { await app.close(); }
+  });
+
+  test('a prompt over the context window is the native context_length_exceeded code and is never retried', async () => {
+    const app = await fixtureRouter();
+    try {
+      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_OVERFLOW')), 'context_length_exceeded', 'context window', 'context_length_exceeded');
+      expect(await invocations('GROK_OVERFLOW')).toBe(3);
     } finally { await app.close(); }
   });
 

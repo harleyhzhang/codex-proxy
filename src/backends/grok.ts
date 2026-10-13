@@ -10,7 +10,7 @@ import { isRecord, type JsonRecord, randomId, sha256 } from '../json';
 import { logSafe } from '../log';
 import { outputSchema, preparePrompt, requestToPrompt, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
-import { BackendError, classifyCliFailure, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
@@ -395,7 +395,7 @@ function jsonLines(stdout: string): JsonRecord[] {
  * A non-zero exit is classified from stderr and the CLI's own status records only, because stdout
  * also carries model text that can mention any word.
  */
-function exitFailure(exit: number, stdout: string, stderr: string): GrokError {
+function exitFailure(exit: number, stdout: string, stderr: string): BackendError {
   const records = jsonLines(stdout);
   const status = records
     .filter((record) => record.type === 'result' || record.type === 'error' || record.is_error === true)
@@ -409,6 +409,7 @@ function exitFailure(exit: number, stdout: string, stderr: string): GrokError {
       }),
     );
   const { category, retryable } = classifyCliFailure(`${stderr}\n${status.join('\n')}`);
+  if (CONTEXT_OVERFLOW_TEXT.test(`${stderr}\n${status.join('\n')}`)) return contextOverflowError('Grok Build');
   logSafe('grok-exit', {
     exit,
     category,
@@ -472,6 +473,8 @@ function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
       hint: errorText.slice(0, 120),
     });
     if (failure && !failure.retryable) throw new GrokError(`Grok Build ${failure.category}; no automatic fallback`);
+    // Resending an oversized prompt can never succeed; give Codex its native overflow code.
+    if (CONTEXT_OVERFLOW_TEXT.test(errorText)) throw contextOverflowError('Grok Build');
     throw new GrokError(
       nativeCalls.length
         ? 'Grok did not complete a valid constrained turn (it tried disabled native tools; return Codex tool_calls instead)'

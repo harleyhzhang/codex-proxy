@@ -50,6 +50,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     const headers = { 'content-type': 'application/connect+json' };
     const run = (result) => ({ result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result, model: { id: 'kimi-k3', params: [{ id: 'reasoning', value: 'high' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } });
     if (scenario === 'STREAM_ERROR') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { runId: 'run-1' } } }), frame(2, { error: { code: 'internal' } })]), { headers });
+    if (scenario === 'STREAM_OVERFLOW') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { runId: 'run-1' } } }), frame(2, { error: { code: 'invalid_argument', message: 'prompt is too long for this model' } })]), { headers });
     if (scenario === 'TRUNCATED') return new Response(frame(0, run('{}')).subarray(0, 12), { headers });
     if (scenario === 'NATIVE') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { content: [{ type: 'tool_use', name: 'shell' }] } } }), frame(0, run('{}')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'UNFINISHED') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
@@ -174,6 +175,17 @@ describe('Cursor bridge failures through the router', () => {
       await scenario('CATALOG_BAD'); expectTerminal(await everyTransport(app, body('x')), 'invalid model catalog');
       await scenario('MODEL_MISSING'); expectTerminal(await everyTransport(app, body('x')), 'unavailable on the pinned Cursor account');
       await scenario('AGENT_BAD'); expectTerminal(await everyTransport(app, body('x')), 'agent creation failed');
+    } finally { await app.close(); }
+  });
+
+  test('a stream error saying the prompt is too long is the native context_length_exceeded code', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('STREAM_OVERFLOW');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('context_length_exceeded');
+        expect(cell.message, cell.transport).toContain('context window');
+      }
     } finally { await app.close(); }
   });
 

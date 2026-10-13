@@ -12,7 +12,7 @@ import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requ
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { reconnectTransport, transportError } from '../transport';
 import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
-import { BackendError, CONTEXT_OVERFLOW_TEXT, estimateVisibleTokens, type SubscriptionBackend } from './contract';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, type SubscriptionBackend } from './contract';
 
 const MODEL_ALIASES: Readonly<Record<string, string>> = {
   opus: 'opus',
@@ -410,9 +410,7 @@ async function runClaudeOnce(request: ResponsesRequest, signal: AbortSignal | un
         throw account.limits.blocked(request.model) ?? new ClaudeUsageLimitError();
       }
       // Retrying the same oversized prompt can never succeed; give Codex its native overflow code.
-      if (CONTEXT_OVERFLOW_TEXT.test(result.result ?? '')) {
-        throw new BackendError(`Claude: ${result.result}. Compact the conversation or start a new thread.`, { code: 'context_length_exceeded' });
-      }
+      if (CONTEXT_OVERFLOW_TEXT.test(result.result ?? '')) throw contextOverflowError('Claude');
       const error = new Error(result.result || 'Claude CLI returned an error');
       throw transportError(error) ?? error;
     }
