@@ -24,7 +24,7 @@ export type CursorOptions = {
   expectedEmail: string; expectedUserId: string; prefix: string; label: string; fastest?: boolean;
 };
 export class CursorError extends BackendError {
-  constructor(message: string, retryable = false, modelOutput = false) { super(message, { retryable, modelOutput }); this.name = 'CursorError'; }
+  constructor(message: string, retryable = false, modelOutput = false, retries = 1) { super(message, { retryable, modelOutput, retries }); this.name = 'CursorError'; }
 }
 
 const MAX_BYTES = 32 * 1024 * 1024;
@@ -206,10 +206,10 @@ function captureInvalidOutput(dir: string | undefined, category: string, text: s
 // Every refusal names the exact mistake so the one retry can fix it, and logs a category so the
 // failure is diagnosable afterwards. Nothing has executed when this throws, so retrying is safe.
 export function parseCursorOutput(text: string, request: ResponsesRequest, captureDir?: string, acceptProse = false): ProxyOutput {
-  const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}): never => {
+  const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}, retries = 1): never => {
     const captured = captureInvalidOutput(captureDir, category, text);
     logSafe('cursor-invalid-output', { category, bytes: text.length, captured: !!captured, ...fields });
-    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true, true);
+    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true, true, retries);
   };
   const descriptors = toolDescriptors(request.tools ?? []);
   const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));
@@ -220,7 +220,10 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     // Grok 4.7 narrates mid-task ("I'll read those sections next.") and forgets the envelope entirely.
     // The first time, refuse with the exact wrap so the retry can continue the work; if the retry is
     // still bare prose, deliver it as a text-only message rather than a failed turn. No tool runs.
-    if (!acceptProse) return refuse('returned plain prose with no JSON object; put that sentence in "text" and the next tool call in "tool_calls" of ONE object, exactly like {"text":"<your sentence>","tool_calls":[{"name":"<tool>","arguments":{...}}]}', 'prose');
+    if (!acceptProse) {
+      const quoted = JSON.stringify(text.trim().slice(0, 200));
+      return refuse(`wrote the narration ${quoted} instead of acting. Narration is not an action. Your reply must begin with the character { and end with }: put that sentence in "text" and the tool call it describes in "tool_calls", exactly like {"text":${quoted},"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}`, 'prose', {}, 2);
+    }
     logSafe('cursor-output-prose-accepted', { bytes: text.length });
     value = { text: text.trim(), tool_calls: [] };
   } else {
@@ -402,7 +405,7 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   return output;
 }
 
-async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, signal?: AbortSignal, retryNote = ''): Promise<ProxyOutput> {
+async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, signal?: AbortSignal, retryNote = '', lastAttempt = false): Promise<ProxyOutput> {
   signal?.throwIfAborted();
   const sanitized = sanitizeCursorInput(request.input);
   if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
@@ -489,7 +492,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
     }
     signal?.throwIfAborted(); controller.signal.throwIfAborted();
-    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'), retryNote !== '');
+    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'), lastAttempt && retryNote !== '');
   } catch (error) {
     // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
     // shows the real cause instead of the generic internal-router message.
@@ -515,7 +518,7 @@ export function createCursorBackend(options: CursorOptions): SubscriptionBackend
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
     catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text'] })),
-    run: (request, signal) => retryOnce('Cursor', signal, note => runCursorOnce(options, request, signal, note)),
+    run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runCursorOnce(options, request, signal, note, last)),
   };
 }
 export function configuredCursorBackend(env: Readonly<Record<string, string | undefined>> = process.env): SubscriptionBackend | undefined {

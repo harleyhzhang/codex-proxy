@@ -36,6 +36,8 @@ export type FailureOptions = {
   logEvent?: Record<string, unknown>;
   /** True only when the backend refused before anything reached Codex, so one more attempt is safe. */
   retryable?: boolean;
+  /** How many fresh attempts this refusal earns (default 1). Model-output refusals that a stronger note usually fixes may ask for 2. */
+  retries?: number;
   /**
    * True when the refusal is about what the model wrote (unparseable reply, bad tool arguments, unknown
    * tool). After the one retry, such a refusal is delivered as a chat message instead of a failed turn.
@@ -53,6 +55,7 @@ export class BackendError extends Error {
   readonly logEvent?: Record<string, unknown>;
   readonly retryable: boolean;
   readonly modelOutput: boolean;
+  readonly retries: number;
 
   constructor(message: string, options: FailureOptions = {}) {
     super(message);
@@ -61,6 +64,7 @@ export class BackendError extends Error {
     this.logEvent = options.logEvent;
     this.retryable = options.retryable ?? false;
     this.modelOutput = options.modelOutput ?? false;
+    this.retries = Math.max(1, options.retries ?? 1);
   }
 }
 
@@ -79,23 +83,31 @@ export const RETRY_MARKER = 'rejected before anything ran';
 export async function retryOnce(
   backend: string,
   signal: AbortSignal | undefined,
-  attempt: (retryNote: string) => Promise<ProxyOutput>,
+  attempt: (retryNote: string, lastAttempt: boolean) => Promise<ProxyOutput>,
 ): Promise<ProxyOutput> {
-  try {
-    return await attempt('');
-  } catch (error) {
-    if (!(error instanceof BackendError) || !error.retryable || signal?.aborted) throw error;
-    logSafe('backend-retry', { backend, reason: error.message });
+  // The first refusal decides how many fresh attempts follow (usually one). Each attempt is told
+  // whether it is the last so a backend can relax a recoverable check (e.g. accept bare prose as a
+  // chat message) only when nothing else is left to try. Non-retryable errors propagate unchanged.
+  let error: BackendError | undefined;
+  let budget = 1;
+  for (let index = 0; index <= budget; index++) {
+    const last = index === budget;
     try {
-      return await attempt(
-        ` Your previous answer was ${RETRY_MARKER}: ${error.message}. Follow the output rules exactly this time.`,
-      );
-    } catch (second) {
-      if (!(second instanceof BackendError) || !second.retryable || !second.modelOutput || signal?.aborted) throw second;
-      logSafe('backend-refusal-as-message', { backend, reason: second.message });
-      return refusalMessage(backend, second);
+      const note = error ? ` Your previous answer was ${RETRY_MARKER}: ${error.message}. Follow the output rules exactly this time.` : '';
+      return await attempt(note, last);
+    } catch (caught) {
+      if (!(caught instanceof BackendError) || !caught.retryable || signal?.aborted) throw caught;
+      if (index === 0) budget = caught.retries;
+      if (last) {
+        if (!caught.modelOutput) throw caught;
+        logSafe('backend-refusal-as-message', { backend, reason: caught.message });
+        return refusalMessage(backend, caught);
+      }
+      logSafe('backend-retry', { backend, reason: caught.message, attempt: index + 1, budget });
+      error = caught;
     }
   }
+  throw error;
 }
 
 /** A text-only output that explains a refusal in the chat instead of failing the turn. */

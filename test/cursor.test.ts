@@ -128,8 +128,9 @@ test('Cursor never caches failed identity checks',async()=>{
 });
 
 test('Cursor bare prose (Grok narration) refuses on the first attempt with the exact wrap and is delivered as text-only on the retry',()=>{
- expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/plain prose with no JSON object/);
- expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/no Codex actions were executed/);
+ expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/wrote the narration \"I'll read those sections next\.\" instead of acting/);
+ expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/must begin with the character \{/);
+ try { parseCursorOutput("I'll read those sections next.",request); } catch (error) { expect((error as CursorError).retries).toBe(2); expect((error as CursorError).retryable).toBe(true); }
  const out=parseCursorOutput("  I'll read those sections next.\n",request,undefined,true);
  expect(out.text).toBe("I'll read those sections next.");
  expect(out.toolCalls).toEqual([]);
