@@ -70,7 +70,18 @@ export function buildCatalog(nativeCache: unknown, secondary?: SecondaryCatalog,
       ...(secondary.fastest ? { service_tiers: [], additional_speed_tiers: [] } : {}),
     })) : [];
   if (secondary && !accountRows.length) throw new Error('Secondary native model cache has no selected available GPT models; run bun run account-cache');
-  return { models: [...kept, ...local.map((model, index) => catalogRow(template, model, lastPriority + index + 1)), ...accountRows] };
+  const rows = [...kept, ...local.map((model, index) => catalogRow(template, model, lastPriority + index + 1)), ...accountRows];
+  return { models: rows.map(withBaseInstructions) };
+}
+
+/**
+ * Native `ModelInfo.base_instructions` is a required string (codex-rs protocol openai_models.rs), but
+ * the app's models cache omits it on rows that carry `model_messages.instructions_template`. An
+ * empty value is never used for those rows (the template always wins) and lets the standalone CLI
+ * parse `model_catalog_json` instead of refusing to start.
+ */
+function withBaseInstructions(row: JsonRecord): JsonRecord {
+  return typeof row.base_instructions === 'string' ? row : { ...row, base_instructions: '' };
 }
 
 /**

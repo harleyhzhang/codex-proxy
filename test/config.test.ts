@@ -105,6 +105,14 @@ describe('buildCatalog', () => {
     }
   });
 
+  test('every row carries the base_instructions string native ModelInfo requires', () => {
+    const withKept = { models: [...native.models, { slug: 'gpt-own', visibility: 'list', base_instructions: 'keep me' }] };
+    const { models } = buildCatalog(withKept);
+    for (const row of models) expect(typeof row.base_instructions).toBe('string');
+    expect(models.find((row) => row.slug === 'gpt-own')!.base_instructions).toBe('keep me');
+    expect(models.find((row) => row.slug === 'gpt-main')!.base_instructions).toBe('');
+  });
+
   test('pinned efforts leave one level per row, falling back to the strongest', () => {
     const levels = (...efforts: string[]) => efforts.map((effort) => ({ effort, description: effort }));
     const { models } = pinEfforts({

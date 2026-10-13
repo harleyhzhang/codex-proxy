@@ -80,7 +80,8 @@ describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
       const run = await runCodex(app.url('/'), 'Reply with exactly the word from the model.');
       expect(run.stdout + run.stderr).toContain('ABSORBED_BY_ROUTER');
       expect(upstream.calls.filter(p => p.endsWith('/responses')).length).toBe(3);
-      expect(run.stderr).not.toMatch(/507|server_error/);
+      // Word boundaries: debug-log timestamps such as `47.511507Z` contain the digits 507.
+      expect(run.stderr).not.toMatch(/\b507\b|server_error/);
     } finally { await app.close(); }
   }, 120_000);
 

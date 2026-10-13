@@ -97,7 +97,7 @@ test('account catalog inherits secondary entitlements without modifying primary 
   const native = { models: [{ slug: 'gpt-6-astra', display_name: 'Astra', visibility: 'list', service_tiers: ['priority'], priority: 1 }] };
   const secondary = { models: [{ ...native.models[0], service_tiers: ['priority', 'ultrafast'], supported_reasoning_levels: [{ effort: 'max' }, { effort: 'ultra' }] }] };
   const result = buildCatalog(native, { cache: secondary, prefix: 'secondary', label: 'Secondary' });
-  expect(result.models[0]).toEqual(native.models[0]!);
+  expect(result.models[0]).toEqual({ ...native.models[0]!, base_instructions: '' });
   const work = result.models.find(row => row.slug === 'secondary-gpt-6-astra')!;
   expect(work.display_name).toBe('Astra (Secondary)');
   expect(work.service_tiers).toEqual(['priority', 'ultrafast']);
