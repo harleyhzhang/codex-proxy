@@ -20,7 +20,7 @@ import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, restor
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse } from './local';
-import { jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError } from './upstream';
+import { idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
 
 export type RouterOptions = {
   port: number;
@@ -224,7 +224,8 @@ export function startRouter(options: RouterOptions) {
         return body.stream ? streamResponse(response) : Response.json(response);
       }
       const headers = jsonHeaders(req.headers, { eventStream: false });
-      return relay(await postJson(upstreamFetch, path.slice(3), headers, body, deadline(req.signal)));
+      const idle = idleDeadline(req.signal, timeoutMs);
+      return relay(watchBody(await postJson(upstreamFetch, path.slice(3), headers, body, idle.signal), idle));
     } catch (error) {
       const network = transportError(error);
       if (network && !req.signal.aborted) {
@@ -257,14 +258,15 @@ export function startRouter(options: RouterOptions) {
   async function passthrough(req: Request, url: URL): Promise<Response> {
     if (req.method !== 'POST') return invalidRequest('Unsupported method', 405);
     try {
+      const idle = idleDeadline(req.signal, timeoutMs);
       const response = await upstreamFetch(UPSTREAM_URL + url.pathname.slice(3) + url.search, {
         method: 'POST',
         headers: upstreamHeaders(req.headers),
         body: req.body,
-        signal: deadline(req.signal),
+        signal: idle.signal,
         redirect: 'error',
       });
-      return relay(response);
+      return relay(watchBody(response, idle));
     } catch {
       return invalidRequest('OpenAI tool request failed; retry', 503);
     }
@@ -342,7 +344,8 @@ export function startRouter(options: RouterOptions) {
     send: (event: unknown) => void,
   ): Promise<void> {
     const { type: _type, previous_response_id: _previous, ...request } = body;
-    const response = await postJson(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, deadline(signal));
+    const idle = idleDeadline(signal, timeoutMs);
+    const response = watchBody(await postJson(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle.signal), idle);
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
       log.warn('upstream', { status: response.status, detail });

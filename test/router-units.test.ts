@@ -8,7 +8,31 @@ import type { ResponseObject } from '../src/protocol/types';
 import { equalSecret, NativeAuth } from '../src/router/auth';
 import { FOREIGN_HISTORY_ERROR, SummaryCodec } from '../src/router/capsule';
 import { HistoryCache, HistoryMiss } from '../src/router/history';
-import { jsonHeaders, upstreamErrorDetail, upstreamHeaders } from '../src/router/upstream';
+import { idleDeadline, jsonHeaders, upstreamErrorDetail, upstreamHeaders, watchBody } from '../src/router/upstream';
+
+describe('upstream idle deadline (native bounds streams by idle time, not length)', () => {
+  const drip = (chunks: number, gapMs: number) => new Response(new ReadableStream<Uint8Array>({
+    async start(controller) {
+      for (let i = 0; i < chunks; i++) { await Bun.sleep(gapMs); controller.enqueue(new TextEncoder().encode(`c${i};`)); }
+      controller.close();
+    },
+  }));
+
+  test('a stream that keeps sending outlives the window and is delivered whole', async () => {
+    const idle = idleDeadline(new AbortController().signal, 120);
+    const text = await watchBody(drip(6, 60), idle).text();
+    expect(text).toBe('c0;c1;c2;c3;c4;c5;');
+    await Bun.sleep(200);
+    expect(idle.signal.aborted).toBe(false);
+  });
+
+  test('silence longer than the window aborts with a TimeoutError', async () => {
+    const idle = idleDeadline(new AbortController().signal, 50);
+    await Bun.sleep(90);
+    expect(idle.signal.aborted).toBe(true);
+    expect((idle.signal.reason as Error).name).toBe('TimeoutError');
+  });
+});
 
 const dir = mkdtempSync(join(tmpdir(), 'csp-units-'));
 afterAll(() => rmSync(dir, { recursive: true, force: true }));

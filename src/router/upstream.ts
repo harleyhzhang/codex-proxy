@@ -56,6 +56,35 @@ export function relay(response: Response): Response {
 }
 
 /**
+ * Native Codex bounds a stream by idle time, never by total length (codex-api sse/responses.rs
+ * "idle timeout waiting for SSE"), so a long reasoning turn that keeps streaming is never cut.
+ * The returned signal aborts with a TimeoutError once `ms` pass without upstream bytes; `touch`
+ * restarts the window and `done` disarms it.
+ */
+export function idleDeadline(signal: AbortSignal, ms: number) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const done = () => clearTimeout(timer);
+  const touch = () => {
+    done();
+    timer = setTimeout(() => controller.abort(new DOMException('idle timeout waiting for upstream', 'TimeoutError')), ms);
+    timer.unref?.();
+  };
+  touch();
+  return { signal: AbortSignal.any([signal, controller.signal]), touch, done };
+}
+
+/** Restarts the idle window on every upstream chunk and disarms it when the body ends. */
+export function watchBody(response: Response, idle: { touch(): void; done(): void }): Response {
+  if (!response.body) { idle.done(); return response; }
+  const body = response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) { idle.touch(); controller.enqueue(chunk); },
+    flush() { idle.done(); },
+  }));
+  return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+}
+
+/**
  * The upstream `error` fields native Codex classifies on (codex-api api_bridge.rs): `type`
  * (`usage_limit_reached`, `usage_not_included`), `code` (`cyber_policy`, `server_is_overloaded`,
  * `slow_down`), and the reset hints shown with a usage limit. Relaying them keeps a capped or
