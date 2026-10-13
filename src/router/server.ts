@@ -168,7 +168,9 @@ export function startRouter(options: RouterOptions) {
       response = await localResponse(request, signal);
     } else {
       const { type: _type, previous_response_id: _previous, ...clean } = request;
-      const upstream = await postJson(upstreamFetch, '/responses', jsonHeaders(headers, { stripCodexMetadata: true }), clean, deadline(signal));
+      // Streamed like other turns, so bound silence rather than total time; native allows long compactions.
+      const idle = idleDeadline(signal, timeoutMs);
+      const upstream = watchBody(await postJson(upstreamFetch, '/responses', jsonHeaders(headers, { stripCodexMetadata: true }), clean, idle.signal), idle);
       if (!upstream.ok) {
         const { detail, fields } = await upstreamFailure(upstream);
         log.warn('compact-upstream', { status: upstream.status, detail });
