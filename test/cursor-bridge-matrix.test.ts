@@ -1,7 +1,7 @@
 // Cursor bridge failure modes through the router: a scripted bridge binary that really speaks the
 // local Connect handshake and SDK endpoints, failing at every stage the real bridge can fail at.
 // The scenario travels in the API key so each run also defeats the five-minute profile cache.
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,6 +16,9 @@ const USER = 'user_bridge';
 let scratch = '';
 let backend: SubscriptionBackend | undefined;
 const savedTimeout = process.env.CURSOR_TIMEOUT_MS;
+// Every cell spawns the scripted bridge on three transports; under full-suite load that can exceed
+// bun's 5s default, and a short Cursor timeout would trip normal turns. Only the hang cell shortens it.
+setDefaultTimeout(20_000);
 
 beforeAll(async () => {
   scratch = await mkdtemp(tmpdir() + '/cursor-bridge-matrix-');
@@ -72,7 +75,7 @@ await new Promise(() => {});
   backend = configuredCursorBackend({ CURSOR_BRIDGE_BIN: bridge, CURSOR_BRIDGE_SHA256: hash, CURSOR_AUTH_FILE: scratch + '/auth.json', CURSOR_CWD: scratch, CURSOR_EXPECTED_EMAIL: EMAIL, CURSOR_EXPECTED_USER_ID: USER, CURSOR_MODEL_PREFIX: 'cx', CURSOR_LABEL: 'Bridge fixture' });
   if (!backend) throw new Error('fixture backend not configured');
   (BACKENDS as SubscriptionBackend[]).push(backend);
-  process.env.CURSOR_TIMEOUT_MS = '600';
+  process.env.CURSOR_TIMEOUT_MS = '10000';
 });
 afterAll(async () => {
   if (backend) { const at = BACKENDS.indexOf(backend); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
@@ -241,7 +244,8 @@ describe('Cursor bridge failures through the router', () => {
     const app = await fixtureRouter();
     try {
       await scenario('HANG');
-      const seen = await everyTransport(app, body('x'));
+      process.env.CURSOR_TIMEOUT_MS = '600';
+      const seen = await everyTransport(app, body('x')).finally(() => { process.env.CURSOR_TIMEOUT_MS = '10000'; });
       // Same shape as the Grok CLI watchdog: a deliberate terminal refusal that names the cause,
       // never the anonymous INTERNAL message (which would hide why the turn died).
       expectTerminal(seen, 'Cursor request timed out');

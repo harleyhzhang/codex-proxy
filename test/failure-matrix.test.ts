@@ -308,7 +308,7 @@ describe('gpt models × upstream failure modes', () => {
   test('4xx answers pass through once with their status and are never retried (429 included, like native)', async () => {
     for (const status of [400, 401, 403, 404, 413, 429]) {
       let calls = 0;
-      const app = await fixtureRouter({ upstreamFetch: async () => { calls++; return new Response(JSON.stringify({ error: { type: 'upstream', message: `upstream said ${status}` } }), { status, headers: { 'content-type': 'application/json' } }); } });
+      const app = await fixtureRouter({ upstreamFetch: async () => { calls++; return new Response(JSON.stringify({ error: { type: 'upstream', message: `upstream said ${status}` } }), { status, headers: { 'content-type': 'application/json', 'x-codex-primary-used-percent': '100', 'x-request-id': 'req_1', 'set-cookie': 'secret=1' } }); } });
       try {
         const plain = await post(app, request(GPT));
         expect(plain.status).toBe(status); expect(calls).toBe(1);
@@ -316,6 +316,8 @@ describe('gpt models × upstream failure modes', () => {
         calls = 0;
         const ws = await socketTurn(app, request(GPT, { stream: true }));
         expect(ws.type).toBe('error'); expect(ws.status).toBe(status); expect(calls).toBe(1);
+        // Native reads rate-limit and request-id headers off the wrapped socket error; nothing else leaks.
+        expect(ws.headers).toEqual({ 'x-codex-primary-used-percent': '100', 'x-request-id': 'req_1' });
       } finally { await app.close(); }
     }
   });

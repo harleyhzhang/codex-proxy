@@ -346,7 +346,11 @@ export function startRouter(options: RouterOptions) {
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
       log.warn('upstream', { status: response.status, detail });
-      send({ type: 'error', status: response.status, error: upstreamFailureBody(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields) });
+      // Native reads `headers` on a wrapped socket error (responses_websocket.rs) for rate-limit
+      // windows, promo copy and request ids; forward the ones it parses.
+      const relayed: Record<string, string> = {};
+      response.headers.forEach((value, name) => { if (/^(x-codex-|x-request-id$|x-oai-request-id$|cf-ray$|x-openai-authorization-error$|x-error-json$)/i.test(name)) relayed[name] = value; });
+      send({ type: 'error', status: response.status, error: upstreamFailureBody(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields), ...(Object.keys(relayed).length ? { headers: relayed } : {}) });
       return;
     }
     const items: OutputItem[] = [];
