@@ -119,6 +119,13 @@ describe('upstream headers', () => {
     expect(await upstreamErrorDetail(new Response(JSON.stringify({ detail: 'x'.repeat(500) })))).toHaveLength(300);
     expect(await upstreamErrorDetail(new Response('<html>'))).toBe('');
   });
+
+  test('non-JSON bodies keep what native Codex would show', async () => {
+    const blocked = new Response('<html><title>Attention Required! | Cloudflare</title>Sorry, you have been blocked</html>', { status: 403 });
+    expect(await upstreamErrorDetail(blocked)).toBe('Access blocked by Cloudflare. This usually happens when connecting from a restricted region (status 403 Forbidden)');
+    expect(await upstreamErrorDetail(new Response('<html>Cloudflare blocked</html>', { status: 502 }))).toBe('');
+    expect(await upstreamErrorDetail(new Response('  upstream connect error  ', { status: 503 }))).toBe('upstream connect error');
+  });
 });
 
 describe('decodeBody', () => {

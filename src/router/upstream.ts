@@ -64,6 +64,12 @@ export function relay(response: Response): Response {
 export type UpstreamErrorFields = Partial<Record<'type' | 'code' | 'plan_type' | 'resets_at' | 'resets_in_seconds', string | number>>;
 const CLASSIFYING_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in_seconds'] as const;
 
+/**
+ * Native Codex shows this for a 403 whose body mentions a Cloudflare block (codex-api api_bridge.rs
+ * `api_error_user_message`). That body is an HTML page, so keep the signal native keys on.
+ */
+const CLOUDFLARE_BLOCKED_MESSAGE = 'Access blocked by Cloudflare. This usually happens when connecting from a restricted region';
+
 /** The message (never more than 300 chars) and classifying fields of an upstream error body. */
 export async function upstreamFailure(response: Response): Promise<{ detail: string; fields: UpstreamErrorFields }> {
   const text = await response.text().catch(() => '');
@@ -76,6 +82,11 @@ export async function upstreamFailure(response: Response): Promise<{ detail: str
     }
     return { detail: String(parsed?.error?.message ?? parsed?.detail ?? '').slice(0, 300), fields };
   } catch {
+    if (response.status === 403 && text.includes('Cloudflare') && text.includes('blocked')) {
+      return { detail: `${CLOUDFLARE_BLOCKED_MESSAGE} (status 403 Forbidden)`, fields: {} };
+    }
+    // A plain-text body (not an HTML error page) is the only explanation upstream gave.
+    if (text && !/^\s*</.test(text)) return { detail: text.trim().slice(0, 300), fields: {} };
     return { detail: '', fields: {} };
   }
 }
