@@ -158,7 +158,7 @@ export function terminalEvent(error: BackendError) {
  * Codes native Codex classifies itself (codex-api sse/responses.rs): `context_length_exceeded` becomes
  * ContextWindowExceeded, which stops retrying and tells the user to compact instead of looping.
  */
-export const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded']);
+export const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded', 'server_is_overloaded']);
 
 /** Subscription CLIs report a prompt over the model window in prose; match it so Codex sees the native code. */
 export const CONTEXT_OVERFLOW_TEXT = /prompt is too long|context (?:window|length)(?: limit)? (?:exceeded|reached)|exceeds? (?:the )?(?:model'?s? )?(?:maximum )?context|too many (?:input )?tokens/i;
@@ -166,6 +166,17 @@ export const CONTEXT_OVERFLOW_TEXT = /prompt is too long|context (?:window|lengt
 /** Retrying an oversized prompt can never succeed, so it is terminal with the native overflow code. */
 export function contextOverflowError(backend: string): BackendError {
   return new BackendError(`${backend}: the conversation is longer than the model's context window. Compact the conversation or start a new thread.`, { code: 'context_length_exceeded' });
+}
+
+/**
+ * Subscription CLIs already retry provider overload internally (Claude Code retries 529s), so once one
+ * reports it, another full turn is wasted work. Native Codex treats `server_is_overloaded` as
+ * ServerOverloaded: not retried, shown to the user.
+ */
+export const OVERLOADED_TEXT = /\boverloaded(?:_error)?\b|\b529\b/i;
+
+export function overloadedError(backend: string): BackendError {
+  return new BackendError(`${backend} is overloaded right now. Try again in a moment or switch models.`, { code: 'server_is_overloaded' });
 }
 
 /**

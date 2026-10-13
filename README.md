@@ -75,6 +75,7 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 | Malformed request body / unknown model | 400, not retried | 400, not retried |
 | Subscription CLI refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
 | Prompt over the model's context window | `context_length_exceeded`, not retried | a Claude, Grok or Cursor "prompt is too long" becomes the same native `context_length_exceeded` code, so Codex stops retrying and offers compaction |
+| Provider overloaded | `server_is_overloaded`, not retried | a Claude or Grok overload (529) reported after the CLI's own retries becomes native `server_is_overloaded` instead of a retried 500 that reruns the whole CLI turn |
 | Subscription CLI network drop | n/a | pending with 1–30 s backoff and progress events; see Connection recovery |
 
 `test/failure-matrix.test.ts` exercises every registered model row (GPT relay, personal and

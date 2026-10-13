@@ -29,6 +29,7 @@ while IFS= read -r input; do
     *CLI_RATE_EVENT*) echo '{"type":"assistant","error":"rate_limit"}';;
     *CLI_ERRORED*) echo '{"type":"result","subtype":"error","is_error":true,"result":"model backend exploded"}';;
     *CLI_OVERFLOW*) echo '{"type":"result","subtype":"error","is_error":true,"result":"Prompt is too long"}';;
+    *CLI_OVERLOAD*) echo '{"type":"result","subtype":"error","is_error":true,"result":"API Error: 529 Overloaded"}';;
     *CLI_NETWORK*) echo '{"type":"result","subtype":"error","is_error":true,"result":"fetch failed: network error"}';;
     *CLI_BADSTRUCT*) echo '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"x"}}';;
     *CLI_BADTOOL*) echo '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"","tool_calls":[{"name":"no_such_tool","arguments":"{}"}]}}';;
@@ -167,6 +168,13 @@ describe('Claude CLI subprocess failures through the router', () => {
     const app = await fixtureRouter();
     try {
       expectTerminal(await everyTransport(app, body(MODEL, 'CLI_OVERFLOW')), 'context_length_exceeded', 'context window', 'context_length_exceeded');
+    } finally { await app.close(); }
+  });
+
+  test('a provider overload reported after the CLI own retries is native server_is_overloaded, not a retried 500', async () => {
+    const app = await fixtureRouter();
+    try {
+      expectTerminal(await everyTransport(app, body(MODEL, 'CLI_OVERLOAD')), 'server_is_overloaded', 'overloaded right now', 'server_is_overloaded');
     } finally { await app.close(); }
   });
 

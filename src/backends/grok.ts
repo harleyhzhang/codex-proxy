@@ -10,7 +10,7 @@ import { isRecord, type JsonRecord, randomId, sha256 } from '../json';
 import { logSafe } from '../log';
 import { outputSchema, preparePrompt, requestToPrompt, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
-import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
@@ -475,6 +475,7 @@ function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
     if (failure && !failure.retryable) throw new GrokError(`Grok Build ${failure.category}; no automatic fallback`);
     // Resending an oversized prompt can never succeed; give Codex its native overflow code.
     if (CONTEXT_OVERFLOW_TEXT.test(errorText)) throw contextOverflowError('Grok Build');
+    if (OVERLOADED_TEXT.test(errorText)) throw overloadedError('Grok Build');
     throw new GrokError(
       nativeCalls.length
         ? 'Grok did not complete a valid constrained turn (it tried disabled native tools; return Codex tool_calls instead)'
