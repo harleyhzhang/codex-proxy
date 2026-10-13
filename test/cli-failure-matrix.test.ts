@@ -2,13 +2,16 @@
 // transport. The Claude CLI and Grok Build binaries are replaced by scripted stand-ins that crash,
 // hang, emit garbage, report quota or auth failures, or return malformed turns; every cell asserts
 // the exact status, error code and message Codex receives, and that the router recovers afterwards.
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
 import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const INTERNAL = 'Internal router error; Codex will retry.';
 const TIMED_OUT = 'Model connection timed out. Retrying.';
+// Every cell spawns real stand-in processes on three transports (up to six Grok runs per cell), which
+// can exceed bun's 5s default when the full suite runs in parallel.
+setDefaultTimeout(20_000);
 let scratch = '';
 const saved: Record<string, string | undefined> = {};
 const ENV = ['CLAUDE_BIN', 'CLAUDE_TIMEOUT_MS', 'GROK_BIN', 'GROK_CWD', 'GROK_TIMEOUT_MS'];
@@ -39,7 +42,7 @@ done
 `);
   await chmod(claude, 0o755);
   process.env.CLAUDE_BIN = claude;
-  process.env.CLAUDE_TIMEOUT_MS = '400';
+  process.env.CLAUDE_TIMEOUT_MS = '10000';
   // Grok stand-in: a one-shot CLI keyed on the prompt file, counting invocations per request.
   const grok = scratch + '/grok';
   await Bun.write(grok, `#!/usr/bin/env bun
@@ -60,7 +63,7 @@ console.log(JSON.stringify({type:'result',stopReason:'end_turn',num_turns:1,stru
   await chmod(grok, 0o700);
   process.env.GROK_BIN = grok;
   process.env.GROK_CWD = scratch;
-  process.env.GROK_TIMEOUT_MS = '400';
+  process.env.GROK_TIMEOUT_MS = '10000';
 });
 afterAll(async () => {
   for (const key of ENV) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
@@ -121,6 +124,13 @@ const expectTerminal = (seen: Seen[], code: string, fragment: string, streamCode
 const expectOk = (seen: Seen[], text: string) => { for (const cell of seen) { expect(cell.code, cell.transport).toBe('ok'); expect(cell.message, cell.transport).toBe(text); } };
 const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+// Turns run with a generous timeout so a cold spawn under full-suite load never trips it; only the
+// hang and garbage cells shorten it, since both backends read the timeout per turn.
+async function briefTimeout<T>(key: 'CLAUDE_TIMEOUT_MS' | 'GROK_TIMEOUT_MS', run: () => Promise<T>): Promise<T> {
+  const previous = process.env[key];
+  process.env[key] = '400';
+  try { return await run(); } finally { process.env[key] = previous; }
+}
 
 describe('Claude CLI subprocess failures through the router', () => {
   const MODEL = 'claude-opus-5-5';
@@ -144,7 +154,7 @@ describe('Claude CLI subprocess failures through the router', () => {
     const app = await fixtureRouter();
     try {
       for (const token of ['CLI_HANG', 'CLI_GARBAGE']) {
-        const seen = await everyTransport(app, body(MODEL, token));
+        const seen = await briefTimeout('CLAUDE_TIMEOUT_MS', () => everyTransport(app, body(MODEL, token)));
         expectRetryable(seen, TIMED_OUT);
         expect(seen[0]!.status).toBe(503);
         const pid = Number(await readFile(scratch + '/claude.pid', 'utf8'));
@@ -292,7 +302,7 @@ describe('Grok Build subprocess failures through the router', () => {
   test('a hung CLI is killed at the Grok timeout and refused with the timeout message', async () => {
     const app = await fixtureRouter();
     try {
-      const seen = await everyTransport(app, body(MODEL, 'GROK_HANG'));
+      const seen = await briefTimeout('GROK_TIMEOUT_MS', () => everyTransport(app, body(MODEL, 'GROK_HANG')));
       expectTerminal(seen, 'invalid_request_error', 'timed out');
       const pid = Number(await readFile(scratch + '/grok.pid', 'utf8'));
       await sleep(50);
