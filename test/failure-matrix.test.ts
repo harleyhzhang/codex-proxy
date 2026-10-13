@@ -404,6 +404,24 @@ describe('gpt models × upstream failure modes', () => {
       }
     } finally { await app.close(); }
   });
+
+  test('compaction: OpenAI usage-limit, cyber-policy and overload fields survive so native classifies them', async () => {
+    let reply = { status: 429, error: { type: 'usage_limit_reached', message: 'cap', plan_type: 'pro', resets_at: 1_900_000_000 } as Record<string, unknown> };
+    let calls = 0;
+    const app = await fixtureRouter({ summaryKey: Buffer.alloc(32, 5), upstreamFetch: async () => { calls++; return Response.json({ error: reply.error }, { status: reply.status }); } });
+    const compaction = request(GPT, { input: [{ role: 'user', content: 'hi' }, { type: 'compaction_trigger' }] });
+    try {
+      const capped = await post(app, compaction);
+      expect(capped.status).toBe(429); expect(calls).toBe(1);
+      expect(((await capped.json()) as any).error).toMatchObject({ type: 'usage_limit_reached', plan_type: 'pro', resets_at: 1_900_000_000 });
+      reply = { status: 400, error: { type: 'invalid_request_error', code: 'cyber_policy', message: 'flagged' } };
+      const flagged = ((await (await post(app, compaction)).json()) as any).error;
+      expect(flagged.code).toBe('cyber_policy'); expect(flagged.message).toContain('flagged');
+      reply = { status: 503, error: { type: 'server_error', code: 'server_is_overloaded', message: 'busy' } };
+      const ws = await socketTurn(app, compaction);
+      expect(ws).toMatchObject({ type: 'error', status: 503, error: { code: 'server_is_overloaded' } });
+    } finally { await app.close(); }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

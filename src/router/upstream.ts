@@ -12,7 +12,7 @@ export type UpstreamFetch = (url: string, init: RequestInit) => Promise<Response
  * 5xx is retryable, 4xx is not. Reporting every failure as 400 would suppress that retry.
  */
 export class UpstreamStatusError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly fields: UpstreamErrorFields = {}) {
     super(message);
     this.name = 'UpstreamStatusError';
   }
@@ -55,15 +55,34 @@ export function relay(response: Response): Response {
   return new Response(response.body, { status: response.status, headers });
 }
 
-/** The error message from an upstream error body, if it has one. Never more than 300 chars. */
-export async function upstreamErrorDetail(response: Response): Promise<string> {
+/**
+ * The upstream `error` fields native Codex classifies on (codex-api api_bridge.rs): `type`
+ * (`usage_limit_reached`, `usage_not_included`), `code` (`cyber_policy`, `server_is_overloaded`,
+ * `slow_down`), and the reset hints shown with a usage limit. Relaying them keeps a capped or
+ * flagged request terminal with native's own message instead of a generic retry-limit error.
+ */
+export type UpstreamErrorFields = Partial<Record<'type' | 'code' | 'plan_type' | 'resets_at' | 'resets_in_seconds', string | number>>;
+const CLASSIFYING_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in_seconds'] as const;
+
+/** The message (never more than 300 chars) and classifying fields of an upstream error body. */
+export async function upstreamFailure(response: Response): Promise<{ detail: string; fields: UpstreamErrorFields }> {
   const text = await response.text().catch(() => '');
   try {
-    const parsed = JSON.parse(text) as { error?: { message?: unknown }; detail?: unknown };
-    return String(parsed?.error?.message ?? parsed?.detail ?? '').slice(0, 300);
+    const parsed = JSON.parse(text) as { error?: Record<string, unknown>; detail?: unknown };
+    const fields: UpstreamErrorFields = {};
+    for (const key of CLASSIFYING_FIELDS) {
+      const value = parsed?.error?.[key];
+      if (typeof value === 'string' || typeof value === 'number') fields[key] = value;
+    }
+    return { detail: String(parsed?.error?.message ?? parsed?.detail ?? '').slice(0, 300), fields };
   } catch {
-    return '';
+    return { detail: '', fields: {} };
   }
+}
+
+/** The error message from an upstream error body, if it has one. Never more than 300 chars. */
+export async function upstreamErrorDetail(response: Response): Promise<string> {
+  return (await upstreamFailure(response)).detail;
 }
 
 /**
