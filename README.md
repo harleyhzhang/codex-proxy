@@ -64,7 +64,7 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 
 | Situation | Native Codex | This router |
 | --- | --- | --- |
-| OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); covers turns, compaction and bridge calls |
+| OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling, ±10% jitter | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); covers turns, compaction and bridge calls |
 | Dropped socket to OpenAI | retried 4x | same; timeouts are not retried (Codex owns that budget) |
 | OpenAI 4xx incl. 429 | not retried, status surfaced | relayed once with the real status and body |
 | Lasting 5xx | surfaced with real status | surfaced with real status as `server_error`, never masked as 400 |

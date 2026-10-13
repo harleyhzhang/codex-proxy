@@ -1,11 +1,17 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { responseObject, streamResponse } from '../src/protocol/output';
 import type { ResponsesBody } from '../src/protocol/types';
-import { postJson } from '../src/router/upstream';
+import { postJson, retryDelayMs } from '../src/router/upstream';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const saved = process.env.UPSTREAM_RETRY_BASE_MS;
 beforeAll(() => { process.env.UPSTREAM_RETRY_BASE_MS = '1'; });
+
+test('upstream backoff matches native Codex: 200ms doubling with 0.9-1.1 jitter', () => {
+  expect(retryDelayMs(200, 0, () => 0)).toBe(180);
+  expect(retryDelayMs(200, 0, () => 0.5)).toBe(200);
+  expect(retryDelayMs(200, 3, () => 0.999999)).toBe(1759);
+});
 afterAll(() => { if (saved === undefined) delete process.env.UPSTREAM_RETRY_BASE_MS; else process.env.UPSTREAM_RETRY_BASE_MS = saved; });
 
 const body: ResponsesBody = { model: 'gpt-6.1-sol', input: [{ role: 'user', content: 'hi' }] };
