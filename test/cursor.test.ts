@@ -126,3 +126,14 @@ test('Cursor never caches failed identity checks',async()=>{
  const rpc=async()=>{count++;return Response.json({user:{userEmail:'other@example.com',userId:'12'}})};
  for(let i=0;i<2;i++)await expect(verifyCursorProfile(pins,'bad-key',rpc)).rejects.toThrow();expect(count).toBe(2);
 });
+
+test('Cursor bare prose (Grok narration) refuses on the first attempt with the exact wrap and is delivered as text-only on the retry',()=>{
+ expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/plain prose with no JSON object/);
+ expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/no Codex actions were executed/);
+ const out=parseCursorOutput("  I'll read those sections next.\n",request,undefined,true);
+ expect(out.text).toBe("I'll read those sections next.");
+ expect(out.toolCalls).toEqual([]);
+});
+test('Cursor malformed JSON containing a brace is still refused as unparseable even on the retry',()=>{
+ expect(()=>parseCursorOutput('{"text": "oops", tool_calls: [',request,undefined,true)).toThrow(/parseable JSON object/);
+});

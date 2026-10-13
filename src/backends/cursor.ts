@@ -205,7 +205,7 @@ function captureInvalidOutput(dir: string | undefined, category: string, text: s
 
 // Every refusal names the exact mistake so the one retry can fix it, and logs a category so the
 // failure is diagnosable afterwards. Nothing has executed when this throws, so retrying is safe.
-export function parseCursorOutput(text: string, request: ResponsesRequest, captureDir?: string): ProxyOutput {
+export function parseCursorOutput(text: string, request: ResponsesRequest, captureDir?: string, acceptProse = false): ProxyOutput {
   const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}): never => {
     const captured = captureInvalidOutput(captureDir, category, text);
     logSafe('cursor-invalid-output', { category, bytes: text.length, captured: !!captured, ...fields });
@@ -216,7 +216,14 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   let candidate = text.trim();
   let value: unknown = parseNativeToolMarkup(text);
   if (value) logSafe('cursor-output-native-markup', { bytes: text.length, calls: (value as JsonRecord).tool_calls instanceof Array ? ((value as JsonRecord).tool_calls as unknown[]).length : 0 });
-  else {
+  else if (!text.includes('{')) {
+    // Grok 4.7 narrates mid-task ("I'll read those sections next.") and forgets the envelope entirely.
+    // The first time, refuse with the exact wrap so the retry can continue the work; if the retry is
+    // still bare prose, deliver it as a text-only message rather than a failed turn. No tool runs.
+    if (!acceptProse) return refuse('returned plain prose with no JSON object; put that sentence in "text" and the next tool call in "tool_calls" of ONE object, exactly like {"text":"<your sentence>","tool_calls":[{"name":"<tool>","arguments":{...}}]}', 'prose');
+    logSafe('cursor-output-prose-accepted', { bytes: text.length });
+    value = { text: text.trim(), tool_calls: [] };
+  } else {
     candidate = extractJsonObject(text);
     try { value = parseJsonLoosely(candidate); } catch {
       return refuse('did not return a parseable JSON object (expected exactly {"text": string, "tool_calls": array} with no Markdown fences or surrounding prose)', 'unparseable', { starts_object: candidate.startsWith('{'), ends_object: candidate.endsWith('}') });
@@ -311,7 +318,7 @@ export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: 
   return { input: items, ...stats };
 }
 
-const OUTPUT_RULES = `You are inside the Codex external tool loop. Return ONLY one JSON object with exactly text (string) and tool_calls (array). Each call has exactly name and arguments. Use the exact Codex tool names below. Function arguments are JSON objects; custom tool arguments are raw strings. All actions are executed externally by Codex AFTER your reply: you have no native tools. Never claim an action succeeded until its tool result appears in history. Do not wrap JSON in Markdown or add text outside it.`;
+const OUTPUT_RULES = `You are inside the Codex external tool loop. Return ONLY one JSON object with exactly text (string) and tool_calls (array). Each call has exactly name and arguments. Use the exact Codex tool names below. Function arguments are JSON objects; custom tool arguments are raw strings. All actions are executed externally by Codex AFTER your reply: you have no native tools. Never claim an action succeeded until its tool result appears in history. Do not wrap JSON in Markdown or add text outside it. To narrate progress and keep working, put the sentence in text and the next call in tool_calls of the same object; a reply whose tool_calls is empty ends the turn.`;
 
 export function readCursorKey(options: CursorOptions): string {
   const info = statSync(options.authFile);
@@ -371,7 +378,7 @@ export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEm
   try { return await value; } catch(error) { if(profileCache.get(cacheKey)===entry) profileCache.delete(cacheKey); throw error; }
 }
 
-export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRequest, selection: JsonRecord, captureDir?: string): ProxyOutput {
+export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRequest, selection: JsonRecord, captureDir?: string, acceptProse = false): ProxyOutput {
   // Treat native tools/subagent/compaction as hard failures even with tools: [] configured.
   for (const event of events) {
     const sdk = isRecord(event.sdkMessage) ? event.sdkMessage : undefined;
@@ -387,7 +394,7 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   if (!result || result.status !== FINISHED || !run || run.status !== FINISHED || !isRecord(done) || done.runId !== result.runId || typeof run.result !== 'string') throw new CursorError('Cursor did not finish successfully; no automatic supplier fallback');
   const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
   if (!sameModel) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
-  const output = parseCursorOutput(run.result, request, captureDir);
+  const output = parseCursorOutput(run.result, request, captureDir, acceptProse);
   if (isRecord(run.usage)) {
     const input = Number(run.usage.inputTokens ?? 0) + Number(run.usage.cacheReadTokens ?? 0) + Number(run.usage.cacheWriteTokens ?? 0), out = Number(run.usage.outputTokens ?? 0);
     if ([input,out].every(n => Number.isSafeInteger(n) && n >= 0)) output.usage = { inputTokens: input, outputTokens: out, totalTokens: input + out };
@@ -482,7 +489,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
     }
     signal?.throwIfAborted(); controller.signal.throwIfAborted();
-    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'));
+    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'), retryNote !== '');
   } catch (error) {
     // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
     // shows the real cause instead of the generic internal-router message.

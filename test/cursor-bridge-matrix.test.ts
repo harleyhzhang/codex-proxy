@@ -55,6 +55,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     if (scenario === 'UNFINISHED') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'WRONG_MODEL') { const body = run(JSON.stringify({ text: 'x', tool_calls: [] })); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'BAD_OUTPUT') return new Response(Buffer.concat([frame(0, run('this is not the JSON object')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
+    if (scenario === 'BAD_JSON') return new Response(Buffer.concat([frame(0, run('{"text": "oops", tool_calls: [')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_OK', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
   }
   return json({ code: 'unimplemented' }, 404);
@@ -186,14 +187,26 @@ describe('Cursor bridge failures through the router', () => {
     } finally { await app.close(); }
   });
 
-  test('malformed model output is retried once and then delivered as a chat message, not a failed turn', async () => {
+  test('malformed JSON output is retried once and then delivered as a refusal chat message, not a failed turn', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('BAD_JSON');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toContain('Cursor could not produce a valid action');
+        expect(cell.message, cell.transport).toContain('no Codex actions were executed');
+        if (cell.transport === 'http') expect(cell.status).toBe(200);
+      }
+    } finally { await app.close(); }
+  });
+
+  test('bare prose (Grok narration) is retried once and then delivered verbatim as a text-only chat message', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('BAD_OUTPUT');
       for (const cell of await everyTransport(app, body('x'))) {
         expect(cell.code, cell.transport).toBe('ok');
-        expect(cell.message, cell.transport).toContain('Cursor could not produce a valid action');
-        expect(cell.message, cell.transport).toContain('no Codex actions were executed');
+        expect(cell.message, cell.transport).toBe('this is not the JSON object');
         if (cell.transport === 'http') expect(cell.status).toBe(200);
       }
     } finally { await app.close(); }
