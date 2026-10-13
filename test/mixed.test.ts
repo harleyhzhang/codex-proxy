@@ -10,7 +10,7 @@ import { HistoryCache, HistoryMiss } from '../src/router/history';
 import { sseEvents, decodeBody } from '../src/protocol/stream';
 import { startRouter } from '../src/router/server';
 import { localResponse } from '../src/router/local';
-import { SummaryCodec, compactRequest } from '../src/router/capsule';
+import { SummaryCodec, compactRequest, portableSummary } from '../src/router/capsule';
 import { claudeUsageSnapshot } from '../src/backends/claude-limits';
 import { claudeBackend } from '../src/backends/claude';
 test('Claude task payload reaches GPT as text while native ciphertext and other items stay intact',()=>{
@@ -127,5 +127,26 @@ test('native tools preserve authenticated raw requests and upstream responses',a
   expect((await fetch(server.url+'v1/images/edits',{method:'POST',body:'unauthorized'})).status).toBe(401);
   expect((await fetch(server.url+'v1/unrelated',{method:'POST',headers:{authorization:'Bearer fixture'},body:'{}'})).status).toBe(404);
   expect(calls).toHaveLength(3);
+ } finally {server.stop(true);await rm(dir,{recursive:true});}
+});
+
+test('GPT never receives legacy ts_ tool search ids, including receipts restored from a capsule',async()=>{
+ const dir=await mkdtemp(tmpdir()+'/mixed-tsc-');
+ const key=crypto.getRandomValues(new Uint8Array(32));
+ await Bun.write(dir+'/auth.json',JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:'fixture',account_id:'fixture-account'}}));
+ await Bun.write(dir+'/catalog.json','{}');await Bun.write(dir+'/summary.key',key);
+ const search=(id:string,call:string)=>[{id,type:'tool_search_call',status:'completed',call_id:call,execution:'client',arguments:{query:'browser'}},{type:'tool_search_output',call_id:call,execution:'client',status:'completed',tools:[]}];
+ const capsule=new SummaryCodec(Buffer.from(key)).seal(portableSummary('fixture summary',[{role:'user',content:'find a tool'},...search('ts_capsule','call_capsule')]));
+ const calls:any[]=[];
+ const server=startRouter({port:0,authFile:dir+'/auth.json',catalog:dir+'/catalog.json',summaryKeyFile:dir+'/summary.key',upstreamFetch:(async(url:any,init:any)=>{
+  calls.push(JSON.parse(await new Request(url,init).text()));
+  return Response.json({id:'resp_fixture',object:'response',status:'completed',output:[]});
+ }) as typeof fetch});
+ try {
+  const input=[{type:'compaction',encrypted_content:capsule},...search('ts_saved','call_saved'),{role:'user',content:'say ok'}];
+  const response=await fetch(server.url+'v1/responses',{method:'POST',headers:{authorization:'Bearer fixture','chatgpt-account-id':'fixture-account'},body:JSON.stringify({model:'gpt-test',input,stream:false})});
+  expect(response.status).toBe(200);
+  const ids=calls[0].input.filter((item:any)=>item.type==='tool_search_call').map((item:any)=>item.id);
+  expect(ids).toEqual(['tsc_capsule','tsc_saved']);
  } finally {server.stop(true);await rm(dir,{recursive:true});}
 });

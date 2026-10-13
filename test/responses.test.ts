@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { responseObject, streamResponse } from '../src/protocol/output';
+import { responseObject, streamResponse, upgradeToolSearchIds } from '../src/protocol/output';
 
 describe("Responses API output", () => {
   const request = { model: "sonnet", input: "hello", stream: true } as const;
@@ -57,5 +57,16 @@ describe("Responses API output", () => {
       execution: "client",
       arguments: { query: "browser cua_repl node_repl", limit: 8 },
     });
+    expect(String(response.output[1].id)).toMatch(/^tsc_[0-9a-f]{32}$/);
+  });
+
+  test("upgrades legacy ts_ tool search ids that OpenAI rejects", () => {
+    const legacy = { id: "ts_0123456789abcdef0123456789abcdef", type: "tool_search_call", call_id: "call_1", execution: "client", arguments: { query: "browser" } };
+    const current = { id: "tsc_abc", type: "tool_search_call", call_id: "call_2", execution: "client", arguments: { query: "files" } };
+    const other = { id: "ts_not_a_search", type: "function_call", call_id: "call_3", name: "f", arguments: "{}" };
+    const upgraded = upgradeToolSearchIds({ model: "gpt-test", input: [legacy, current, other] });
+    expect(upgraded.input).toEqual([{ ...legacy, id: "tsc_0123456789abcdef0123456789abcdef" }, current, other]);
+    const clean = { model: "gpt-test", input: [current, other] };
+    expect(upgradeToolSearchIds(clean)).toBe(clean);
   });
 });

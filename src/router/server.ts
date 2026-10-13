@@ -9,7 +9,7 @@ import { BackendError, terminalEvent } from '../backends/contract';
 import { assertRoutable, backendFor, isLocalModel, secondaryClaude } from '../backends/registry';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
-import { responseObject, streamResponse } from '../protocol/output';
+import { responseObject, streamResponse, upgradeToolSearchIds } from '../protocol/output';
 import { pendingResponse, pendingStream } from '../protocol/pending';
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
@@ -144,14 +144,15 @@ export function startRouter(options: RouterOptions) {
     }
     const withList = typeof body.input === 'string' ? { ...body, input: [{ role: 'user', content: body.input }] } : body;
     let expanded = normalizeAgentPayloads(history.expand(withList));
-    if (!codec || body.generate === false) return expanded;
+    if (!codec || body.generate === false) return upgradeToolSearchIds(expanded);
 
     const local = isLocalModel(body.model);
     const bridge = bridgeFor(headers);
     if (local && Array.isArray(expanded.input)) {
       expanded = { ...expanded, input: await restoreAgentMessages(expanded.input, bridge) };
     }
-    return codec.unwrap(expanded, local, bridge && ((encrypted) => bridge.summary(encrypted)));
+    // Capsules restore tool receipts, so upgrade ids after unwrapping.
+    return upgradeToolSearchIds(await codec.unwrap(expanded, local, bridge && ((encrypted) => bridge.summary(encrypted))));
   }
 
   /** Produces a compaction item: a sealed capsule holding the summary and verbatim requests. */

@@ -1,7 +1,7 @@
 // Renders a backend's output as a Responses API object and as the equivalent SSE stream.
 import { randomId } from '../json';
 import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
-import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, StreamEvent, ToolCall } from './types';
+import type { OutputItem, ProxyOutput, ResponseInputItem, ResponseObject, ResponsesBody, ResponseTool, StreamEvent, ToolCall } from './types';
 
 type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown };
 
@@ -19,13 +19,27 @@ function toolSearchItem(call: ToolCall): OutputItem {
     throw new Error('Tool search arguments must include a query string');
   }
   return {
-    id: randomId('ts'),
+    // OpenAI rejects replayed tool_search_call ids unless they start with `tsc`.
+    id: randomId('tsc'),
     type: 'tool_search_call',
     status: 'completed',
     call_id: call.callId ?? randomId('call'),
     execution: 'client',
     arguments: args,
   };
+}
+
+const isLegacyToolSearch = (item: ResponseInputItem): item is ResponseInputItem & { id: string } =>
+  item?.type === 'tool_search_call' && typeof item.id === 'string' && item.id.startsWith('ts_');
+
+/**
+ * Earlier builds minted tool searches as `ts_…`, which OpenAI rejects with HTTP 400 ("Expected an
+ * ID that begins with 'tsc'"). Codex replays saved ids and capsules restore tool receipts, so a chat
+ * that switched to GPT kept failing; rewrite them before the request leaves the router.
+ */
+export function upgradeToolSearchIds(body: ResponsesBody): ResponsesBody {
+  if (!Array.isArray(body.input) || !body.input.some(isLegacyToolSearch)) return body;
+  return { ...body, input: body.input.map((item) => (isLegacyToolSearch(item) ? { ...item, id: `tsc_${item.id.slice(3)}` } : item)) };
 }
 
 function computerItem(call: ToolCall): OutputItem {
