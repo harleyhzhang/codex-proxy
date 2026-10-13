@@ -56,6 +56,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     if (scenario === 'WRONG_MODEL') { const body = run(JSON.stringify({ text: 'x', tool_calls: [] })); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'BAD_OUTPUT') return new Response(Buffer.concat([frame(0, run('this is not the JSON object')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'BAD_JSON') return new Response(Buffer.concat([frame(0, run('{"text": "oops", tool_calls: [')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
+    if (scenario === 'PROSE_THEN_JSON') { globalThis.__sends = (globalThis.__sends || 0) + 1; return new Response(Buffer.concat([frame(0, run(globalThis.__sends === 1 ? 'I will read the file next.' : JSON.stringify({ text: 'wrapped after correction', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_OK', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
   }
   return json({ code: 'unimplemented' }, 404);
@@ -200,7 +201,19 @@ describe('Cursor bridge failures through the router', () => {
     } finally { await app.close(); }
   });
 
+  test('narration is corrected inside the same agent, so one attempt yields the wrapped reply', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('PROSE_THEN_JSON');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toBe('wrapped after correction');
+      }
+    } finally { await app.close(); }
+  });
+
   test('bare prose (Grok narration) is retried once and then delivered verbatim as a text-only chat message', async () => {
+    // (kept for the case where the agent keeps narrating after the in-agent correction)
     const app = await fixtureRouter();
     try {
       await scenario('BAD_OUTPUT');

@@ -27,6 +27,11 @@ export class CursorError extends BackendError {
   constructor(message: string, retryable = false, modelOutput = false, retries = 1) { super(message, { retryable, modelOutput, retries }); this.name = 'CursorError'; }
 }
 
+/** Bare narration with no JSON object. The agent that wrote it can be asked to wrap it in place. */
+export class CursorProseError extends CursorError {
+  constructor(message: string) { super(message, true, true, 2); this.name = 'CursorProseError'; }
+}
+
 const MAX_BYTES = 32 * 1024 * 1024;
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 const PRIVATE_ENV = /^(CURSOR_|AGENT_|OPENAI_|ANTHROPIC_|CLAUDE_CODE_|XAI_|GROK_|PROXY_|NODE_OPTIONS$|BUN_OPTIONS$)/;
@@ -209,7 +214,8 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   const refuse = (reason: string, category: string, fields: Record<string, unknown> = {}, retries = 1): never => {
     const captured = captureInvalidOutput(captureDir, category, text);
     logSafe('cursor-invalid-output', { category, bytes: text.length, captured: !!captured, ...fields });
-    throw new CursorError(`Cursor ${reason}; no Codex actions were executed`, true, true, retries);
+    const message = `Cursor ${reason}; no Codex actions were executed`;
+    throw category === 'prose' ? new CursorProseError(message) : new CursorError(message, true, true, retries);
   };
   const descriptors = toolDescriptors(request.tools ?? []);
   const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));
@@ -405,6 +411,8 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   return output;
 }
 
+const PROSE_CORRECTION = 'Your last reply was narration with no JSON object, so nothing ran. Reply again now with ONLY one JSON object that begins with { : put that sentence in "text" and the tool call it describes in "tool_calls". If you meant to finish, put your final answer in "text" with "tool_calls": [].';
+
 async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, signal?: AbortSignal, retryNote = '', lastAttempt = false): Promise<ProxyOutput> {
   signal?.throwIfAborted();
   const sanitized = sanitizeCursorInput(request.input);
@@ -482,17 +490,30 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: [] }, disallowedTools: ['task', 'mcp'], local: { cwd: [dir], settingSources: [] } } })).json();
     if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
     agentId = created.agentId;
-    const response = await rpc('SdkAgentService', 'Send', { agentId, message: { text: `${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}` }, options: { enableSteps: true } }, true);
-    if (!response.body) throw new CursorError('Cursor returned an empty stream');
-    const events: JsonRecord[] = [];
-    for await (const event of connectFrames(response.body)) {
-      events.push(event);
-      const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
-      if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
-      if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
+    const send = async (text: string): Promise<JsonRecord[]> => {
+      const response = await rpc('SdkAgentService', 'Send', { agentId, message: { text }, options: { enableSteps: true } }, true);
+      if (!response.body) throw new CursorError('Cursor returned an empty stream');
+      const events: JsonRecord[] = [];
+      for await (const event of connectFrames(response.body)) {
+        events.push(event);
+        const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
+        if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
+        if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
+      }
+      signal?.throwIfAborted(); controller.signal.throwIfAborted();
+      return events;
+    };
+    const captureDir = join(dirname(options.cwd), 'invalid-output');
+    const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`);
+    try {
+      return interpretCursorEvents(events, request, selection, captureDir);
+    } catch (error) {
+      // A fresh agent given the same prompt repeats the same narration, so ask the agent that wrote
+      // it to wrap its own sentence while it still holds the context. Nothing has run yet.
+      if (!(error instanceof CursorProseError)) throw error;
+      logSafe('cursor-prose-correction', {});
+      return interpretCursorEvents(await send(PROSE_CORRECTION), request, selection, captureDir, lastAttempt);
     }
-    signal?.throwIfAborted(); controller.signal.throwIfAborted();
-    return interpretCursorEvents(events, request, selection, join(dirname(options.cwd), 'invalid-output'), lastAttempt && retryNote !== '');
   } catch (error) {
     // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
     // shows the real cause instead of the generic internal-router message.
