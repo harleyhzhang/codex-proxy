@@ -105,12 +105,18 @@ describe('buildCatalog', () => {
     }
   });
 
-  test('every row carries the base_instructions string native ModelInfo requires', () => {
-    const withKept = { models: [...native.models, { slug: 'gpt-own', visibility: 'list', base_instructions: 'keep me' }] };
+  test('every row carries the fields the standalone CLI ModelInfo requires', () => {
+    const withKept = { models: [...native.models, { slug: 'gpt-own', visibility: 'list', base_instructions: 'keep me', supports_parallel_tool_calls: false, model_messages: { instructions_template: 't' } }] };
     const { models } = buildCatalog(withKept);
-    for (const row of models) expect(typeof row.base_instructions).toBe('string');
-    expect(models.find((row) => row.slug === 'gpt-own')!.base_instructions).toBe('keep me');
-    expect(models.find((row) => row.slug === 'gpt-main')!.base_instructions).toBe('');
+    for (const row of models) {
+      expect(typeof row.base_instructions).toBe('string');
+      expect(typeof row.supports_reasoning_summaries).toBe('boolean');
+      expect(typeof row.supports_parallel_tool_calls).toBe('boolean');
+    }
+    const own = models.find((row) => row.slug === 'gpt-own')!;
+    expect([own.base_instructions, own.supports_parallel_tool_calls, own.supports_reasoning_summaries]).toEqual(['keep me', false, true]);
+    const main = models.find((row) => row.slug === 'gpt-main')!;
+    expect([main.base_instructions, main.supports_parallel_tool_calls, main.supports_reasoning_summaries]).toEqual(['', true, false]);
   });
 
   test('pinned efforts leave one level per row, falling back to the strongest', () => {

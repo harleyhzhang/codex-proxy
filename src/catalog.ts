@@ -71,17 +71,23 @@ export function buildCatalog(nativeCache: unknown, secondary?: SecondaryCatalog,
     })) : [];
   if (secondary && !accountRows.length) throw new Error('Secondary native model cache has no selected available GPT models; run bun run account-cache');
   const rows = [...kept, ...local.map((model, index) => catalogRow(template, model, lastPriority + index + 1)), ...accountRows];
-  return { models: rows.map(withBaseInstructions) };
+  return { models: rows.map(withNativeRequiredFields) };
 }
 
 /**
- * Native `ModelInfo.base_instructions` is a required string (codex-rs protocol openai_models.rs), but
- * the app's models cache omits it on rows that carry `model_messages.instructions_template`. An
- * empty value is never used for those rows (the template always wins) and lets the standalone CLI
- * parse `model_catalog_json` instead of refusing to start.
+ * `model_catalog_json` is read by both the desktop app's bundled Codex and the standalone `codex`
+ * CLI, whose `ModelInfo` (codex-rs protocol openai_models.rs) still requires fields the app's newer
+ * models cache omits. One missing field makes the CLI refuse to start, so fill each with the value
+ * that matches current behaviour: `base_instructions` is unused when a `model_messages` template
+ * exists, upstream GPT rows support reasoning summaries, and every route accepts parallel tool calls.
  */
-function withBaseInstructions(row: JsonRecord): JsonRecord {
-  return typeof row.base_instructions === 'string' ? row : { ...row, base_instructions: '' };
+function withNativeRequiredFields(row: JsonRecord): JsonRecord {
+  return {
+    ...row,
+    base_instructions: typeof row.base_instructions === 'string' ? row.base_instructions : '',
+    supports_reasoning_summaries: typeof row.supports_reasoning_summaries === 'boolean' ? row.supports_reasoning_summaries : isRecord(row.model_messages),
+    supports_parallel_tool_calls: typeof row.supports_parallel_tool_calls === 'boolean' ? row.supports_parallel_tool_calls : true,
+  };
 }
 
 /**
