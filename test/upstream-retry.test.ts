@@ -60,3 +60,40 @@ test('compaction survives a transient 507, and a lasting one reaches Codex as 50
     await app.close();
   }
 });
+
+test('a slow but steady compaction stream outlives the timeout, which bounds silence like native SSE', async () => {
+  const app = await fixtureRouter({
+    summaryKey: Buffer.alloc(32, 7),
+    upstreamTimeoutMs: 150,
+    upstreamFetch: async (_url, init) => {
+      const request = JSON.parse(String(init.body)) as ResponsesBody;
+      const text = await streamResponse(responseObject(request, { text: 'SUMMARY', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } })).text();
+      const events = text.split('\n\n').filter(Boolean).map((event) => `${event}\n\n`);
+      const encoder = new TextEncoder();
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          // Honour the request signal like real fetch, so a total deadline would cut the stream.
+          let aborted = false;
+          init.signal?.addEventListener('abort', () => { aborted = true; controller.error(init.signal?.reason); });
+          for (const event of events) {
+            await Bun.sleep(60);
+            if (aborted) return;
+            controller.enqueue(encoder.encode(event));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, { headers: { 'content-type': 'text/event-stream' } });
+    },
+  });
+  const compaction = { ...body, input: [{ role: 'user', content: 'hi' }, { type: 'compaction_trigger' }] };
+  try {
+    const started = Date.now();
+    const ok = await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(compaction) });
+    expect(ok.status).toBe(200);
+    expect(JSON.stringify(await ok.json())).toContain('"type":"compaction"');
+    expect(Date.now() - started).toBeGreaterThan(150);
+  } finally {
+    await app.close();
+  }
+});
