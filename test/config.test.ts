@@ -94,7 +94,7 @@ describe('buildCatalog', () => {
     const row = rows.find((r) => r.slug === 'claude-opus-5-5')!;
     expect(row.shell_type).toBe('shell');
     expect(row.visibility).toBe('list');
-    expect(row.context_window).toBe(200_000);
+    expect(row.context_window).toBe(1_000_000);
     expect(row).not.toHaveProperty('service_tiers');
     expect(row).not.toHaveProperty('upgrade');
     expect(Array.isArray(row.supported_reasoning_levels)).toBe(true);

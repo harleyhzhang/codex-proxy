@@ -451,6 +451,9 @@ const claudeModel = (slug: string, displayName: string) => ({
   efforts: EFFORTS,
   defaultEffort: 'high',
   inputModalities: ['text', 'image'] as const,
+  // The pinned Claude CLI reports contextWindow 1000000 for Opus 5.5 and Fable 5.1; advertise it so
+  // Codex compacts at the real limit instead of the 200K default.
+  contextWindow: 1_000_000,
 });
 
 export const claudeBackend: SubscriptionBackend = {
