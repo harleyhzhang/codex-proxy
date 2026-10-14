@@ -1,7 +1,7 @@
 // Talking to the ChatGPT Codex backend on the user's behalf, with the user's own credentials.
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
-import { transportError } from '../transport';
+import { reconnectTransport, transportError } from '../transport';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
@@ -165,4 +165,29 @@ export async function postJson(
     await response.body?.cancel().catch(() => {});
     await Bun.sleep(retryDelayMs(baseDelayMs, attempt));
   }
+}
+
+/**
+ * The connect phase of an upstream call during an outage. Nothing has reached Codex yet, so the
+ * same body is resent with 1-30 s backoff until OpenAI answers or Codex cancels; `postJson`'s own
+ * 4x/200 ms loop still absorbs blips inside each attempt, and a real 5xx answer still returns so
+ * native retry policy applies to it. The idle window restarts per attempt so the outage itself
+ * never counts as upstream silence. `onRetry` fires before every wait so callers can start
+ * heartbeats toward Codex. This is the GPT half of the one offline policy every backend shares
+ * (`localResponse` is the other half).
+ */
+export function connectUpstream(
+  upstreamFetch: UpstreamFetch,
+  path: string,
+  headers: Headers,
+  body: ResponsesBody,
+  idle: { signal: AbortSignal; touch(): void },
+  cancel: AbortSignal,
+  onRetry?: (attempt: number, delayMs: number) => void,
+): Promise<Response> {
+  return reconnectTransport(
+    () => { idle.touch(); return postJson(upstreamFetch, path, headers, body, idle.signal); },
+    cancel,
+    { onRetry: (attempt, delayMs) => { logSafe('upstream-offline-retry', { path, attempt, delay_ms: delayMs }); onRetry?.(attempt, delayMs); } },
+  );
 }

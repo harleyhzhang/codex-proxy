@@ -11,6 +11,7 @@ import { logSafe } from '../log';
 import { outputSchema, preparePrompt, requestToPrompt, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
 import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
+import { transportError } from '../transport';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
@@ -332,6 +333,9 @@ function grokArgs(dir: string, effort: string, request: ResponsesRequest, prompt
     '--system-prompt-override', SYSTEM_PROMPT + retryNote,
     '--json-schema', JSON.stringify(grokOutputSchema(request.tools ?? [])),
     '--output-format', 'streaming-messages-json',
+    // Raw `stream_event` deltas keep stdout live while the model thinks, so the run can be bounded
+    // by silence instead of a total deadline. `interpretRun` only reads `assistant`/`result` records.
+    '--include-partial-messages',
     '--prompt-file', promptFile,
   ];
 }
@@ -395,7 +399,7 @@ function jsonLines(stdout: string): JsonRecord[] {
  * A non-zero exit is classified from stderr and the CLI's own status records only, because stdout
  * also carries model text that can mention any word.
  */
-function exitFailure(exit: number, stdout: string, stderr: string): BackendError {
+function exitFailure(exit: number, stdout: string, stderr: string): Error {
   const records = jsonLines(stdout);
   const status = records
     .filter((record) => record.type === 'result' || record.type === 'error' || record.is_error === true)
@@ -410,6 +414,10 @@ function exitFailure(exit: number, stdout: string, stderr: string): BackendError
     );
   const { category, retryable } = classifyCliFailure(`${stderr}\n${status.join('\n')}`);
   if (CONTEXT_OVERFLOW_TEXT.test(`${stderr}\n${status.join('\n')}`)) return contextOverflowError('Grok Build');
+  // The CLI could not reach xAI: the router's shared offline policy keeps the request pending
+  // and retries it, exactly as for every other backend. The fixed transport message hides stderr.
+  const network = transportError(new Error(`${stderr}\n${status.join('\n')}`));
+  if (network?.reconnectable) { logSafe('grok-exit', { exit, category: 'network', records: records.length }); return network; }
   logSafe('grok-exit', {
     exit,
     category,
@@ -462,6 +470,7 @@ function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
       ? [result.subtype, result.error, result.result].filter((part): part is string => typeof part === 'string').join(' ')
       : '';
     const failure = result.is_error ? classifyCliFailure(errorText) : undefined;
+    const network = result.is_error ? transportError(new Error(errorText)) : undefined;
     logSafe('grok-invalid-turn', {
       stop: String(stop),
       turns: typeof turns === 'number' && Number.isInteger(turns) ? turns : null,
@@ -473,6 +482,8 @@ function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
       hint: errorText.slice(0, 120),
     });
     if (failure && !failure.retryable) throw new GrokError(`Grok Build ${failure.category}; no automatic fallback`);
+    // A network failure reported in-band is an outage, not a bad turn: pending retry, never a refusal.
+    if (network?.reconnectable) throw network;
     // Resending an oversized prompt can never succeed; give Codex its native overflow code.
     if (CONTEXT_OVERFLOW_TEXT.test(errorText)) throw contextOverflowError('Grok Build');
     if (OVERLOADED_TEXT.test(errorText)) throw overloadedError('Grok Build');
@@ -487,11 +498,12 @@ function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
   return parseGrokOutput(text, request);
 }
 
-async function readCapped(stream: ReadableStream<Uint8Array>, keepAll: boolean, onOverflow: () => void): Promise<string> {
+async function readCapped(stream: ReadableStream<Uint8Array>, keepAll: boolean, onOverflow: () => void, onChunk?: () => void): Promise<string> {
   const decoder = new TextDecoder();
   let total = 0;
   let text = '';
   for await (const chunk of stream) {
+    onChunk?.();
     total += chunk.length;
     if (total > MAX_OUTPUT_BYTES) {
       onOverflow();
@@ -539,19 +551,26 @@ async function runGrokOnce(request: ResponsesRequest, signal?: AbortSignal, retr
     });
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) cancel();
-    timeout = setTimeout(() => {
-      timedOut = true;
-      proc?.kill();
-    }, positiveInt('GROK_TIMEOUT_MS', 900_000));
+    // Bound the run by silence, like native Codex (DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s): every
+    // stdout/stderr chunk restarts the window. A total deadline cut long xhigh turns mid-answer.
+    const idleMs = positiveInt('GROK_TIMEOUT_MS', 300_000);
+    const touch = () => {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        timedOut = true;
+        proc?.kill();
+      }, idleMs);
+    };
+    touch();
 
     const kill = () => proc?.kill();
     const [stdout, stderr, exit] = await Promise.all([
-      readCapped(proc.stdout, true, kill),
-      readCapped(proc.stderr, false, kill),
+      readCapped(proc.stdout, true, kill, touch),
+      readCapped(proc.stderr, false, kill, touch),
       proc.exited,
     ]);
     if (aborted) throw new GrokError('Grok request cancelled');
-    if (timedOut) throw new GrokError('Grok Build request timed out; no automatic model fallback');
+    if (timedOut) throw new GrokError(`Grok Build request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic model fallback`, true);
     if (exit !== 0) throw exitFailure(exit, stdout, stderr);
     return interpretRun(stdout, request);
   } finally {

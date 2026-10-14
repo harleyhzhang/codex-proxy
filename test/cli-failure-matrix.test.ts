@@ -14,7 +14,7 @@ const TIMED_OUT = 'Model connection timed out. Retrying.';
 setDefaultTimeout(20_000);
 let scratch = '';
 const saved: Record<string, string | undefined> = {};
-const ENV = ['CLAUDE_BIN', 'CLAUDE_TIMEOUT_MS', 'GROK_BIN', 'GROK_CWD', 'GROK_TIMEOUT_MS'];
+const ENV = ['CLAUDE_BIN', 'CLAUDE_TIMEOUT_MS', 'GROK_BIN', 'GROK_CWD', 'GROK_TIMEOUT_MS', 'OFFLINE_RETRY_BASE_MS'];
 
 beforeAll(async () => {
   scratch = await mkdtemp(tmpdir() + '/cli-failure-matrix-');
@@ -49,10 +49,13 @@ done
 const args = process.argv; const text = await Bun.file(args[args.indexOf('--prompt-file') + 1]).text();
 const key = (text.match(/GROK_[A-Z]+/) ?? ['GROK_OK'])[0];
 const counter = '${scratch}/grok-' + key + '.count';
-await Bun.write(counter, String(Number(await Bun.file(counter).text().catch(() => '0')) + 1));
+const count = Number(await Bun.file(counter).text().catch(() => '0')) + 1;
+await Bun.write(counter, String(count));
 await Bun.write('${scratch}/grok.pid', String(process.pid));
 if (key === 'GROK_CRASH') { console.error('grok: segmentation fault'); process.exit(7); }
 if (key === 'GROK_AUTH') { console.error('error: unauthorized (401) - please run grok login'); process.exit(1); }
+// Network outage for the first two spawns, then the network is back.
+if (key === 'GROK_NETWORK' && count <= 2) { console.error('TypeError: fetch failed: getaddrinfo ENOTFOUND api.x.ai'); process.exit(1); }
 if (key === 'GROK_QUOTA') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'rate limit exceeded: quota'})); process.exit(0); }
 if (key === 'GROK_OVERFLOW') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'Prompt is too long: 300000 tokens > 256000 maximum'})); process.exit(0); }
 if (key === 'GROK_GARBAGE') { console.log('<<<not json>>>'); process.exit(0); }
@@ -64,6 +67,7 @@ console.log(JSON.stringify({type:'result',stopReason:'end_turn',num_turns:1,stru
   process.env.GROK_BIN = grok;
   process.env.GROK_CWD = scratch;
   process.env.GROK_TIMEOUT_MS = '10000';
+  process.env.OFFLINE_RETRY_BASE_MS = '20';
 });
 afterAll(async () => {
   for (const key of ENV) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
@@ -296,6 +300,28 @@ describe('Grok Build subprocess failures through the router', () => {
       expect(await invocations('GROK_GARBAGE')).toBe(6);
       expectTerminal(await everyTransport(app, body(MODEL, 'GROK_EMPTY')), 'invalid_request_error', 'invalid output');
       expect(await invocations('GROK_EMPTY')).toBe(6);
+    } finally { await app.close(); }
+  });
+
+  test('a network error on stderr is an outage: plain JSON gets a 503, streams stay pending and complete once the network returns', async () => {
+    const app = await fixtureRouter({ heartbeatMs: 20 });
+    try {
+      const plain = await post(app, body(MODEL, 'GROK_NETWORK'));
+      expect(plain.status).toBe(503);
+      const plainBody = await plain.json() as any;
+      expect(plainBody.error.code).toBe('server_error');
+      expect(plainBody.error.message).toContain('Network connection interrupted');
+      expect(JSON.stringify(plainBody)).not.toContain('ENOTFOUND');
+      expect(await invocations('GROK_NETWORK')).toBe(1);
+      // The second spawn still fails; the stream keeps the turn pending and the third spawn answers.
+      const stream = await post(app, { ...body(MODEL, 'GROK_NETWORK'), stream: true });
+      const text = await stream.text();
+      expect(text).toContain('response.in_progress');
+      const event = terminal(text);
+      expect(event?.type).toBe('response.completed');
+      expect(event?.response?.output?.[0]?.content?.[0]?.text).toBe('GROK_OK');
+      expect(text).not.toContain('ENOTFOUND');
+      expect(await invocations('GROK_NETWORK')).toBe(3);
     } finally { await app.close(); }
   });
 

@@ -10,14 +10,17 @@ import { fixtureRouter } from './support';
 
 const codexBin = Bun.which('codex');
 const savedBase = process.env.UPSTREAM_RETRY_BASE_MS;
+const savedOffline = process.env.OFFLINE_RETRY_BASE_MS;
 let home = '';
 
 beforeAll(async () => {
   process.env.UPSTREAM_RETRY_BASE_MS = '1';
+  process.env.OFFLINE_RETRY_BASE_MS = '5';
   home = await mkdtemp(join(tmpdir(), 'codex-e2e-home-'));
 });
 afterAll(async () => {
   if (savedBase === undefined) delete process.env.UPSTREAM_RETRY_BASE_MS; else process.env.UPSTREAM_RETRY_BASE_MS = savedBase;
+  if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline;
   await rm(home, { recursive: true, force: true });
 });
 
@@ -42,6 +45,20 @@ function scriptedOpenAI(failures: number, answer: string) {
     const attempt = calls.filter(p => p.endsWith('/responses')).length;
     if (attempt <= failures) return new Response('', { status: 507 });
     void init;
+    return new Response(sseAnswer(answer), { status: 200, headers: { 'content-type': 'text/event-stream' } });
+  };
+  return { calls, upstreamFetch };
+}
+
+/** A scripted OpenAI that is unreachable (connection reset) for the first `failures` /responses calls. */
+function offlineOpenAI(failures: number, answer: string) {
+  const calls: string[] = [];
+  const upstreamFetch = async (url: string): Promise<Response> => {
+    const path = new URL(url).pathname;
+    calls.push(path);
+    if (!path.endsWith('/responses')) return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    const attempt = calls.filter(p => p.endsWith('/responses')).length;
+    if (attempt <= failures) throw Object.assign(new Error('connect ECONNRESET'), { code: 'ECONNRESET' });
     return new Response(sseAnswer(answer), { status: 200, headers: { 'content-type': 'text/event-stream' } });
   };
   return { calls, upstreamFetch };
@@ -94,6 +111,20 @@ describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
       const run = await runCodex(app.url('/'), 'Reply with exactly the word from the model.');
       expect(run.stdout + run.stderr).toContain('RECOVERED_BY_CODEX');
       expect(upstream.calls.filter(p => p.endsWith('/responses')).length).toBe(7);
+    } finally { await app.close(); }
+  }, 120_000);
+
+  test('a network outage longer than the native budget is held pending by the router; Codex never reconnects or drops the turn', async () => {
+    // Native Codex gives up after 5 attempts ("Reconnecting 5/5"). Twelve consecutive connection
+    // resets outlast that budget, so the only way Codex completes without a retry of its own is the
+    // router keeping the one request pending with heartbeats until the network returns.
+    const upstream = offlineOpenAI(12, 'SURVIVED_OUTAGE');
+    const app = await fixtureRouter({ upstreamFetch: upstream.upstreamFetch, heartbeatMs: 500 });
+    try {
+      const run = await runCodex(app.url('/'), 'Reply with exactly the word from the model.');
+      expect(run.stdout + run.stderr).toContain('SURVIVED_OUTAGE');
+      expect(run.stdout + run.stderr).not.toMatch(/Reconnecting|stream disconnected|Network connection interrupted/);
+      expect(upstream.calls.filter(p => p.endsWith('/responses')).length).toBe(13);
     } finally { await app.close(); }
   }, 120_000);
 });

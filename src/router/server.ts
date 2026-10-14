@@ -10,7 +10,7 @@ import { assertRoutable, backendFor, isLocalModel, secondaryClaude } from '../ba
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
-import { pendingResponse, pendingStream } from '../protocol/pending';
+import { pendingEnvelope, pendingRelay, pendingResponse, pendingStream, startHeartbeat } from '../protocol/pending';
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
@@ -20,7 +20,7 @@ import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, restor
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse } from './local';
-import { idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
+import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
 
 export type RouterOptions = {
   port: number;
@@ -75,6 +75,17 @@ function invalidRequest(message: string, status = 400): Response {
 function upstreamFailureBody(status: number, message: string, fields: UpstreamErrorFields = {}) {
   const type = status >= 500 ? 'server_error' : 'invalid_request_error';
   return { type, code: type, ...fields, message };
+}
+
+/**
+ * An upstream refusal delivered inside an already-open stream (the status line is gone). 5xx keeps
+ * `server_error` so Codex retries; a 4xx without a native classifying code is `invalid_prompt`, the
+ * terminal code that shows OpenAI's message verbatim instead of retrying.
+ */
+function upstreamFailedEvent(status: number, message: string, fields: UpstreamErrorFields = {}) {
+  const body = upstreamFailureBody(status, message, fields);
+  const code = status >= 500 ? 'server_error' : typeof fields.code === 'string' ? fields.code : 'invalid_prompt';
+  return { type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { ...body, code } } };
 }
 
 function errorPrefix(error: unknown, pattern: RegExp): string | undefined {
@@ -155,7 +166,13 @@ export function startRouter(options: RouterOptions) {
   }
 
   /** Produces a compaction item: a sealed capsule holding the summary and verbatim requests. */
-  async function compact(body: ResponsesBody, headers: Headers, signal: AbortSignal): Promise<ResponseObject> {
+  /**
+   * `offline` enables the shared outage policy: the OpenAI connect phase (or the local backend) is
+   * retried until it answers, and `offline()` is invoked on the first failed attempt so the caller
+   * can start progress frames. Without it, one attempt: the caller keeps HTTP status semantics and
+   * decides itself whether to go pending.
+   */
+  async function compact(body: ResponsesBody, headers: Headers, signal: AbortSignal, offline?: () => void): Promise<ResponseObject> {
     if (!codec) throw new Error('Local compaction key unavailable');
     const input = Array.isArray(body.input) ? body.input : [];
     portableSummary('', input); // Fail before spending a generation if the requests cannot fit.
@@ -165,12 +182,15 @@ export function startRouter(options: RouterOptions) {
     const streamedItems: OutputItem[] = [];
     let streamedText = '';
     if (isLocalModel(body.model)) {
-      response = await localResponse(request, signal);
+      response = await localResponse(request, signal, { reconnect: offline !== undefined });
     } else {
       const { type: _type, previous_response_id: _previous, ...clean } = request;
       // Streamed like other turns, so bound silence rather than total time; native allows long compactions.
       const idle = idleDeadline(signal, timeoutMs);
-      const upstream = watchBody(await postJson(upstreamFetch, '/responses', jsonHeaders(headers, { stripCodexMetadata: true }), clean, idle.signal), idle);
+      const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
+      const upstream = watchBody(offline
+        ? await connectUpstream(upstreamFetch, '/responses', forwarded, clean, idle, signal, offline)
+        : await postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal), idle);
       if (!upstream.ok) {
         const { detail, fields } = await upstreamFailure(upstream);
         log.warn('compact-upstream', { status: upstream.status, detail });
@@ -201,6 +221,7 @@ export function startRouter(options: RouterOptions) {
     const network = transportError(error);
     if (network) return transportFailureEvent(network);
     if (error instanceof BackendError) return terminalEvent(error);
+    if (error instanceof UpstreamStatusError) return upstreamFailedEvent(error.status, error.message, error.fields);
     // An unexpected router/backend exception mid-stream: retryable, like native Codex's own internal errors.
     logSafe('pending-internal-error', { name: error instanceof Error ? error.name : typeof error });
     return { type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { code: 'server_error', message: INTERNAL_FAILURE } } };
@@ -214,20 +235,50 @@ export function startRouter(options: RouterOptions) {
       streaming = raw.stream === true;
       const body = await normalize(raw, req.headers);
       if (isCompaction(body)) {
-        if (body.stream && isLocalModel(body.model)) return pendingStream(body, signal => compact(body, req.headers, signal), req.signal, pendingFailure, response => history.remember(body, response), options.heartbeatMs);
+        const pendingCompaction = () => pendingStream(body, signal => compact(body, req.headers, signal, () => {}), req.signal, pendingFailure, response => history.remember(body, response), options.heartbeatMs);
+        if (body.stream && isLocalModel(body.model)) return pendingCompaction();
+        if (body.stream) {
+          // GPT compaction keeps OpenAI's real status on the first attempt; only an outage before any
+          // answer switches the same request to the pending stream, where it waits for the network.
+          try { return streamResponse(await compact(body, req.headers, req.signal)); }
+          catch (error) {
+            if (!transportError(error)?.reconnectable || req.signal.aborted) throw error;
+            log.warn('upstream-offline', { path: 'compact' });
+            return pendingCompaction();
+          }
+        }
         const response = await compact(body, req.headers, req.signal);
-        return body.stream ? streamResponse(response) : Response.json(response);
+        return Response.json(response);
       }
       if (isLocalModel(body.model)) {
         if (path !== '/v1/responses') return invalidRequest('Use Codex local compaction for subscription models');
         if (body.stream) return pendingStream(body, signal => localResponse(body, signal), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
-        const response = await localResponse(body, req.signal);
+        // Plain JSON has no channel for progress frames, so it fails like a native request would.
+        const response = await localResponse(body, req.signal, { reconnect: false });
         if (body.generate !== false) history.remember(body, response);
-        return body.stream ? streamResponse(response) : Response.json(response);
+        return Response.json(response);
       }
       const headers = jsonHeaders(req.headers, { eventStream: false });
       const idle = idleDeadline(req.signal, timeoutMs);
-      return relay(watchBody(await postJson(upstreamFetch, path.slice(3), headers, body, idle.signal), idle));
+      const upstreamPath = path.slice(3);
+      try {
+        return relay(watchBody(await postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle));
+      } catch (error) {
+        // Offline before any upstream byte: keep this request pending with progress frames instead of
+        // spending one of Codex's five stream reconnects on every outage retry. The first attempt
+        // above still relays OpenAI's real HTTP status when the network is up.
+        if (!streaming || !transportError(error)?.reconnectable || req.signal.aborted) throw error;
+        idle.done();
+        log.warn('upstream-offline', { path: upstreamPath });
+        return pendingRelay(body, (signal) => {
+          const pendingIdle = idleDeadline(signal, timeoutMs);
+          return connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal).then(response => watchBody(response, pendingIdle));
+        }, req.signal, pendingFailure, async (response) => {
+          const { detail, fields } = await upstreamFailure(response);
+          log.warn('upstream', { status: response.status, detail });
+          return upstreamFailedEvent(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields);
+        }, options.heartbeatMs);
+      }
     } catch (error) {
       const network = transportError(error);
       if (network && !req.signal.aborted) {
@@ -299,8 +350,16 @@ export function startRouter(options: RouterOptions) {
         history.remember(body, warm);
         await sseEvents(streamResponse(warm), send);
       } else if (isCompaction(body)) {
-        if (isLocalModel(body.model)) await pendingResponse(body, signal => compact(body, ws.data.headers, signal), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
-        else await sseEvents(streamResponse(await compact(body, ws.data.headers, controller.signal)), send);
+        if (isLocalModel(body.model)) await pendingResponse(body, signal => compact(body, ws.data.headers, signal, () => {}), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
+        else {
+          // The socket can carry progress frames at any time, so an outage starts heartbeats in place.
+          let stop: (() => void) | undefined;
+          try {
+            const compacted = await compact(body, ws.data.headers, controller.signal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); });
+            stop?.(); stop = undefined;
+            await sseEvents(streamResponse(compacted), send);
+          } finally { stop?.(); }
+        }
       } else if (isLocalModel(body.model)) {
         await pendingResponse(body, signal => localResponse(body, signal), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
       } else {
@@ -347,7 +406,13 @@ export function startRouter(options: RouterOptions) {
   ): Promise<void> {
     const { type: _type, previous_response_id: _previous, ...request } = body;
     const idle = idleDeadline(signal, timeoutMs);
-    const response = watchBody(await postJson(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle.signal), idle);
+    // An outage before OpenAI answers keeps the turn pending with progress frames (the socket is
+    // already open, so nothing about the status line is lost); a real HTTP status still arrives below.
+    let stop: (() => void) | undefined;
+    let response: Response;
+    try {
+      response = watchBody(await connectUpstream(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, signal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+    } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
       log.warn('upstream', { status: response.status, detail });

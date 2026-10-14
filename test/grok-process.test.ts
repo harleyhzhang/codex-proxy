@@ -2,6 +2,7 @@ import {test,expect} from 'bun:test';
 import {mkdtemp,chmod,rm,readdir} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import { runGrok } from '../src/backends/grok';
+import { ProxyTransportError, reconnectTransport } from '../src/transport';
 test('isolated Grok sessions preserve simultaneous parent/child tasks; native actions and cancellation fail closed',async()=>{
  const dir=await mkdtemp(tmpdir()+'/grok-process-');const binary=dir+'/fixture';
  await Bun.write(binary,`#!/usr/bin/env bun
@@ -47,13 +48,13 @@ test('an unfinished Grok turn is retried once; a CLI-reported error is not',asyn
   await expect(runGrok({model:'grok-4.7',input:'ERRORED'})).rejects.toThrow('valid constrained turn');
  }finally{for(const [key,value] of [['GROK_BIN',before.bin],['GROK_CWD',before.cwd],['GROK_TIMEOUT_MS',before.timeout]]){if(value===undefined)delete process.env[key!];else process.env[key!]=value;}await rm(dir,{recursive:true});}
 });
-test('a failed Grok exit is classified from stderr and result records only, logged without content, and retried unless it is auth or quota',async()=>{
+test('a failed Grok exit is classified from stderr and result records only, logged without content; a network exit is a transport outage the router loop recovers, auth is refused at once',async()=>{
  const dir=await mkdtemp(tmpdir()+'/grok-exit-');const binary=dir+'/fixture';
  await Bun.write(binary,`#!/usr/bin/env bun
- const args=process.argv;const system=args[args.indexOf('--system-prompt-override')+1];const text=await Bun.file(args[args.indexOf('--prompt-file')+1]).text();
- const retried=system.includes('rejected before anything ran');
+ const args=process.argv;const text=await Bun.file(args[args.indexOf('--prompt-file')+1]).text();
+ const counter='${dir}/spawns';const count=Number(await Bun.file(counter).text().catch(()=>'0'))+1;await Bun.write(counter,String(count));
  if(text.includes('AUTH')){console.error('Error: 401 Unauthorized');process.exit(1);}
- if(!retried){
+ if(count<=2){
   console.log(JSON.stringify({type:'assistant',message:{content:[{type:'text',text:'SECRET_CONTENT parse this json schema structured output'}]}}));
   console.error('Error: network connection reset by peer');process.exit(1);
  }
@@ -62,9 +63,12 @@ test('a failed Grok exit is classified from stderr and result records only, logg
  const before={bin:process.env.GROK_BIN,cwd:process.env.GROK_CWD,timeout:process.env.GROK_TIMEOUT_MS};process.env.GROK_BIN=binary;process.env.GROK_CWD=dir;process.env.GROK_TIMEOUT_MS='5000';
  const warn=console.warn,logged:string[]=[];console.warn=(...parts:any[])=>{logged.push(parts.join(' '));};
  try {
-  expect((await runGrok({model:'grok-4.7',input:'NETWORK'})).text).toBe('RECOVERED');
-  const exit=logged.map(line=>{try{return JSON.parse(line);}catch{return null;}}).find(event=>event?.event==='grok-exit');
-  expect(exit.category).toBe('connection failed');expect(exit.exit).toBe(1);
+  // The backend itself does not retry an outage: it surfaces a reconnectable transport error.
+  await expect(runGrok({model:'grok-4.7',input:'NETWORK'})).rejects.toBeInstanceOf(ProxyTransportError);
+  // The router-level offline loop keeps spawning the same request until the network returns.
+  expect((await reconnectTransport(()=>runGrok({model:'grok-4.7',input:'NETWORK'}),undefined,{initialDelayMs:1,maxDelayMs:2})).text).toBe('RECOVERED');
+  const exits=logged.map(line=>{try{return JSON.parse(line);}catch{return null;}}).filter(event=>event?.event==='grok-exit');
+  expect(exits.length).toBe(2);for(const exit of exits){expect(exit.category).toBe('network');expect(exit.exit).toBe(1);}
   expect(logged.join(' ')).not.toContain('SECRET_CONTENT');
   await expect(runGrok({model:'grok-4.7',input:'AUTH'})).rejects.toThrow('authentication failed');
   expect(logged.filter(line=>line.includes('grok-exit') && line.includes('authentication')).length).toBe(1);

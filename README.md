@@ -44,15 +44,26 @@ Codex updates its own model list.
 
 ## Connection recovery
 
-Claude requests stay pending through temporary connection failures. The proxy retries with
-backoff from 1 to 30 seconds and sends progress events every 10 seconds, so an outage does not
-consume Codex's stream reconnect budget. Recovery preserves the original request and tool
-receipts. Stop/cancel also stops the pending request and retries.
+A network outage is handled once, at the router level, for every backend: Claude (primary,
+secondary and the quota fallback), Grok, Cursor, the GPT relay on HTTP and WebSocket, and GPT
+or local compaction. When the network drops before anything has reached Codex, the router keeps
+the same request pending, sends `response.in_progress` progress events every 10 seconds, and
+retries with backoff from 1 to 30 seconds until the network returns or Codex cancels the turn.
+The outage therefore never consumes Codex's own stream reconnect budget, so a long disconnect
+does not end as "Reconnecting 5/5" and a dropped turn. Recovery preserves the original request
+and tool receipts. Stop/cancel also stops the pending request and its retries.
 
-Authentication, quota and validation errors still fail promptly. The per-turn model deadline
-remains separate from connection timeouts. GPT stream failures continue through Codex's own
-reconnect path; this change applies to buffered Claude requests. Reload a running proxy after
-updating its source.
+Only transport failures qualify: reset or refused sockets, DNS failures, a subscription CLI
+exiting with a network error, Cursor reporting `unavailable`. A plain (non-streaming) JSON
+request cannot be held, so it still gets an immediate 503 with a generic "Network connection
+interrupted" message. Timeouts are not outages: the per-turn model deadline stays terminal and
+Codex owns that budget. The native GPT relay keeps its 4-retry burst first and only switches to
+the pending loop once that burst fails on a reconnectable error. `OFFLINE_RETRY_BASE_MS`
+shortens the first backoff step for test suites; production keeps 1 s.
+
+Authentication, quota and validation errors still fail promptly. Known gap: the compaction
+bridge used by `bridgeFor` still has only the finite native retry burst. Reload a running proxy
+after updating its source.
 
 ## Retries and errors versus native Codex
 
@@ -65,7 +76,7 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 | Situation | Native Codex | This router |
 | --- | --- | --- |
 | OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling, ±10% jitter | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); covers turns, compaction and bridge calls |
-| Dropped socket to OpenAI | retried 4x | same; timeouts are not retried (Codex owns that budget) |
+| Dropped socket to OpenAI | retried 4x, then the stream reconnect budget (5) | same 4x burst, then streams and WebSocket turns stay pending with progress events and 1–30 s backoff until the network returns or Codex cancels; plain JSON gets a 503; timeouts are not retried (Codex owns that budget) |
 | OpenAI 4xx incl. 429 | not retried, status surfaced | relayed once with the real status and body |
 | Lasting 5xx | surfaced with real status | surfaced with real status as `server_error`, never masked as 400 |
 | Unparseable SSE frame | skipped, stream continues | skipped (`sse-frame-skipped` log) |
@@ -76,7 +87,7 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 | Subscription CLI refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
 | Prompt over the model's context window | `context_length_exceeded`, not retried | a Claude, Grok or Cursor "prompt is too long" becomes the same native `context_length_exceeded` code, so Codex stops retrying and offers compaction |
 | Provider overloaded | `server_is_overloaded`, not retried | a Claude or Grok overload (529) reported after the CLI's own retries becomes native `server_is_overloaded` instead of a retried 500 that reruns the whole CLI turn |
-| Subscription CLI network drop | n/a | pending with 1–30 s backoff and progress events; see Connection recovery |
+| Subscription CLI network drop (Claude, Grok, Cursor) | n/a | same pending loop as above; see Connection recovery |
 
 `test/failure-matrix.test.ts` exercises every registered model row (GPT relay, personal and
 secondary Claude, Cursor, Grok, the Opus quota fallback) against each row above on plain HTTP,

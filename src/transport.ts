@@ -13,8 +13,10 @@ const NETWORK_CODES = new Set([
   'UND_ERR_CONNECT_TIMEOUT',
 ]);
 const TIMEOUT_CODES = new Set(['ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']);
+// Message text, because subscription CLIs and bridges report the same failures as prose or as the
+// code word inside stderr rather than as an `error.code` property.
 const NETWORK_MESSAGE =
-  /fetch failed|unable to connect|cannot connect|network (?:error|connection)|socket connection.*closed|connection (?:reset|refused)|getaddrinfo|connectionerror/i;
+  /fetch failed|unable to connect|cannot connect|network (?:error|connection|is unreachable)|socket connection.*closed|socket hang up|connection (?:reset|refused|closed)|getaddrinfo|connectionerror|\bE(?:CONNRESET|CONNREFUSED|NOTFOUND|AI_AGAIN|NETUNREACH|HOSTUNREACH|PIPE)\b|\bUND_ERR_(?:SOCKET|CONNECT_TIMEOUT)\b/i;
 
 /** A dropped or timed-out connection. Codex retries these on its own. */
 export class ProxyTransportError extends Error {
@@ -69,20 +71,24 @@ export function failureStream(event: unknown): Response {
   });
 }
 
-// Buffered backends have not delivered text or tool calls yet. Keep the same request pending
-// through an outage instead of consuming Codex's finite stream-reconnect budget. A real model
-// timeout, auth/quota refusal or cancellation still follows its existing terminal/retry path.
+// Nothing has reached Codex yet (a buffered backend, or an upstream connection that never opened).
+// Keep the same request pending through an outage instead of consuming Codex's finite
+// stream-reconnect budget. A real model timeout, auth/quota refusal or cancellation still follows
+// its existing terminal/retry path. `onRetry` fires before each wait so callers can start
+// heartbeats and log; it never receives the error.
 export async function reconnectTransport<T>(attempt: () => Promise<T>, signal?: AbortSignal,
-  options: { initialDelayMs?: number; maxDelayMs?: number } = {}): Promise<T> {
-  let delay = options.initialDelayMs ?? 1000;
+  options: { initialDelayMs?: number; maxDelayMs?: number; onRetry?: (attempt: number, delayMs: number) => void } = {}): Promise<T> {
+  // OFFLINE_RETRY_BASE_MS exists for test suites that script outages; production keeps 1 s.
+  let delay = options.initialDelayMs ?? Number(process.env.OFFLINE_RETRY_BASE_MS ?? 1000);
   const maxDelay = options.maxDelayMs ?? 30_000;
-  for (;;) {
+  for (let attempts = 1; ; attempts++) {
     signal?.throwIfAborted();
     try { return await attempt(); }
     catch (error) {
       if (signal?.aborted) throw transportError(error) ? signal.reason : error;
       const network = transportError(error);
       if (!network || !network.reconnectable) throw error;
+      options.onRetry?.(attempts, delay);
       await new Promise<void>((resolve, reject) => {
         const cancel = () => { clearTimeout(timer); reject(signal!.reason); };
         const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, delay);

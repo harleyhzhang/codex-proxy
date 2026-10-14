@@ -170,13 +170,34 @@ describe('Cursor bridge failures through the router', () => {
   test('SDK refusals carry the HTTP status and code, never a fallback, and never leak the key', async () => {
     const app = await fixtureRouter();
     try {
-      for (const [name, status, code] of [['SDK_401', 401, 'unauthenticated'], ['SDK_429', 429, 'resource_exhausted'], ['SDK_503', 503, 'unavailable']] as const) {
+      for (const [name, status, code] of [['SDK_401', 401, 'unauthenticated'], ['SDK_429', 429, 'resource_exhausted']] as const) {
         await scenario(name);
         const seen = await everyTransport(app, body('x'));
         expectTerminal(seen, `HTTP ${status}, ${code}`);
         for (const cell of seen) expect(cell.message).not.toContain('key-');
       }
     } finally { await app.close(); }
+  });
+
+  test('a Connect `unavailable` (Cursor unreachable) is an outage: plain JSON gets a 503, streams stay pending until it clears', async () => {
+    const savedOffline = process.env.OFFLINE_RETRY_BASE_MS; process.env.OFFLINE_RETRY_BASE_MS = '20';
+    const app = await fixtureRouter({ heartbeatMs: 20 });
+    try {
+      await scenario('SDK_503');
+      const plain = await post(app, body('x'));
+      expect(plain.status).toBe(503);
+      const text = await plain.text();
+      expect(text).toContain('server_error'); expect(text).toContain('Network connection interrupted'); expect(text).not.toContain('key-');
+      // The stream rides out the outage: the bridge is re-spawned with the restored key and the
+      // same request completes without a response.failed in between.
+      const inflight = post(app, { ...body('x'), stream: true }).then(r => r.text());
+      await sleep(300);
+      await scenario('OK');
+      const stream = await inflight;
+      expect(stream).toContain('response.in_progress');
+      expect(terminal(stream)?.type).toBe('response.completed');
+      expect(stream).toContain('CURSOR_OK'); expect(stream).not.toContain('response.failed');
+    } finally { await app.close(); if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline; }
   });
 
   test('identity mismatch, broken catalog, missing model and failed agent creation are refused', async () => {

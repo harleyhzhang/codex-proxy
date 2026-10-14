@@ -10,7 +10,7 @@ import { isRecord, randomId } from '../json';
 import { logSafe } from '../log';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
-import { reconnectTransport, transportError } from '../transport';
+import { transportError } from '../transport';
 import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, type SubscriptionBackend } from './contract';
 
@@ -71,6 +71,10 @@ export function buildClaudeArgs(request: ResponsesRequest): string[] {
     'stream-json',
     '--output-format',
     'stream-json',
+    // Partial chunks keep stdout live while the model thinks, so the turn can be bounded by
+    // silence (native Codex's 300 s stream idle timeout) instead of a total deadline that
+    // cuts long xhigh turns. `acceptLine` ignores every record type it does not settle on.
+    '--include-partial-messages',
     '--verbose',
     '--model',
     resolveModel(request.model),
@@ -132,7 +136,9 @@ export class ClaudeAccount {
     throw new BackendError('Claude account identity does not match its configured login');
   }
   run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
-    return reconnectTransport(() => runClaudeOnce(request, signal, this), signal);
+    // One attempt. A dropped connection surfaces as a transport error and the router's shared
+    // offline policy (`localResponse`) keeps the request pending and retries it.
+    return runClaudeOnce(request, signal, this);
   }
 }
 
@@ -149,6 +155,7 @@ class ClaudeWorker {
   private pending?: PendingTurn;
   private stderr = '';
   private idleTimer?: ReturnType<typeof setTimeout>;
+  private touch?: () => void;
   private closed = false;
 
   constructor(request: ResponsesRequest, readonly account: ClaudeAccount) {
@@ -180,7 +187,9 @@ class ClaudeWorker {
     if (this.closed) throw new Error('Claude CLI worker is closed');
     if (this.pending) throw new Error('Claude CLI worker is already processing a turn');
     clearTimeout(this.idleTimer);
-    const timeoutMs = positiveInt('CLAUDE_TIMEOUT_MS', 900_000);
+    // Bound the turn by silence, like native Codex (DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s): any
+    // stdout byte restarts the window, and the idle timeout is retried like a dropped stream.
+    const idleMs = positiveInt('CLAUDE_TIMEOUT_MS', 300_000);
 
     return new Promise<ClaudeResult>((resolve, reject) => {
       const settle = (error: Error) => {
@@ -189,10 +198,20 @@ class ClaudeWorker {
         this.abort();
         pending?.reject(error);
       };
-      const timeout = setTimeout(() => settle(new Error(`Claude CLI timed out after ${timeoutMs}ms`)), timeoutMs);
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      const arm = () => {
+        clearTimeout(timeout);
+        timeout = setTimeout(
+          () => settle(new BackendError(`Claude CLI timed out after ${Math.round(idleMs / 1000)}s without output`, { retryable: true })),
+          idleMs,
+        );
+      };
+      this.touch = arm;
+      arm();
       const cancel = () => settle(new Error('Claude request cancelled'));
       const cleanup = () => {
         clearTimeout(timeout);
+        this.touch = undefined;
         signal?.removeEventListener('abort', cancel);
       };
       this.pending = {
@@ -267,6 +286,7 @@ class ClaudeWorker {
     const decoder = new TextDecoder();
     let buffer = '';
     for await (const chunk of this.process.stdout) {
+      this.touch?.();
       buffer += decoder.decode(chunk, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() ?? '';

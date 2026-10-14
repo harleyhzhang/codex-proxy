@@ -19,11 +19,13 @@ const GPT = 'gpt-6.1-sol';
 const INTERNAL = 'Internal router error; Codex will retry.';
 const OK: ProxyOutput = { text: 'FINE', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
 const savedBase = process.env.UPSTREAM_RETRY_BASE_MS;
+const savedOffline = process.env.OFFLINE_RETRY_BASE_MS;
 let scratch = '';
 const extraRows: SubscriptionBackend[] = [];
 
 beforeAll(async () => {
   process.env.UPSTREAM_RETRY_BASE_MS = '1';
+  process.env.OFFLINE_RETRY_BASE_MS = '5';
   scratch = await mkdtemp(tmpdir() + '/failure-matrix-');
   await Bun.write(scratch + '/bridge', '#!/bin/sh\nexit 1\n');
   // The same constructors the live launcher uses, with the production prefixes.
@@ -39,6 +41,7 @@ beforeAll(async () => {
 afterAll(async () => {
   for (const row of extraRows) { const at = BACKENDS.indexOf(row); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
   if (savedBase === undefined) delete process.env.UPSTREAM_RETRY_BASE_MS; else process.env.UPSTREAM_RETRY_BASE_MS = savedBase;
+  if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline;
   await rm(scratch, { recursive: true, force: true });
 });
 
@@ -150,24 +153,50 @@ describe('subscription models × failure modes', () => {
     } finally { await app.close(); }
   });
 
-  test('CLI network drops and timeouts become retryable server_error events with a safe message', async () => {
-    const app = await fixtureRouter();
-    const cases = [
-      { name: 'reset', error: () => Object.assign(new Error('SECRET socket path'), { code: 'ECONNRESET' }), expect: 'Network connection interrupted' },
-      { name: 'timeout', error: () => new DOMException('SECRET deadline', 'TimeoutError'), expect: 'timed out' },
-    ];
+  test('CLI network drops keep the turn pending until the network returns; timeouts stay terminal', async () => {
+    const app = await fixtureRouter({ heartbeatMs: 20 });
+    const reset = () => Object.assign(new Error('SECRET socket path'), { code: 'ECONNRESET' });
     try {
-      for (const { backend, model } of rows()) for (const c of cases) {
-        await withRun(backend, async () => { throw c.error(); }, async () => {
+      for (const { backend, model } of rows()) {
+        // Plain JSON has no channel for heartbeats, so a drop is a 503 the client may retry.
+        await withRun(backend, async () => { throw reset(); }, async () => {
           const plain = await post(app, request(model));
           expect(plain.status).toBe(503);
           const text = await plain.text();
           expect(JSON.parse(text).error.type).toBe('server_error');
-          expect(text).toContain(c.expect); expect(text).not.toContain('SECRET');
+          expect(text).toContain('Network connection interrupted'); expect(text).not.toContain('SECRET');
+        });
+
+        // Streams and sockets ride out the outage: the same request stays pending with
+        // response.in_progress heartbeats and completes once the backend reconnects.
+        for (const transport of ['stream', 'socket'] as const) {
+          let calls = 0;
+          await withRun(backend, async () => { if (++calls <= 3) throw reset(); return OK; }, async () => {
+            if (transport === 'stream') {
+              const stream = await (await post(app, request(model, { stream: true }))).text();
+              const events = sse(stream);
+              expect(events.some(e => e.type === 'response.in_progress')).toBe(true);
+              expect(last(stream).type).toBe('response.completed');
+              expect(stream).toContain('FINE'); expect(stream).not.toContain('SECRET');
+            } else {
+              const ws = await socketTurn(app, request(model, { stream: true }));
+              expect(ws.type).toBe('response.completed');
+              expect(JSON.stringify(ws)).toContain('FINE'); expect(JSON.stringify(ws)).not.toContain('SECRET');
+            }
+            expect(calls).toBe(4);
+          });
+        }
+
+        // A backend deadline is not an outage: every transport reports it once, safely.
+        await withRun(backend, async () => { throw new DOMException('SECRET deadline', 'TimeoutError'); }, async () => {
+          const plain = await post(app, request(model));
+          expect(plain.status).toBe(503);
+          const text = await plain.text();
+          expect(text).toContain('timed out'); expect(text).not.toContain('SECRET');
 
           const stream = await (await post(app, request(model, { stream: true }))).text();
           expect(last(stream).response.error.code).toBe('server_error');
-          expect(stream).toContain(c.expect); expect(stream).not.toContain('SECRET');
+          expect(stream).toContain('timed out'); expect(stream).not.toContain('SECRET');
 
           const ws = await socketTurn(app, request(model, { stream: true }));
           expect(ws.type).toBe('response.failed');
@@ -322,7 +351,7 @@ describe('gpt models × upstream failure modes', () => {
     }
   });
 
-  test('dropped connections are retried like native and a lasting one is a retryable server_error, timeouts are not retried', async () => {
+  test('dropped connections are retried like native; a lasting one is a 503 on plain JSON but stays pending on streams, timeouts are not retried', async () => {
     let calls = 0; let failuresLeft = 2;
     const app = await fixtureRouter({ upstreamFetch: async (_url, init) => { calls++; if (failuresLeft-- > 0) throw Object.assign(new Error('SECRET reset'), { code: 'ECONNRESET' }); return success(init); } });
     try {
@@ -331,9 +360,15 @@ describe('gpt models × upstream failure modes', () => {
       const plain = await post(app, request(GPT));
       expect(plain.status).toBe(503); expect(calls).toBe(5);
       const text = await plain.text(); expect(text).toContain('Network connection interrupted'); expect(text).not.toContain('SECRET');
-      calls = 0;
+      // A stream outlasts the native burst: after the 4 inner retries fail the relay stays pending
+      // with heartbeats and reconnects with backoff until OpenAI answers.
+      calls = 0; failuresLeft = 7;
       const stream = await (await post(app, request(GPT, { stream: true }))).text();
-      expect(last(stream).response.error.code).toBe('server_error'); expect(stream).not.toContain('SECRET'); expect(calls).toBe(5);
+      expect(last(stream).type).toBe('response.completed'); expect(stream).toContain('UPSTREAM OK'); expect(stream).not.toContain('SECRET');
+      expect(calls).toBe(8);
+      calls = 0; failuresLeft = 7;
+      const ws = await socketTurn(app, request(GPT, { stream: true }));
+      expect(ws.type).toBe('response.completed'); expect(JSON.stringify(ws)).toContain('UPSTREAM OK'); expect(calls).toBe(8);
     } finally { await app.close(); }
     calls = 0;
     const slow = await fixtureRouter({ upstreamFetch: async () => { calls++; throw new DOMException('SECRET deadline', 'TimeoutError'); } });

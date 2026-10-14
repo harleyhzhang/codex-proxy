@@ -12,6 +12,7 @@ import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { repairJsonStrings } from './grok';
 import { logSafe } from '../log';
+import { ProxyTransportError, transportError } from '../transport';
 
 export const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
@@ -373,12 +374,22 @@ export async function* connectFrames(body: ReadableStream<Uint8Array>): AsyncGen
       if (flags === 2) {
         if (value.error) {
           if (CONTEXT_OVERFLOW_TEXT.test(JSON.stringify(value.error))) throw contextOverflowError('Cursor');
+          // Connect `unavailable` (or a network message) means the bridge could not reach Cursor's
+          // servers: the router's shared offline policy keeps the request pending and retries it.
+          if (connectUnavailable(value.error)) throw new ProxyTransportError();
           throw new CursorError('Cursor stream failed; no automatic supplier fallback');
         }
       } else yield value;
     }
   }
   if (pending.length) throw new CursorError('Cursor stream ended with a partial frame');
+}
+
+/** A Connect error whose code or message says the upstream service could not be reached. */
+function connectUnavailable(error: unknown): boolean {
+  const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
+  const message = isRecord(error) && typeof error.message === 'string' ? error.message : '';
+  return code === 'unavailable' || transportError(new Error(message))?.reconnectable === true;
 }
 
 export function assertCursorIdentity(value: unknown, options: Pick<CursorOptions, 'expectedEmail' | 'expectedUserId'>): void {
@@ -502,10 +513,19 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     async function rpc(service: string, method: string, body: JsonRecord, stream = false, rpcSignal: AbortSignal = controller.signal): Promise<Response> {
       const json = Buffer.from(JSON.stringify(body));
       const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
-      const response = await fetch(`${url}/sdk.v1.${service}/${method}`, { method: 'POST', signal: rpcSignal, headers: { authorization: `Bearer ${token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
+      let response: Response;
+      try {
+        response = await fetch(`${url}/sdk.v1.${service}/${method}`, { method: 'POST', signal: rpcSignal, headers: { authorization: `Bearer ${token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
+      } catch (error) {
+        // This socket only reaches the loopback bridge, so a failure here is the bridge dying, never
+        // the internet; it must not be mistaken for an outage the router should wait out.
+        if (rpcSignal.aborted) throw error;
+        throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
+      }
       if (!response.ok) {
         const detail:unknown = await response.json().catch(() => undefined);
         const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g,'').slice(0,64) : 'unknown';
+        if (connectUnavailable(detail)) throw new ProxyTransportError();
         throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`);
       }
       return response;
@@ -523,12 +543,19 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       const response = await rpc('SdkAgentService', 'Send', { agentId, message: attach.length ? { text, images: attach } : { text }, options: { enableSteps: true } }, true);
       if (!response.body) throw new CursorError('Cursor returned an empty stream');
       const events: JsonRecord[] = [];
-      for await (const event of connectFrames(response.body)) {
-        touch();
-        events.push(event);
-        const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
-        if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
-        if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
+      try {
+        for await (const event of connectFrames(response.body)) {
+          touch();
+          events.push(event);
+          const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
+          if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
+          if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
+        }
+      } catch (error) {
+        // A loopback socket dropping mid-stream is the bridge crashing, not an outage (those arrive as
+        // Connect `unavailable` frames and are rethrown unchanged above).
+        if (error instanceof ProxyTransportError || controller.signal.aborted || !transportError(error)) throw error;
+        throw new CursorError('Cursor bridge stream dropped; no automatic supplier fallback', true);
       }
       signal?.throwIfAborted(); controller.signal.throwIfAborted();
       return events;

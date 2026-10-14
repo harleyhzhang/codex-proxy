@@ -148,11 +148,13 @@ test('an interrupted tool continuation replays the original task and receipt wit
   try {
     const first = await runClaude({ model: 'claude-opus-5-5', input: 'ORIGINAL_TASK', tools });
     const call = first.toolCalls[0]!;
-    const recovered = await runClaude({ model: 'claude-opus-5-5', tools, input: [
+    // Offline recovery lives in the router (localResponse), so the direct backend call wraps the
+    // same reconnectTransport the router uses.
+    const recovered = await reconnectTransport(() => runClaude({ model: 'claude-opus-5-5', tools, input: [
       { role: 'user', content: 'ORIGINAL_TASK' },
       { type: 'function_call', name: call.name, call_id: call.callId, arguments: call.arguments },
       { type: 'function_call_output', call_id: call.callId, output: 'ALREADY_EXECUTED_RECEIPT' },
-    ] });
+    ] }), undefined, { initialDelayMs: 1, maxDelayMs: 2 });
     expect(recovered.text).toBe('CONTINUATION_RECOVERED');
     expect(recovered.toolCalls).toHaveLength(0);
     expect(await Bun.file(dir + '/starts').text()).toBe('startedstarted');
