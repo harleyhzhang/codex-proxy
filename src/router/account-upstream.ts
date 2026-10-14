@@ -15,6 +15,8 @@ export type AccountOptions = {
   models?: readonly string[];
   fastest?: boolean;
   refresh?: () => Promise<void>;
+  /** Rewrites the profile's models cache through native Codex. Defaults to a native `model/list`. */
+  catalog?: () => Promise<void>;
 };
 
 const record = isRecord;
@@ -104,10 +106,17 @@ export async function refreshAccount(options: AccountOptions): Promise<void> {
   await nativeAccountRequest(options, 'account/read', { refreshToken: true });
 }
 
+/** Native Codex rewrites models_cache.json as a side effect of listing models; the bundled binary
+ *  always asks as a current client, so a cache left behind by an outdated CLI gets repaired. */
+export async function refreshCatalog(options: AccountOptions): Promise<void> {
+  await nativeAccountRequest(options, 'model/list', {});
+}
+
 type Identity = { token: string; account: string; expires: number };
 
 export class AccountUpstream {
   private refreshing?: Promise<void>;
+  private cataloging?: Promise<void>;
   constructor(private options: AccountOptions, private upstream: UpstreamFetch) {
     validateAccountPrefix(options.prefix);
   }
@@ -132,6 +141,25 @@ export class AccountUpstream {
     }
     return identity;
   }
+  private async catalogRow(native: string): Promise<{ readable: boolean; row?: JsonRecord }> {
+    try {
+      const cache: unknown = await Bun.file(join(this.options.home, 'models_cache.json')).json();
+      return { readable: true, row: accountModels(cache, this.options.models).find(value => value.slug === native) };
+    } catch { return { readable: false }; }
+  }
+  /** A missing or stale cache earns one shared native catalog refresh before the request is refused. */
+  private async catalogRowWithRefresh(native: string): Promise<{ readable: boolean; row?: JsonRecord }> {
+    let found = await this.catalogRow(native);
+    if (found.row) return found;
+    let refreshed = true;
+    try {
+      this.cataloging ??= (this.options.catalog ?? (() => refreshCatalog(this.options)))().finally(() => { this.cataloging = undefined; });
+      await this.cataloging;
+    } catch { refreshed = false; }
+    found = await this.catalogRow(native);
+    logSafe('account-catalog', { account: this.options.prefix, model: native, refreshed, listed: Boolean(found.row) });
+    return found;
+  }
   fetch: UpstreamFetch = async (url, init) => {
     let body: unknown;
     if (typeof init.body === 'string') { try { body = JSON.parse(init.body); } catch {} }
@@ -155,11 +183,8 @@ export class AccountUpstream {
       headers.delete('content-length');
       return headers;
     };
-    let row: JsonRecord | undefined;
-    try {
-      const cache: unknown = await Bun.file(join(this.options.home, 'models_cache.json')).json();
-      row = accountModels(cache, this.options.models).find(value => value.slug === native);
-    } catch { throw new BackendError('Secondary model cache unavailable; refresh its native model catalog'); }
+    const { readable, row } = await this.catalogRowWithRefresh(native);
+    if (!readable) throw new BackendError('Secondary model cache unavailable; refresh its native model catalog');
     if (!row) throw new BackendError('Unsupported secondary Codex model; refresh its native model catalog');
     let tier = body.service_tier;
     if (this.options.fastest) {

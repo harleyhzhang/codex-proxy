@@ -10,7 +10,7 @@ afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { re
 const jwt = (value: unknown) => 'fixture.' + Buffer.from(JSON.stringify(value)).toString('base64url') + '.fixture';
 async function fixture(expires = Date.now() / 1000 + 3600) {
   const home = await mkdtemp(tmpdir() + '/secondary-auth-'); dirs.push(home);
-  const options: AccountOptions = { home, prefix: 'secondary', binary: 'unused', expectedEmail: 'secondary@example.com', expectedAccountId: 'secondary-space' };
+  const options: AccountOptions = { home, prefix: 'secondary', binary: 'unused', expectedEmail: 'secondary@example.com', expectedAccountId: 'secondary-space', catalog: async () => {} };
   const write = (exp: number, email = 'secondary@example.com', account = 'secondary-space') => Bun.write(home + '/auth.json', JSON.stringify({
     auth_mode: 'chatgpt', tokens: { access_token: jwt({ exp }), id_token: jwt({ email }), account_id: account },
   }));
@@ -91,6 +91,29 @@ test('concurrent expired requests share native refresh and re-read the renewed i
   await write(0); options.refresh = async () => { throw new Error('synthetic secret must not be surfaced'); };
   await expect(router.fetch(target, request('secondary-gpt-6-astra'))).rejects.toThrow('Secondary Codex login unavailable');
   expect(calls).toBe(5);
+});
+
+test('a stale models cache earns one shared native catalog refresh; a failed refresh still refuses', async () => {
+  const { home, options } = await fixture(); let refreshes = 0, calls = 0;
+  const stale = JSON.stringify({ models: [{ slug: 'codex-auto-review', visibility: 'hide' }] });
+  const fresh = JSON.stringify({ models: [{ slug: 'gpt-6.1-sol', visibility: 'list', service_tiers: [{ id: 'priority' }] }] });
+  await Bun.write(home + '/models_cache.json', stale);
+  options.catalog = async () => { refreshes++; await new Promise(resolve => setTimeout(resolve, 20)); await Bun.write(home + '/models_cache.json', fresh); };
+  const router = new AccountUpstream({ ...options, fastest: true }, async (_, init) => {
+    calls++; expect(JSON.parse(String(init.body)).service_tier).toBe('priority'); return new Response('{}');
+  });
+  await Promise.all(Array.from({ length: 4 }, () => router.fetch(target, request('secondary-gpt-6.1-sol'))));
+  expect(refreshes).toBe(1); expect(calls).toBe(4);
+  await router.fetch(target, request('secondary-gpt-6.1-sol'));
+  expect(refreshes).toBe(1);
+
+  await Bun.write(home + '/models_cache.json', stale);
+  options.catalog = async () => { refreshes++; throw new Error('synthetic secret must not be surfaced'); };
+  const denied = new AccountUpstream(options, async () => { throw new Error('must not reach upstream'); });
+  await expect(denied.fetch(target, request('secondary-gpt-6.1-sol'))).rejects.toThrow('Unsupported secondary');
+  expect(refreshes).toBe(2);
+  await rm(home + '/models_cache.json');
+  await expect(denied.fetch(target, request('secondary-gpt-6.1-sol'))).rejects.toThrow('cache unavailable');
 });
 
 test('an upstream 401 forces one native refresh and one retry; a failed refresh keeps the 401', async () => {
