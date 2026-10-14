@@ -54,7 +54,7 @@ await Bun.write('${scratch}/bridge.count', String(Number(await Bun.file('${scrat
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 const frame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
-const catalog = { items: [{ id: 'claude-opus-5-5', parameters: [{ id: 'effort', values: [{ value: 'medium' }, { value: 'high' }] }, { id: 'context', values: [{ value: '300k' }] }, { id: 'fast', values: [{ value: 'false' }] }] }] };
+const catalog = { items: [{ id: 'claude-opus-5-5', parameters: [{ id: 'effort', values: [{ value: 'medium' }, { value: 'high' }] }, { id: 'context', values: [{ value: '300k' }, { value: '1m' }] }, { id: 'fast', values: [{ value: 'false' }] }] }] };
 const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
   const path = new URL(request.url).pathname;
   if (path.endsWith('/Me')) return json({ user: { userEmail: '${EMAIL}', userId: '${USER}' } });
@@ -62,7 +62,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
   if (path.endsWith('/CreateAgent')) return mode === 'quota' ? json({ code: 'resource_exhausted' }, 429) : json({ agentId: 'agent-1' });
   if (path.endsWith('/CancelRun') || path.endsWith('/CloseAgent')) return json({});
   if (path.endsWith('/Send')) {
-    const run = { result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result: JSON.stringify({ text: 'CURSOR_OPUS_OK', tool_calls: [] }), model: { id: 'claude-opus-5-5', params: [{ id: 'effort', value: 'high' }, { id: 'context', value: '300k' }, { id: 'fast', value: 'false' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } };
+    const run = { result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result: JSON.stringify({ text: 'CURSOR_OPUS_OK', tool_calls: [] }), model: { id: 'claude-opus-5-5', params: [{ id: 'effort', value: 'high' }, { id: 'context', value: '1m' }, { id: 'fast', value: 'false' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } };
     return new Response(Buffer.concat([frame(0, run), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers: { 'content-type': 'application/connect+json' } });
   }
   return json({ code: 'unimplemented' }, 404);

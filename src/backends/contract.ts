@@ -13,6 +13,8 @@ export type CatalogModel = {
   efforts: readonly string[];
   defaultEffort: string;
   inputModalities: readonly ('text' | 'image')[];
+  /** Tokens Codex may keep before compacting. Omit to advertise the 200K default. */
+  contextWindow?: number;
 };
 
 export interface SubscriptionBackend {

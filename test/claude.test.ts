@@ -19,10 +19,10 @@ describe("Claude subprocess boundaries", () => {
     expect(estimateVisibleTokens("")).toBe(0);
   });
   test("forwards supported effort and refuses silent downgrade", () => {
-    for (const effort of ["low", "medium", "high"]) {
+    for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
       const args = buildClaudeArgs({ model: "opus", input: "hello", reasoning: { effort } });
       expect(args[args.indexOf("--effort") + 1]).toBe(effort);
     }
-    expect(() => buildClaudeArgs({ model: "opus", input: "hello", reasoning: { effort: "max" } })).toThrow("Unsupported staged effort");
+    expect(() => buildClaudeArgs({ model: "opus", input: "hello", reasoning: { effort: "ultra" } })).toThrow("Unsupported staged effort");
   });
 });

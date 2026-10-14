@@ -39,7 +39,7 @@ function catalogRow(template: JsonRecord, model: CatalogModel, priority: number)
       description: EFFORT_DESCRIPTIONS[effort] ?? effort,
     })),
     input_modalities: [...model.inputModalities],
-    context_window: 200_000,
+    context_window: model.contextWindow ?? 200_000,
     visibility: 'list',
     priority,
   };

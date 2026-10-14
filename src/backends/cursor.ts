@@ -14,9 +14,12 @@ import { repairJsonStrings } from './grok';
 import { logSafe } from '../log';
 
 export const CURSOR_MODELS = {
-  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '' },
-  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k' },
-  'claude-opus-5-5': { name: 'Opus 5.5', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '300k' },
+  // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
+  // the catalog advertises to Codex so compaction happens at the real limit, not an artificial 200K.
+  // Kimi exposes no context parameter and its limit is unverified, so it keeps the 200K default.
+  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000 },
+  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '500k', window: 500_000 },
+  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 },
 } as const;
 export type CursorModel = keyof typeof CURSOR_MODELS;
 export type CursorOptions = {
@@ -562,11 +565,11 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
 
 export function createCursorBackend(options: CursorOptions): SubscriptionBackend {
   if (![options.binary, options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt','grok','claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId || !/^[a-f0-9]{64}$/.test(options.binaryHash)) throw new Error('Cursor requires absolute paths, a pinned bridge, account identity and a model namespace');
-  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7'];
+  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'claude-opus-5-5'];
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
-    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text', 'image'] })),
+    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: CURSOR_MODELS[model].window })),
     run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runCursorOnce(options, request, signal, note, last)),
   };
 }

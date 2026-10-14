@@ -22,7 +22,8 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = {
   'claude-sonnet': 'sonnet',
   'claude-haiku': 'haiku',
 };
-const EFFORTS = ['low', 'medium', 'high'] as const;
+// Every level the pinned Claude CLI accepts (`claude --help`: low, medium, high, xhigh, max).
+const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 const SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
 

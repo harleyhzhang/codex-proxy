@@ -89,14 +89,16 @@ describe('buildCatalog', () => {
     expect(local.map((row) => row.priority)).toEqual(local.map((_, index) => 8 + index));
   });
 
-  test('local rows inherit the listed template minus GPT-only fields', () => {
-    const row = buildCatalog(native).models.at(-1)!;
+  test('local rows inherit the listed template minus GPT-only fields and a per-model context window', () => {
+    const rows = buildCatalog(native).models;
+    const row = rows.find((r) => r.slug === 'claude-opus-5-5')!;
     expect(row.shell_type).toBe('shell');
     expect(row.visibility).toBe('list');
     expect(row.context_window).toBe(200_000);
     expect(row).not.toHaveProperty('service_tiers');
     expect(row).not.toHaveProperty('upgrade');
     expect(Array.isArray(row.supported_reasoning_levels)).toBe(true);
+    expect((row.supported_reasoning_levels as Array<{ effort: string }>).map((l) => l.effort)).toEqual(['low', 'medium', 'high', 'xhigh', 'max']);
   });
 
   test('refuses an empty or malformed cache', () => {
