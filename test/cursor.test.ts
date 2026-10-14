@@ -77,6 +77,10 @@ test('Cursor lenient parser tolerates fences, extra keys, extra args and OpenAI-
  expect(()=>parseCursorOutput('this is not the JSON object',request)).toThrow(/no Codex actions were executed/);
 });
 test('Cursor does not classify assistant quota text as a failure',()=>expect(output({text:'quota 429 expired',tool_calls:[]}).text).toBe('quota 429 expired'));
+test('Cursor repairs Kimi miscounted closers at the end of a tool call',()=>{
+ const body='{"text":"t","tool_calls":[{"name":"apply_patch","arguments":"x({a:\'{\'})"}';
+ for(const tail of ['}]}','}}]}','}}]'])expect(parseCursorOutput(body+tail,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['apply_patch',"x({a:'{'})"]]);
+});
 test('Cursor model parameters are family specific and unsupported effort is refused',()=>{
  expect(cursorSelection('kimi-k3','max').params).toEqual([{id:'reasoning',value:'max'}]);
  expect(cursorSelection('grok-4.7','xhigh',true).params).toContainEqual({id:'fast',value:'true'});

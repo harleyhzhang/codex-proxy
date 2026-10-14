@@ -183,9 +183,43 @@ export function coerceCustomArguments(value: unknown): string | undefined {
 function parseJsonLooselyImpl(raw: string): unknown {
   try { return JSON.parse(raw); } catch { /* fall through */ }
   try { return JSON.parse(repairJsonStrings(raw)); } catch { /* fall through */ }
-  const value = parseJsonLenient(raw);
-  logSafe('cursor-output-repaired', { category: 'lenient', bytes: raw.length });
-  return value;
+  try {
+    const value = parseJsonLenient(raw);
+    logSafe('cursor-output-repaired', { category: 'lenient', bytes: raw.length });
+    return value;
+  } catch (error) {
+    const balanced = balanceJsonBrackets(raw);
+    if (balanced === raw) throw error;
+    let value: unknown;
+    try { value = JSON.parse(balanced); } catch {
+      try { value = JSON.parse(repairJsonStrings(balanced)); } catch { value = parseJsonLenient(balanced); }
+    }
+    logSafe('cursor-output-repaired', { category: 'brackets', bytes: raw.length });
+    return value;
+  }
+}
+
+// Kimi K3 miscounts closers at the end of a tool call: `..."}}]}` (one extra brace before the
+// array closes) or `..."}}]` (that extra brace plus a missing final one). Outside strings, drop any
+// closer that does not match the innermost open bracket and append whatever is still open.
+export function balanceJsonBrackets(raw: string): string {
+  const stack: string[] = [];
+  let out = '', inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (inString) {
+      out += c;
+      if (c === '\\') { out += raw[i + 1] ?? ''; i++; }
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') inString = true;
+    else if (c === '{' || c === '[') stack.push(c === '{' ? '}' : ']');
+    else if (c === '}' || c === ']') { if (stack[stack.length - 1] !== c) continue; stack.pop(); }
+    out += c;
+  }
+  if (inString) return raw;
+  return out + stack.reverse().join('');
 }
 const fieldName = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(key) ? key : '(invalid name)';
 
