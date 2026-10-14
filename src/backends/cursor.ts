@@ -447,7 +447,14 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     } else proc?.kill();
   };
   let timedOut = false;
-  const timeout = setTimeout(() => { timedOut = true; cancel(); }, positiveInt('CURSOR_TIMEOUT_MS', 900_000));
+  // Native Codex bounds a model stream by silence, never by total length (model-provider-info
+  // DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s; codex-api "idle timeout waiting for SSE"), and retries
+  // that idle timeout like any dropped stream. A total deadline cut a long xhigh Grok turn that was
+  // still producing frames (benchmark round 38). Every Connect frame restarts the window.
+  const idleMs = positiveInt('CURSOR_TIMEOUT_MS', 300_000);
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const touch = () => { clearTimeout(timeout); timeout = setTimeout(() => { timedOut = true; cancel(); }, idleMs); };
+  touch();
   signal?.addEventListener('abort', cancel, { once: true });
   try {
     signal?.throwIfAborted();
@@ -505,6 +512,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       if (!response.body) throw new CursorError('Cursor returned an empty stream');
       const events: JsonRecord[] = [];
       for await (const event of connectFrames(response.body)) {
+        touch();
         events.push(event);
         const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
         if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
@@ -527,7 +535,7 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
   } catch (error) {
     // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
     // shows the real cause instead of the generic internal-router message.
-    if (timedOut) throw new CursorError('Cursor request timed out; no automatic supplier fallback');
+    if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic supplier fallback`, true);
     throw error;
   } finally {
     clearTimeout(timeout); clearTimeout(startup); signal?.removeEventListener('abort', cancel);

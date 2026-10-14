@@ -52,6 +52,14 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     if (scenario === 'HANG') await new Promise(() => {});
     const headers = { 'content-type': 'application/connect+json' };
     const run = (result) => ({ result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result, model: { id: 'kimi-k3', params: [{ id: 'reasoning', value: 'high' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } });
+    if (scenario === 'SLOW') {
+      // Six keepalive frames 250 ms apart, then the result: 1.5 s total, never more than 250 ms silent.
+      const stream = new ReadableStream({ async start(controller) {
+        for (let i = 0; i < 6; i++) { await new Promise(r => setTimeout(r, 250)); controller.enqueue(frame(0, { sdkMessage: { message: { runId: 'run-1', step: i } } })); }
+        controller.enqueue(frame(0, run(JSON.stringify({ text: 'CURSOR_SLOW_OK', tool_calls: [] })))); controller.enqueue(frame(0, { done: { runId: 'run-1' } })); controller.enqueue(frame(2, {})); controller.close();
+      } });
+      return new Response(stream, { headers });
+    }
     if (scenario === 'STREAM_ERROR') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { runId: 'run-1' } } }), frame(2, { error: { code: 'internal' } })]), { headers });
     if (scenario === 'STREAM_OVERFLOW') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { runId: 'run-1' } } }), frame(2, { error: { code: 'invalid_argument', message: 'prompt is too long for this model' } })]), { headers });
     if (scenario === 'TRUNCATED') return new Response(frame(0, run('{}')).subarray(0, 12), { headers });
@@ -254,6 +262,17 @@ describe('Cursor bridge failures through the router', () => {
       expect(pidAlive(await bridgePid())).toBe(false);
       await scenario('OK');
       expectOk(await everyTransport(app, body('after-hang')), 'CURSOR_OK');
+    } finally { await app.close(); }
+  });
+
+  test('a slow but steady stream outlives the idle window because every frame restarts it', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('SLOW');
+      // 600 ms of silence would cut it; the stream stays quiet for at most 250 ms but runs 1.5 s.
+      process.env.CURSOR_TIMEOUT_MS = '600';
+      const seen = await everyTransport(app, body('slow')).finally(() => { process.env.CURSOR_TIMEOUT_MS = '10000'; });
+      expectOk(seen, 'CURSOR_SLOW_OK');
     } finally { await app.close(); }
   });
 
