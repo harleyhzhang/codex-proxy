@@ -29,10 +29,10 @@ test('Cursor unwraps Kimi native-markup custom calls that carry a call_id beside
  expect(()=>parseCursorOutput(bad,req as never)).toThrow(/got max_output_tokens, yield_time_ms.*@exec: pragma/);
 });
 
-test('Cursor sanitizer drops encrypted reasoning and compaction items and replaces media parts instead of refusing the turn',()=>{
+test('Cursor sanitizer drops encrypted reasoning and compaction items, keeps inline images and replaces other media instead of refusing the turn',()=>{
  type R=Record<string,unknown>;
  const history=[
-  {type:'message',role:'user',content:[{type:'input_text',text:'look at this'},{type:'input_image',image_url:'data:image/png;base64,AAAA'}]},
+  {type:'message',role:'user',content:[{type:'input_text',text:'look at this'},{type:'input_image',image_url:'data:image/png;base64,AAAA'},{type:'input_image',image_url:'https://example.com/remote.png'}]},
   {type:'reasoning',id:'rs_1',encrypted_content:'gAAAAopaque',summary:[]},
   {type:'message',role:'assistant',content:[{type:'output_text',text:'ok'}]},
   {type:'compaction',encrypted_content:'gAAAAsummary'},
@@ -44,7 +44,8 @@ test('Cursor sanitizer drops encrypted reasoning and compaction items and replac
  expect(result.replaced).toBe(2);
  const items=result.input as R[];
  expect(items.map(i=>i.type)).toEqual(['message','message','function_call_output','message']);
- expect((items[0]!.content as R[])[1]).toEqual({type:'input_text',text:'[attachment omitted: the Cursor bridge is text-only]'});
+ expect((items[0]!.content as R[])[1]).toEqual({type:'input_image',image_url:'data:image/png;base64,AAAA'});
+ expect((items[0]!.content as R[])[2]).toEqual({type:'input_text',text:'[attachment omitted: the Cursor bridge accepts text and inline images only]'});
  expect((items[2]!.output as R[])[1]).toEqual({type:'input_text',text:'done'});
  expect(JSON.stringify(result.input)).not.toContain('gAAAA');
  expect(history[1]!.encrypted_content).toBe('gAAAAopaque');

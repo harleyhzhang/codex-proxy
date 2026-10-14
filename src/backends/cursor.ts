@@ -305,21 +305,28 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
 
 const OPAQUE_ITEM_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction', 'encrypted_content', 'reasoning']);
 const MEDIA_PART_TYPES = new Set(['input_image', 'image', 'input_audio', 'audio', 'input_file', 'file']);
+const IMAGE_PART_TYPES = new Set(['input_image', 'image']);
 const isOpaque = (value: JsonRecord): boolean => OPAQUE_ITEM_TYPES.has(String(value.type)) || typeof value.encrypted_content === 'string';
 const isMedia = (value: JsonRecord): boolean => MEDIA_PART_TYPES.has(String(value.type)) || Boolean(value.file_id) || Boolean(value.image_url) || Boolean(value.audio_url) || Boolean(value.file_data);
+const imageUrlOf = (value: JsonRecord): string | undefined => typeof value.image_url === 'string' ? value.image_url : isRecord(value.image_url) && typeof value.image_url.url === 'string' ? value.image_url.url : undefined;
+// Inline PNG/JPEG/GIF/WebP data URLs are forwarded to the bridge as SelectedImages (the same path the
+// Cursor app uses for pasted screenshots). Remote URLs, files and audio stay placeholders.
+const isInlineImage = (value: JsonRecord): boolean => IMAGE_PART_TYPES.has(String(value.type)) && !value.file_id && /^data:image\/(?:png|jpeg|gif|webp);base64,/.test(imageUrlOf(value) ?? '');
 
 /**
- * Cursor cannot replay OpenAI-encrypted reasoning, compaction summaries or binary attachments. Rather than
- * refusing the whole turn (which breaks mid-thread model switches from a GPT backend), drop the opaque
- * history items and replace media parts with a short text placeholder so the model knows something was
- * omitted. Returns the sanitized input plus a count of what changed for logging.
+ * Cursor cannot replay OpenAI-encrypted reasoning, compaction summaries or non-image attachments. Rather
+ * than refusing the whole turn (which breaks mid-thread model switches from a GPT backend), drop the opaque
+ * history items and replace unsupported media parts with a short text placeholder so the model knows
+ * something was omitted. Inline images survive untouched. Returns the sanitized input plus a count of what
+ * changed for logging.
  */
 export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: number; replaced: number } {
   const stats = { dropped: 0, replaced: 0 };
   const walk = (value: unknown): unknown => {
     if (Array.isArray(value)) return value.map(walk);
     if (!isRecord(value)) return value;
-    if (isMedia(value)) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge is text-only]' }; }
+    if (isInlineImage(value)) return value;
+    if (isMedia(value)) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' }; }
     if (isOpaque(value)) { stats.replaced++; return { type: 'input_text', text: '[encrypted or compacted content from a previous model; unreadable here]' }; }
     const out: JsonRecord = {};
     for (const [key, child] of Object.entries(value)) out[key] = walk(child);
@@ -430,7 +437,9 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
   request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
   const selection = cursorSelection(request.model, request.reasoning?.effort, options.fastest);
   const prepared = preparePrompt(request);
-  if (prepared.images.length) throw new CursorError('Cursor bridge supports text only');
+  // SendRequest.message.images is SdkImage{ data: SdkImageData{ data: bytes, mime_type } }; proto JSON
+  // encodes bytes as base64 and the oneof by field name. The bridge wraps each as a SelectedImage.
+  const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
   if (sha256(readFileSync(options.binary)) !== options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
   const key = readCursorKey(options);
   const dir = await mkdtemp(join(options.cwd, 'request-')); await chmod(dir, 0o700);
@@ -507,8 +516,8 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: [] }, disallowedTools: ['task', 'mcp'], local: { cwd: [dir], settingSources: [] } } })).json();
     if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
     agentId = created.agentId;
-    const send = async (text: string): Promise<JsonRecord[]> => {
-      const response = await rpc('SdkAgentService', 'Send', { agentId, message: { text }, options: { enableSteps: true } }, true);
+    const send = async (text: string, attach: typeof images = []): Promise<JsonRecord[]> => {
+      const response = await rpc('SdkAgentService', 'Send', { agentId, message: attach.length ? { text, images: attach } : { text }, options: { enableSteps: true } }, true);
       if (!response.body) throw new CursorError('Cursor returned an empty stream');
       const events: JsonRecord[] = [];
       for await (const event of connectFrames(response.body)) {
@@ -522,7 +531,8 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
       return events;
     };
     const captureDir = join(dirname(options.cwd), 'invalid-output');
-    const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`);
+    if (images.length) logSafe('cursor-images-attached', { count: images.length });
+    const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`, images);
     try {
       return interpretCursorEvents(events, request, selection, captureDir);
     } catch (error) {
@@ -556,7 +566,7 @@ export function createCursorBackend(options: CursorOptions): SubscriptionBackend
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
-    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text'] })),
+    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text', 'image'] })),
     run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runCursorOnce(options, request, signal, note, last)),
   };
 }
