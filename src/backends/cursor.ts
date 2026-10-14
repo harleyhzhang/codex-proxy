@@ -18,11 +18,12 @@ export const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
   // the catalog advertises to Codex so compaction happens at the real limit, not an artificial 200K.
   // Kimi exposes no context parameter and its limit is unverified, so it keeps the 200K default.
-  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000 },
+  // Kimi K3 is not a vision model on Cursor: a probed image arrives as an on-disk asset path only (2026-10-13).
+  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000, vision: false },
   // Grok 4.7: Cursor discovery lists a 500k context, but a run requested at 500k never reaches
   // RUN_LIFECYCLE_STATUS_FINISHED (probed 2026-10-13, text-only prompt); 256k is the largest that works.
-  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 },
-  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 },
+  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 , vision: true },
+  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 , vision: true },
 } as const;
 export type CursorModel = keyof typeof CURSOR_MODELS;
 export type CursorOptions = {
@@ -623,7 +624,7 @@ export function createCursorBackend(options: CursorOptions): SubscriptionBackend
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
-    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: CURSOR_MODELS[model].window })),
+    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
     run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runCursorOnce(options, request, signal, note, last)),
   };
 }
