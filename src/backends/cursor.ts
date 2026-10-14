@@ -19,7 +19,9 @@ export const CURSOR_MODELS = {
   // the catalog advertises to Codex so compaction happens at the real limit, not an artificial 200K.
   // Kimi exposes no context parameter and its limit is unverified, so it keeps the 200K default.
   'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000 },
-  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '500k', window: 500_000 },
+  // Grok 4.7: Cursor discovery lists a 500k context, but a run requested at 500k never reaches
+  // RUN_LIFECYCLE_STATUS_FINISHED (probed 2026-10-13, text-only prompt); 256k is the largest that works.
+  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 },
   'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 },
 } as const;
 export type CursorModel = keyof typeof CURSOR_MODELS;
@@ -38,6 +40,20 @@ export class CursorProseError extends CursorError {
 
 const MAX_BYTES = 32 * 1024 * 1024;
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
+// Provider-side failures that native Codex would retry with backoff (429/5xx/overload). Matched
+// against the short reason Cursor attaches to an errored run, never against model output.
+const TRANSIENT_RUN_ERROR = /rate.?limit|too many requests|\b429\b|\b50[234]\b|overload|capacity|temporar|unavailable|internal error|try again|timed? ?out|upstream|gateway/i;
+
+/** Cursor's own reason for an unfinished run: a short provider string, or undefined when absent. */
+function cursorRunReason(result: JsonRecord | undefined, run: JsonRecord | undefined, done: unknown): string | undefined {
+  const candidates: unknown[] = [run?.error, run?.errorMessage, run?.message, result?.error, result?.errorMessage, isRecord(done) ? done.error : undefined];
+  if (run && run.status !== FINISHED && typeof run.result === 'string') candidates.push(run.result);
+  for (const value of candidates) {
+    const text = typeof value === 'string' ? value : isRecord(value) && typeof value.message === 'string' ? value.message : undefined;
+    if (text && text.trim()) return text.replace(/\s+/g, ' ').trim().slice(0, 160);
+  }
+  return undefined;
+}
 const PRIVATE_ENV = /^(CURSOR_|AGENT_|OPENAI_|ANTHROPIC_|CLAUDE_CODE_|XAI_|GROK_|PROXY_|NODE_OPTIONS$|BUN_OPTIONS$)/;
 export function cursorEnvironment(apiKey: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -431,7 +447,18 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   const result = terminal.length === 1 && isRecord(terminal[0]?.result) ? terminal[0].result : undefined;
   const run = result && isRecord(result.result) ? result.result : undefined;
   const done = events.at(-1)?.done;
-  if (!result || result.status !== FINISHED || !run || run.status !== FINISHED || !isRecord(done) || done.runId !== result.runId || typeof run.result !== 'string') throw new CursorError('Cursor did not finish successfully; no automatic supplier fallback');
+  if (!result || result.status !== FINISHED || !run || run.status !== FINISHED || !isRecord(done) || done.runId !== result.runId || typeof run.result !== 'string') {
+    // Name the lifecycle state so a failed run is diagnosable from the router log, and retry once
+    // when Cursor itself reports a transient provider error, which is what native Codex does for
+    // 429/5xx. The reason is Cursor's provider string, not model output, so it is safe to surface.
+    const status = String(result?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
+    const runStatus = String(run?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
+    const reason = cursorRunReason(result, run, done);
+    const transient = !!reason && TRANSIENT_RUN_ERROR.test(reason);
+    logSafe('cursor-unfinished', { events: events.length, terminal: terminal.length, status, runStatus, hasDone: isRecord(done), doneMatches: isRecord(done) && !!result && done.runId === result.runId, resultType: typeof run?.result, reasonBytes: reason?.length ?? 0, transient });
+    const detail = status === 'FINISHED' && runStatus === 'FINISHED' ? 'the run finished without a result' : `run status ${runStatus}${reason ? `: ${reason}` : ''}`;
+    throw new CursorError(`Cursor did not finish successfully (${detail}); no automatic supplier fallback`, transient);
+  }
   const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
   if (!sameModel) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
   const output = parseCursorOutput(run.result, request, captureDir, acceptProse);

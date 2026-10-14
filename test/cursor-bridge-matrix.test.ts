@@ -65,6 +65,11 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     if (scenario === 'TRUNCATED') return new Response(frame(0, run('{}')).subarray(0, 12), { headers });
     if (scenario === 'NATIVE') return new Response(Buffer.concat([frame(0, { sdkMessage: { message: { content: [{ type: 'tool_use', name: 'shell' }] } } }), frame(0, run('{}')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'UNFINISHED') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
+    // A provider-side transient failure (what native Codex retries on 429/5xx): the first run errors
+    // with Cursor's reason string, the fresh retry succeeds. A non-transient reason is not retried.
+    // Each attempt launches a fresh bridge process, so the first/second distinction lives on disk.
+    if (scenario === 'UNFINISHED_TRANSIENT') { const marker = '${scratch}/transient-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'upstream provider rate limit exceeded, try again' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_AFTER_TRANSIENT', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
+    if (scenario === 'UNFINISHED_REASON') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'model refused the request policy' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'WRONG_MODEL') { const body = run(JSON.stringify({ text: 'x', tool_calls: [] })); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'BAD_OUTPUT') return new Response(Buffer.concat([frame(0, run('this is not the JSON object')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'BAD_JSON') return new Response(Buffer.concat([frame(0, run('{"text": "oops", tool_calls: [')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
@@ -228,7 +233,19 @@ describe('Cursor bridge failures through the router', () => {
       await scenario('TRUNCATED'); expectTerminal(await everyTransport(app, body('x')), 'partial frame');
       await scenario('NATIVE'); expectTerminal(await everyTransport(app, body('x')), 'native tool');
       await scenario('UNFINISHED'); expectTerminal(await everyTransport(app, body('x')), 'did not finish successfully');
+      await scenario('UNFINISHED_REASON'); expectTerminal(await everyTransport(app, body('x')), 'run status ERROR: model refused the request policy');
       await scenario('WRONG_MODEL'); expectTerminal(await everyTransport(app, body('x')), 'different model or reasoning setting');
+    } finally { await app.close(); }
+  });
+
+  test('a transient provider error on the run is retried once with a fresh agent, like native 429/5xx handling', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('UNFINISHED_TRANSIENT');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toContain('CURSOR_AFTER_TRANSIENT');
+      }
     } finally { await app.close(); }
   });
 
