@@ -173,6 +173,25 @@ describe('secondary Claude account identity check', () => {
       expectText(await everyTransport(app, body(OPUS, 'recovered')), 'CLAUDE_OK');
     } finally { await app.close(); }
   });
+
+  test('a complete matching answer whose teardown was killed by the probe deadline (exit 143) still serves the turn', async () => {
+    // October 11-15, 2026: `claude auth status` wrote its full answer, then its teardown ran past the spawn
+    // timeout. Bun reports that SIGTERM as exit 143 with no signalCode. The answer is the verdict; the
+    // teardown status is not evidence about the login and must not fail a healthy turn.
+    const app = await fixtureRouter();
+    try {
+      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 143);
+      expectText(await everyTransport(app, body(FABLE, 'slow probe')), 'CLAUDE_OK');
+      // The same exit with no usable answer is still a killed probe, named as such, with no turn launched.
+      const turnsBefore = await count('claude-turn');
+      await setIdentity('', 143);
+      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
+      await setIdentity(JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 143);
+      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
+      expect(await count('claude-turn')).toBe(turnsBefore);
+      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
+    } finally { await app.close(); }
+  });
 });
 
 describe('Opus quota fallback into Cursor, end to end', () => {

@@ -92,6 +92,14 @@ export type ClaudeAccountOptions = {
   expectedEmail?: string; expectedOrg?: string;
 };
 
+/**
+ * Wall-clock budget for one `claude auth status` probe. The CLI answers in well under a second on an
+ * idle machine, but under swap pressure or a busy router its startup and teardown each stretch past
+ * twenty seconds (observed 20.1-23.4 s on October 11-15, 2026). The budget only bounds a probe that
+ * never answers; a probe whose answer arrived is accepted even if its teardown ran past the budget.
+ */
+const IDENTITY_PROBE_TIMEOUT_MS = 45_000;
+
 /** Each login owns its warm workers, quota snapshot and usage sink. */
 export class ClaudeAccount {
   readonly workers = new Map<string, ClaudeWorker>();
@@ -113,7 +121,7 @@ export class ClaudeAccount {
     signal?.throwIfAborted();
     if (!this.options.expectedEmail && !this.options.expectedOrg) return;
     const started = Date.now();
-    const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: 20000, signal});
+    const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: IDENTITY_PROBE_TIMEOUT_MS, signal});
     const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
     // A cancelled turn kills the probe (SIGTERM, exit 143); that is the caller's abort, not an account problem.
     signal?.throwIfAborted();
@@ -122,14 +130,23 @@ export class ClaudeAccount {
     const info = isRecord(status) ? status : undefined;
     const emailMatch = !this.options.expectedEmail || info?.email === this.options.expectedEmail;
     const orgMatch = !this.options.expectedOrg || info?.orgId === this.options.expectedOrg;
-    if (exitCode === 0 && info?.loggedIn && emailMatch && orgMatch) return;
+    const answered = !!info?.loggedIn && emailMatch && orgMatch;
+    if (exitCode === 0 && answered) return;
+    // Bun reports the spawn-timeout SIGTERM as exit 143 and leaves `signalCode` null, so both spellings
+    // mean "our own deadline killed it". When the full answer had already been written before that kill
+    // (stdout parsed, logged in, email and org match), the account is verified: the CLI's slow teardown
+    // under machine stall is not evidence about the login, and refusing it fails a healthy turn.
+    const killed = child.signalCode !== null || exitCode === 143;
+    if (killed && answered) {
+      logSafe('claude-identity-check-slow', { ms: Date.now() - started, exit: exitCode });
+      return;
+    }
     // Content-free diagnostics: which condition failed and how long the probe took, never the identity values.
-    const killed = child.signalCode !== null;
     logSafe('claude-identity-check-failed', { exit: exitCode, killed, ms: Date.now() - started, parsed: !!info, logged_in: !!info?.loggedIn, email_match: emailMatch, org_match: orgMatch });
     // Only a parsed, logged-in answer with the wrong email/org is an identity mismatch. A killed probe (the
-    // 20s spawn timeout under machine stall), a non-zero exit or unreadable output is a probe failure and
+    // spawn timeout under machine stall), a non-zero exit or unreadable output is a probe failure and
     // must say so, or a transient stall reads as a login problem.
-    if (killed) throw new BackendError('Claude identity check was killed before it answered (claude auth status exceeded 20s); retry the turn');
+    if (killed) throw new BackendError(`Claude identity check was killed before it answered (claude auth status exceeded ${IDENTITY_PROBE_TIMEOUT_MS / 1000}s); retry the turn`);
     if (exitCode !== 0) throw new BackendError(`Claude identity check failed (claude auth status exited ${exitCode}); retry the turn`);
     if (!info) throw new BackendError('Claude identity check returned unreadable output; retry the turn');
     if (!info.loggedIn) throw new BackendError('Claude account is not logged in for this configuration');
