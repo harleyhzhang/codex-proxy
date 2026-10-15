@@ -70,6 +70,9 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     // Each attempt launches a fresh bridge process, so the first/second distinction lives on disk.
     if (scenario === 'UNFINISHED_TRANSIENT') { const marker = '${scratch}/transient-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'upstream provider rate limit exceeded, try again' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_AFTER_TRANSIENT', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'UNFINISHED_REASON') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'model refused the request policy' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
+    // 2026-10-15 live shape: status ERROR with every reason field empty. Nothing has executed, so it
+    // gets the same single fresh attempt as a transient provider error; here the retry succeeds.
+    if (scenario === 'UNFINISHED_OPAQUE') { const marker = '${scratch}/opaque-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_AFTER_OPAQUE', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'WRONG_MODEL') { const body = run(JSON.stringify({ text: 'x', tool_calls: [] })); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'BAD_OUTPUT') return new Response(Buffer.concat([frame(0, run('this is not the JSON object')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     if (scenario === 'BAD_JSON') return new Response(Buffer.concat([frame(0, run('{"text": "oops", tool_calls: [')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
@@ -245,6 +248,17 @@ describe('Cursor bridge failures through the router', () => {
       for (const cell of await everyTransport(app, body('x'))) {
         expect(cell.code, cell.transport).toBe('ok');
         expect(cell.message, cell.transport).toContain('CURSOR_AFTER_TRANSIENT');
+      }
+    } finally { await app.close(); }
+  });
+
+  test('an errored run with no reason at all is retried once like a transient error; the retry succeeds', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('UNFINISHED_OPAQUE');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toContain('CURSOR_AFTER_OPAQUE');
       }
     } finally { await app.close(); }
   });

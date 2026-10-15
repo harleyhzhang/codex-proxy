@@ -489,9 +489,17 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
     const status = String(result?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
     const runStatus = String(run?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
     const reason = cursorRunReason(result, run, done);
-    const transient = !!reason && TRANSIENT_RUN_ERROR.test(reason);
-    logSafe('cursor-unfinished', { events: events.length, terminal: terminal.length, status, runStatus, hasDone: isRecord(done), doneMatches: isRecord(done) && !!result && done.runId === result.runId, resultType: typeof run?.result, reasonBytes: reason?.length ?? 0, transient });
-    const detail = status === 'FINISHED' && runStatus === 'FINISHED' ? 'the run finished without a result' : `run status ${runStatus}${reason ? `: ${reason}` : ''}`;
+    // An errored run that carries no reason at all (2026-10-15: status ERROR, every reason field
+    // empty) is indistinguishable from a provider hiccup, and nothing has executed, so it gets the
+    // same single fresh attempt. A run that names a non-transient reason is not retried. The raw
+    // terminal frames are kept owner-only so the next opaque failure can be read, not guessed.
+    const errored = runStatus !== 'FINISHED' || status !== 'FINISHED';
+    const opaque = errored && !reason;
+    const transient = opaque || (!!reason && TRANSIENT_RUN_ERROR.test(reason));
+    const captured = captureInvalidOutput(captureDir, 'unfinished', JSON.stringify({ result, done, events }, null, 1).slice(0, 262_144));
+    const keysOf = (value: unknown) => isRecord(value) ? Object.keys(value).sort().slice(0, 32) : [];
+    logSafe('cursor-unfinished', { events: events.length, terminal: terminal.length, status, runStatus, hasDone: isRecord(done), doneMatches: isRecord(done) && !!result && done.runId === result.runId, resultType: typeof run?.result, reasonBytes: reason?.length ?? 0, opaque, transient, resultKeys: keysOf(result), runKeys: keysOf(run), doneKeys: keysOf(done), captured: !!captured });
+    const detail = status === 'FINISHED' && runStatus === 'FINISHED' ? 'the run finished without a result' : `run status ${runStatus}${reason ? `: ${reason}` : opaque ? ' with no reason from Cursor' : ''}`;
     throw new CursorError(`Cursor did not finish successfully (${detail}); no automatic supplier fallback`, transient);
   }
   const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));

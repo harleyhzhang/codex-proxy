@@ -106,6 +106,15 @@ test('Cursor requires matching terminal success, done and exact model',()=>{
  expect(()=>interpretCursorEvents(events,request,cursorSelection('kimi-k3','high'))).toThrow();
  expect(()=>interpretCursorEvents([...events,events[0]!],request,selection)).toThrow();
 });
+test('an errored run is retryable only when Cursor gives no reason or a transient one',()=>{
+ const errored=(run:JsonRecord):JsonRecord[]=>[{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',...run}}},{done:{runId:'r'}}];
+ const caught=(run:JsonRecord)=>{try{interpretCursorEvents(errored(run),request,selection);}catch(error){return error as CursorError;}throw new Error('expected a refusal');};
+ const opaque=caught({});
+ expect(opaque.retryable).toBe(true); expect(opaque.message).toContain('run status ERROR with no reason from Cursor');
+ expect(caught({error:'upstream provider rate limit exceeded'}).retryable).toBe(true);
+ const policy=caught({error:'model refused the request policy'});
+ expect(policy.retryable).toBe(false); expect(policy.message).toContain('run status ERROR: model refused the request policy');
+});
 for(const event of [{sdkMessage:{type:'tool_call',message:{}}},{sdkMessage:{type:'task',message:{}}},{step:{type:'summaryMessage',step:{}}}])test('Cursor rejects native execution and native compaction',()=>expect(()=>interpretCursorEvents([event,...events],request,selection)).toThrow());
 function frame(value:unknown,flag=0){const data=Buffer.from(JSON.stringify(value));const h=Buffer.alloc(5);h[0]=flag;h.writeUInt32BE(data.length,1);return Buffer.concat([h,data]);}
 const stream=(chunks:Uint8Array[])=>new ReadableStream<Uint8Array>({start(c){chunks.forEach(x=>c.enqueue(x));c.close()}});
