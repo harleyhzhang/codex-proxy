@@ -3,7 +3,7 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runClaude } from '../src/backends/claude';
+import { reportedUsage, runClaude } from '../src/backends/claude';
 
 let directory = '';
 let oldClaudeBin: string | undefined;
@@ -55,10 +55,23 @@ const lookup = {
 };
 
 describe('Claude worker', () => {
-  test('answers a plain turn and reports visible usage, not cache reads', async () => {
+  test("answers a plain turn and reports the CLI's real prompt size, cache reads included", async () => {
     const output = await runClaude({ model: 'sonnet', input: 'hello' });
     expect(output.text).toBe('mock-ok');
-    expect(output.usage.inputTokens).toBeLessThan(1_000);
+    // Codex compacts from this number; the mock's prompt was 440,960 uncached + 180,000 cached tokens.
+    expect(output.usage.inputTokens).toBe(620_960);
+    expect(output.usage.totalTokens).toBe(output.usage.inputTokens + output.usage.outputTokens);
+  });
+
+  test('reportedUsage reads the last API call of a turn and ignores results without usage', () => {
+    expect(reportedUsage(undefined)).toBeUndefined();
+    expect(reportedUsage({ input_tokens: 0, output_tokens: 0 })).toBeUndefined();
+    expect(reportedUsage({ input_tokens: 2, cache_creation_input_tokens: 233, cache_read_input_tokens: 2172, output_tokens: 5 })).toEqual({ promptTokens: 2407, outputTokens: 5 });
+    // A multi-call turn sums at the top level; only the final call reflects what the model holds now.
+    expect(reportedUsage({
+      input_tokens: 10, cache_read_input_tokens: 1000, output_tokens: 30,
+      iterations: [{ input_tokens: 4, cache_read_input_tokens: 400, output_tokens: 10 }, { input_tokens: 6, cache_read_input_tokens: 600, output_tokens: 20 }],
+    })).toEqual({ promptTokens: 606, outputTokens: 20 });
   });
 
   test('continues a tool loop in the same worker', async () => {

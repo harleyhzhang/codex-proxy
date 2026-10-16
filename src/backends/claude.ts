@@ -35,8 +35,24 @@ type ClaudeResult = {
   is_error: boolean;
   result?: string;
   structured_output?: StructuredOutput;
+  usage?: unknown;
 };
 type StructuredOutput = { text: string; tool_calls: Array<{ name: string; arguments: string }> };
+
+/**
+ * Token counts of the last API call behind a CLI result. Anthropic's `input_tokens` excludes cached
+ * tokens, so the prompt the model actually held is input + cache creation + cache reads; the per-call
+ * breakdown lives in `usage.iterations` and the top level is the turn total. Each `result` is one
+ * turn, not the session, so this never accumulates across a worker's continuation turns.
+ */
+export function reportedUsage(usage: unknown): { promptTokens: number; outputTokens: number } | undefined {
+  if (!isRecord(usage)) return undefined;
+  const iterations = Array.isArray(usage.iterations) ? usage.iterations.filter(isRecord) : [];
+  const last = iterations.length ? iterations[iterations.length - 1] : usage;
+  const count = (key: string): number => (typeof last[key] === 'number' && last[key] > 0 ? last[key] : 0);
+  const promptTokens = count('input_tokens') + count('cache_creation_input_tokens') + count('cache_read_input_tokens');
+  return promptTokens > 0 ? { promptTokens, outputTokens: count('output_tokens') } : undefined;
+}
 
 export function resolveEffort(request: ResponsesRequest): string {
   const effort = request.reasoning?.effort ?? 'high';
@@ -465,11 +481,15 @@ async function runClaudeOnce(request: ResponsesRequest, signal: AbortSignal | un
     if (canContinue) worker.retainFor(toolCalls.map((call) => call.callId));
     else worker.close();
 
-    // Claude Code's own usage counts its hidden system prompt, tool schemas and cache activity.
-    // Reporting that overhead makes Codex think its conversation exceeds the context window, so
-    // only the content Codex can see and compact is counted.
-    const inputTokens = estimateVisibleTokens(requestToPrompt(request));
-    const outputTokens = estimateVisibleTokens(structured.text + JSON.stringify(toolCalls));
+    // Codex decides when to compact from this number, so it must be what Claude actually held: the
+    // CLI's own count of the last call (cache reads included). The byte estimate of the visible
+    // conversation undercounts JSON-heavy tool output and images by up to half, which let a thread
+    // grow past the real window before Codex thought it was near the limit; it is now only a floor
+    // for a CLI result that carries no usage. With every native tool disabled the CLI's hidden
+    // overhead is about 2K tokens, immaterial against the advertised window.
+    const reported = reportedUsage(result.usage);
+    const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request)), reported?.promptTokens ?? 0);
+    const outputTokens = Math.max(estimateVisibleTokens(structured.text + JSON.stringify(toolCalls)), reported?.outputTokens ?? 0);
     return {
       text: structured.text,
       toolCalls,
