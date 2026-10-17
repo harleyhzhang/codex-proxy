@@ -94,6 +94,7 @@ describe("Responses request adapter", () => {
     expect(continuationRequest(request, new Set(["call_1"]))).toEqual({
       ...request,
       instructions: undefined,
+      tools: undefined,
       input: request.input.slice(2),
     });
   });

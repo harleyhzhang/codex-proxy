@@ -186,6 +186,9 @@ export function requestToPrompt(request: ResponsesRequest): string {
 /**
  * The suffix of a request that a still-running CLI session has not seen yet: everything from the
  * first result of a tool call that session issued. Undefined when the session cannot continue.
+ * The tool list is dropped too: a session only continues when its signature (tool list included)
+ * matches, so it already holds those descriptions and its output schema. Resending them on every
+ * tool result added ~20K tokens per call and filled the context window in a handful of commands.
  */
 export function continuationRequest(
   request: ResponsesRequest,
@@ -197,7 +200,7 @@ export function continuationRequest(
       typeof item.call_id === 'string' && callIds.has(item.call_id) && TOOL_OUTPUT_TYPES.has(item.type ?? ''),
   );
   if (first < 0) return undefined;
-  return { ...request, instructions: undefined, input: request.input.slice(first) };
+  return { ...request, instructions: undefined, tools: undefined, input: request.input.slice(first) };
 }
 
 /** The JSON schema a CLI model's structured output must satisfy: text plus listed tool calls. */

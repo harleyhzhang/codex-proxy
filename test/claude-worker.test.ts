@@ -21,8 +21,12 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 while IFS= read -r input; do
-  if [ "$turn" -eq 1 ]; then
+  if [ "$turn" -eq 1 ] && printf '%s' "$input" | grep -q 'available_tools'; then
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"continued-with-resent-tools","tool_calls":[]}}'
+  elif [ "$turn" -eq 1 ]; then
     printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"continued-in-worker","tool_calls":[]}}'
+  elif printf '%s' "$input" | grep -q 'TOOLS_LISTED' && printf '%s' "$input" | grep -q 'available_tools'; then
+    printf '%s\\n' '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"tools-listed","tool_calls":[]}}'
   elif printf '%s' "$input" | grep -q 'CANCEL_PENDING'; then
     continue
   elif printf '%s' "$input" | grep -q 'EFFORT_CHANGED'; then
@@ -74,7 +78,7 @@ describe('Claude worker', () => {
     })).toEqual({ promptTokens: 606, outputTokens: 20 });
   });
 
-  test('continues a tool loop in the same worker', async () => {
+  test('continues a tool loop in the same worker without resending the tool list', async () => {
     const first = await runClaude({ model: 'sonnet', input: 'persistent-first', tools: [lookup] });
     const call = first.toolCalls[0]!;
     expect(call.name).toBe('lookup');
@@ -87,7 +91,13 @@ describe('Claude worker', () => {
         { type: 'function_call_output', call_id: call.callId, output: 'result' },
       ],
     });
+    // The mock answers differently if the continuation carries <available_tools> again.
     expect(second.text).toBe('continued-in-worker');
+  });
+
+  test('a fresh session still receives the tool list', async () => {
+    const output = await runClaude({ model: 'sonnet', input: 'TOOLS_LISTED', tools: [lookup] });
+    expect(output.text).toBe('tools-listed');
   });
 
   test('restarts with a replayed transcript when the effort changes', async () => {
