@@ -116,11 +116,20 @@ export type ClaudeAccountOptions = {
  */
 const IDENTITY_PROBE_TIMEOUT_MS = 45_000;
 
+/**
+ * How long a verified identity vouches for a probe that stalled without answering. Under heavy load
+ * (October 17, 2026: load average 13 during a disk cleanup) `claude auth status` printed nothing for
+ * the full 45 s budget and a healthy Poly turn was refused. A stall says nothing about the login; only
+ * a parsed answer can show a mismatch or a logout, and either one clears the verification.
+ */
+const IDENTITY_STALL_GRACE_MS = 6 * 60 * 60_000;
+
 /** Each login owns its warm workers, quota snapshot and usage sink. */
 export class ClaudeAccount {
   readonly workers = new Map<string, ClaudeWorker>();
   rateLimitSink?: (info: unknown) => void;
   readonly options: Readonly<ClaudeAccountOptions>;
+  private verifiedAt = 0;
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
   onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
   environment(): Record<string, string> {
@@ -147,14 +156,22 @@ export class ClaudeAccount {
     const emailMatch = !this.options.expectedEmail || info?.email === this.options.expectedEmail;
     const orgMatch = !this.options.expectedOrg || info?.orgId === this.options.expectedOrg;
     const answered = !!info?.loggedIn && emailMatch && orgMatch;
-    if (exitCode === 0 && answered) return;
+    if (exitCode === 0 && answered) { this.verifiedAt = Date.now(); return; }
     // Bun reports the spawn-timeout SIGTERM as exit 143 and leaves `signalCode` null, so both spellings
     // mean "our own deadline killed it". When the full answer had already been written before that kill
     // (stdout parsed, logged in, email and org match), the account is verified: the CLI's slow teardown
     // under machine stall is not evidence about the login, and refusing it fails a healthy turn.
     const killed = child.signalCode !== null || exitCode === 143;
     if (killed && answered) {
+      this.verifiedAt = Date.now();
       logSafe('claude-identity-check-slow', { ms: Date.now() - started, exit: exitCode });
+      return;
+    }
+    // A probe killed before it wrote anything is a machine stall. A recent verification of this same
+    // login still stands; any parsed answer that is not a match means the login changed and clears it.
+    if (info) this.verifiedAt = 0;
+    else if (killed && this.verifiedAt && Date.now() - this.verifiedAt < IDENTITY_STALL_GRACE_MS) {
+      logSafe('claude-identity-check-stale', { ms: Date.now() - started, exit: exitCode, verified_ago_ms: Date.now() - this.verifiedAt });
       return;
     }
     // Content-free diagnostics: which condition failed and how long the probe took, never the identity values.

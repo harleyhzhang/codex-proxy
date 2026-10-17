@@ -182,11 +182,16 @@ describe('secondary Claude account identity check', () => {
     try {
       await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 143);
       expectText(await everyTransport(app, body(FABLE, 'slow probe')), 'CLAUDE_OK');
-      // The same exit with no usable answer is still a killed probe, named as such, with no turn launched.
-      const turnsBefore = await count('claude-turn');
+      // October 17, 2026: a probe that stalled without printing anything, right after this login was
+      // verified, is a machine stall and the recent verification still serves the turn.
       await setIdentity('', 143);
-      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
+      expectText(await everyTransport(app, body(FABLE, 'stalled probe')), 'CLAUDE_OK');
+      // A parsed mismatch clears the verification; after that a stalled probe is refused, named as such,
+      // with no turn launched.
+      const turnsBefore = await count('claude-turn');
       await setIdentity(JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 143);
+      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
+      await setIdentity('', 143);
       expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
       expect(await count('claude-turn')).toBe(turnsBefore);
       await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
