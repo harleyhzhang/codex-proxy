@@ -3,8 +3,10 @@ import { logSafe } from '../log';
 import { ProxyTransportError } from '../transport';
 import type { StreamEvent } from './types';
 
-/** Upper bound for request bodies, WebSocket messages and single upstream SSE events. */
-export const MAX_BODY_BYTES = 32 * 1024 * 1024;
+/** Full conversation replays include base64 images/tool output even below the token window. */
+export const MAX_BODY_BYTES = 128 * 1024 * 1024;
+/** A single upstream event does not need the larger conversation replay allowance. */
+const MAX_EVENT_BYTES = 32 * 1024 * 1024;
 
 const TERMINAL_EVENTS = new Set(['response.completed', 'response.failed', 'response.incomplete', 'error']);
 
@@ -77,7 +79,7 @@ export async function sseEvents(response: Response, consume: (event: StreamEvent
       const frames = buffer.split(/\r?\n\r?\n/);
       buffer = frames.pop() ?? '';
       for (const frame of frames) if (handleFrame(frame)) return;
-      if (buffer.length > MAX_BODY_BYTES) throw new Error('Upstream event too large');
+      if (buffer.length > MAX_EVENT_BYTES) throw new Error('Upstream event too large');
     }
     buffer += decoder.decode();
     if (buffer.trim() && handleFrame(buffer)) return;

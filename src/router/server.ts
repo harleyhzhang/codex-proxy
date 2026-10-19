@@ -455,6 +455,8 @@ export function startRouter(options: RouterOptions) {
       return handleHttp(req, url.pathname);
     },
     websocket: {
+      // Bun otherwise closes full-history replays above its 16 MiB default before our handler.
+      maxPayloadLength: MAX_BODY_BYTES,
       message: handleSocketMessage,
       close(ws) {
         ws.data.abort?.abort();

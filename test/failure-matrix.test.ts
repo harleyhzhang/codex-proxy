@@ -12,6 +12,7 @@ import { configuredCursorBackend } from '../src/backends/cursor';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
 import { BACKENDS, backendFor, publicModels } from '../src/backends/registry';
 import { responseObject, streamResponse } from '../src/protocol/output';
+import { MAX_BODY_BYTES } from '../src/protocol/stream';
 import type { ProxyOutput, ResponsesBody } from '../src/protocol/types';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
@@ -490,7 +491,7 @@ describe('router edge cases', () => {
     let upstreamCalls = 0;
     const app = await fixtureRouter({ upstreamFetch: async () => { upstreamCalls++; return new Response('{}'); } });
     try {
-      const huge = JSON.stringify(request(GPT, { input: [{ role: 'user', content: 'x'.repeat(33 * 1024 * 1024) }] }));
+      const huge = JSON.stringify(request(GPT, { input: [{ role: 'user', content: 'x'.repeat(MAX_BODY_BYTES + 1) }] }));
       const response = await post(app, undefined, { body: huge }).catch(() => undefined);
       if (response) expect(response.status).toBeGreaterThanOrEqual(400);
       expect(upstreamCalls).toBe(0);
