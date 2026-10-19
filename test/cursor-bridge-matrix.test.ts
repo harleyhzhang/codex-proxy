@@ -50,6 +50,9 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
   if (path.endsWith('/CancelRun') || path.endsWith('/CloseAgent')) return json({});
   if (path.endsWith('/Send')) {
     if (scenario === 'HANG') await new Promise(() => {});
+    // 2026-10-19 live shape: Send itself answered HTTP 500 'internal'. Once, then fine; or every time.
+    if (scenario === 'SEND_500_ONCE') { const marker = '${scratch}/send500-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return json({ code: 'internal' }, 500); } }
+    if (scenario === 'SEND_500') return json({ code: 'internal' }, 500);
     const headers = { 'content-type': 'application/connect+json' };
     const run = (result) => ({ result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result, model: { id: 'kimi-k3', params: [{ id: 'reasoning', value: 'high' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } });
     if (scenario === 'SLOW') {
@@ -260,6 +263,27 @@ describe('Cursor bridge failures through the router', () => {
         expect(cell.code, cell.transport).toBe('ok');
         expect(cell.message, cell.transport).toContain('CURSOR_AFTER_OPAQUE');
       }
+    } finally { await app.close(); }
+  });
+
+  test('an SDK HTTP 500 is retried once with a fresh bridge; the retry succeeds', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('SEND_500_ONCE');
+      for (const cell of await everyTransport(app, body('x'))) {
+        expect(cell.code, cell.transport).toBe('ok');
+        expect(cell.message, cell.transport).toContain('CURSOR_OK');
+      }
+    } finally { await app.close(); }
+  });
+
+  test('an SDK HTTP 500 that repeats on the retry is refused with its status and code', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('SEND_500');
+      const seen = await everyTransport(app, body('x'));
+      expectTerminal(seen, 'HTTP 500, internal');
+      for (const cell of seen) expect(cell.message).not.toContain('key-');
     } finally { await app.close(); }
   });
 

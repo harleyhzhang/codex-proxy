@@ -596,7 +596,12 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
         const detail:unknown = await response.json().catch(() => undefined);
         const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g,'').slice(0,64) : 'unknown';
         if (connectUnavailable(detail)) throw new ProxyTransportError();
-        throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`);
+        // A 5xx is Cursor's own server failing (2026-10-19: Send returned 500 `internal` mid-chat).
+        // Codex runs the tools, so nothing has executed yet and one fresh attempt is safe, the same
+        // single retry native Codex gives a 5xx. 4xx (auth, quota, bad request) stays terminal.
+        const transient = response.status >= 500;
+        logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient });
+        throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`, transient);
       }
       return response;
     }
