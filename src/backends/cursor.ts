@@ -443,6 +443,17 @@ function connectUnavailable(error: unknown): boolean {
   return code === 'unavailable' || transportError(new Error(message))?.reconnectable === true;
 }
 
+/**
+ * Whether Cursor's API answers at all from this machine. The bridge reports its own failure to reach
+ * Cursor as a bare 500 `internal` (2026-10-19: `Me` 500 while every OpenAI request was also failing
+ * with status 0), so a persistent 5xx alone cannot tell an outage from a Cursor-side fault. Any HTTP
+ * answer means the network is up; only a transport failure counts as unreachable.
+ */
+async function cursorUnreachable(): Promise<boolean> {
+  try { await fetch(process.env.CURSOR_REACHABILITY_URL || 'https://api2.cursor.sh', { method: 'HEAD', signal: AbortSignal.timeout(5000) }); return false; }
+  catch (error) { return !!transportError(error); }
+}
+
 export function assertCursorIdentity(value: unknown, options: Pick<CursorOptions, 'expectedEmail' | 'expectedUserId'>): void {
   const user = isRecord(value) && isRecord(value.user) ? value.user : undefined;
   if (!user || user.userEmail !== options.expectedEmail || String(user.userId) !== options.expectedUserId) throw new CursorError('Cursor authenticated account differs from the pinned identity');
@@ -583,16 +594,21 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     async function rpc(service: string, method: string, body: JsonRecord, stream = false, rpcSignal: AbortSignal = controller.signal): Promise<Response> {
       const json = Buffer.from(JSON.stringify(body));
       const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
-      let response: Response;
-      try {
-        response = await fetch(`${url}/sdk.v1.${service}/${method}`, { method: 'POST', signal: rpcSignal, headers: { authorization: `Bearer ${token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
-      } catch (error) {
-        // This socket only reaches the loopback bridge, so a failure here is the bridge dying, never
-        // the internet; it must not be mistaken for an outage the router should wait out.
-        if (rpcSignal.aborted) throw error;
-        throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
-      }
-      if (!response.ok) {
+      // Setup lookups (Me, ListModels, CreateAgent) start nothing, so a 5xx is retried in place with a
+      // short backoff before the whole attempt is spent; a 500 is usually gone a second later. Send is
+      // not repeated on the same agent, which may already hold the message; it gets a fresh attempt.
+      const backoff = positiveInt('CURSOR_RPC_RETRY_MS', 1000);
+      for (let tries = 1; ; tries++) {
+        let response: Response;
+        try {
+          response = await fetch(`${url}/sdk.v1.${service}/${method}`, { method: 'POST', signal: rpcSignal, headers: { authorization: `Bearer ${token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
+        } catch (error) {
+          // This socket only reaches the loopback bridge, so a failure here is the bridge dying, never
+          // the internet; it must not be mistaken for an outage the router should wait out.
+          if (rpcSignal.aborted) throw error;
+          throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
+        }
+        if (response.ok) return response;
         const detail:unknown = await response.json().catch(() => undefined);
         const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g,'').slice(0,64) : 'unknown';
         if (connectUnavailable(detail)) throw new ProxyTransportError();
@@ -600,10 +616,22 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
         // Codex runs the tools, so nothing has executed yet and one fresh attempt is safe, the same
         // single retry native Codex gives a 5xx. 4xx (auth, quota, bad request) stays terminal.
         const transient = response.status >= 500;
-        logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient });
+        if (transient && !stream && tries < 3) {
+          logSafe('cursor-rpc-retry', { service, method, status: response.status, code, attempt: tries });
+          await new Promise<void>((resolve, reject) => {
+            const stop = () => { clearTimeout(timer); reject(rpcSignal.reason); };
+            const timer = setTimeout(() => { rpcSignal.removeEventListener('abort', stop); resolve(); }, backoff * 2 ** (tries - 1));
+            rpcSignal.addEventListener('abort', stop, { once: true });
+          });
+          continue;
+        }
+        // A 5xx that outlasts the retries while Cursor cannot be reached from here is the internet
+        // being down, not Cursor refusing: the router's offline policy holds the request until it returns.
+        const offline = transient && await cursorUnreachable();
+        logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient, offline, tries });
+        if (offline) throw new ProxyTransportError();
         throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`, transient);
       }
-      return response;
     }
     const models = await verifyCursorProfile(options, key, rpc);
     const discovered = isRecord(models) && Array.isArray(models.items) ? models.items.find(item => isRecord(item) && item.id === request.model) : undefined;

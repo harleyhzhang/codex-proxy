@@ -16,6 +16,10 @@ const USER = 'user_bridge';
 let scratch = '';
 let backend: SubscriptionBackend | undefined;
 const savedTimeout = process.env.CURSOR_TIMEOUT_MS;
+const savedRetry = process.env.CURSOR_RPC_RETRY_MS;
+const savedReachability = process.env.CURSOR_REACHABILITY_URL;
+// Stands in for api2.cursor.sh so the reachability probe never leaves the machine.
+const cursorApi = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response(null, { status: 404 }) });
 // Every cell spawns the scripted bridge on three transports; under full-suite load that can exceed
 // bun's 5s default, and a short Cursor timeout would trip normal turns. Only the hang cell shortens it.
 setDefaultTimeout(20_000);
@@ -42,6 +46,9 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     if (scenario === 'SDK_401') return json({ code: 'unauthenticated' }, 401);
     if (scenario === 'SDK_429') return json({ code: 'resource_exhausted' }, 429);
     if (scenario === 'SDK_503') return json({ code: 'unavailable' }, 503);
+    // 2026-10-19 live shape: Me answered 500 'internal'. Twice then fine (in-place retries), or every time.
+    if (scenario === 'ME_500_TWICE') { const marker = '${scratch}/me500-count'; const n = (await Bun.file(marker).exists()) ? Number(await Bun.file(marker).text()) : 0; if (n < 2) { await Bun.write(marker, String(n + 1)); return json({ code: 'internal' }, 500); } }
+    if (scenario === 'ME_500') return json({ code: 'internal' }, 500);
     if (scenario === 'IDENTITY') return json({ user: { userEmail: 'other@example.com', userId: 'user_other' } });
     return json({ user: { userEmail: '${EMAIL}', userId: '${USER}' } });
   }
@@ -95,10 +102,15 @@ await new Promise(() => {});
   if (!backend) throw new Error('fixture backend not configured');
   (BACKENDS as SubscriptionBackend[]).push(backend);
   process.env.CURSOR_TIMEOUT_MS = '10000';
+  process.env.CURSOR_RPC_RETRY_MS = '20';
+  process.env.CURSOR_REACHABILITY_URL = `http://127.0.0.1:${cursorApi.port}`;
 });
 afterAll(async () => {
   if (backend) { const at = BACKENDS.indexOf(backend); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
   if (savedTimeout === undefined) delete process.env.CURSOR_TIMEOUT_MS; else process.env.CURSOR_TIMEOUT_MS = savedTimeout;
+  if (savedRetry === undefined) delete process.env.CURSOR_RPC_RETRY_MS; else process.env.CURSOR_RPC_RETRY_MS = savedRetry;
+  if (savedReachability === undefined) delete process.env.CURSOR_REACHABILITY_URL; else process.env.CURSOR_REACHABILITY_URL = savedReachability;
+  cursorApi.stop(true);
   await rm(scratch, { recursive: true, force: true });
 });
 
@@ -285,6 +297,44 @@ describe('Cursor bridge failures through the router', () => {
       expectTerminal(seen, 'HTTP 500, internal');
       for (const cell of seen) expect(cell.message).not.toContain('key-');
     } finally { await app.close(); }
+  });
+
+  test('a setup RPC that answers 500 is retried in place with backoff; the turn succeeds', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('ME_500_TWICE');
+      expectOk(await everyTransport(app, body('x')), 'CURSOR_OK');
+    } finally { await app.close(); }
+  });
+
+  test('a setup RPC that keeps answering 500 while Cursor is reachable is refused with its status and code', async () => {
+    const app = await fixtureRouter();
+    try {
+      await scenario('ME_500');
+      expectTerminal(await everyTransport(app, body('x')), 'HTTP 500, internal');
+    } finally { await app.close(); }
+  });
+
+  test('a persistent 500 while Cursor is unreachable is an outage: streams stay pending until the network returns', async () => {
+    const savedOffline = process.env.OFFLINE_RETRY_BASE_MS; process.env.OFFLINE_RETRY_BASE_MS = '20';
+    process.env.CURSOR_REACHABILITY_URL = 'http://127.0.0.1:1';
+    const app = await fixtureRouter({ heartbeatMs: 20 });
+    try {
+      await scenario('ME_500');
+      const plain = await post(app, body('x'));
+      expect(plain.status).toBe(503);
+      expect(await plain.text()).toContain('Network connection interrupted');
+      const inflight = post(app, { ...body('x'), stream: true }).then(r => r.text());
+      await sleep(300);
+      await scenario('OK');
+      const stream = await inflight;
+      expect(terminal(stream)?.type).toBe('response.completed');
+      expect(stream).toContain('CURSOR_OK'); expect(stream).not.toContain('response.failed');
+    } finally {
+      await app.close();
+      process.env.CURSOR_REACHABILITY_URL = `http://127.0.0.1:${cursorApi.port}`;
+      if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline;
+    }
   });
 
   test('malformed JSON output is retried once and then delivered as a refusal chat message, not a failed turn', async () => {
