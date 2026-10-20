@@ -156,6 +156,7 @@ describe('secondary Claude account identity check', () => {
         [JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 0, 'identity does not match'],
         [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_other' }), 0, 'identity does not match'],
         [JSON.stringify({ loggedIn: false }), 0, 'not logged in'],
+        [JSON.stringify({ loggedIn: false, authMethod: 'none', apiProvider: 'firstParty' }), 1, 'credential store is inaccessible'],
         ['not json', 0, 'unreadable output'],
         [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 2, 'auth status exited 2'],
       ];

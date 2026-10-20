@@ -180,6 +180,9 @@ export class ClaudeAccount {
     // spawn timeout under machine stall), a non-zero exit or unreadable output is a probe failure and
     // must say so, or a transient stall reads as a login problem.
     if (killed) throw new BackendError(`Claude identity check was killed before it answered (claude auth status exceeded ${IDENTITY_PROBE_TIMEOUT_MS / 1000}s); retry the turn`);
+    // The CLI exits 1 for a parsed logged-out answer, including when its credential store cannot be
+    // read. Retrying the turn cannot repair that state; preserve the answer before the generic exit error.
+    if (info?.loggedIn === false) throw new BackendError('Claude account is not logged in for this configuration, or its credential store is inaccessible; restore credential access or sign in again');
     if (exitCode !== 0) throw new BackendError(`Claude identity check failed (claude auth status exited ${exitCode}); retry the turn`);
     if (!info) throw new BackendError('Claude identity check returned unreadable output; retry the turn');
     if (!info.loggedIn) throw new BackendError('Claude account is not logged in for this configuration');
