@@ -48,6 +48,21 @@ export function normalizeAgentPayloads(body: ResponsesBody): ResponsesBody {
 }
 
 /**
+ * OpenAI rejects a `tool_search_call` whose id does not start with `tsc`. Older router builds
+ * minted `ts_` ids, and threads holding them must still replay to GPT after a model switch.
+ */
+export function normalizeToolSearchIds(body: ResponsesBody): ResponsesBody {
+  if (!Array.isArray(body.input)) return body;
+  let changed = false;
+  const input = body.input.map((item) => {
+    if (item?.type !== 'tool_search_call' || typeof item.id !== 'string' || !item.id.startsWith('ts_')) return item;
+    changed = true;
+    return { ...item, id: `tsc${item.id.slice(2)}` };
+  });
+  return changed ? { ...body, input } : body;
+}
+
+/**
  * Accepts `{"message": string}`, optionally inside a code fence. A short message that only says
  * the payload could not be recovered is a refusal, never a task; long genuine messages may
  * mention such words.

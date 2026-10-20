@@ -16,7 +16,7 @@ import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody,
 import { failureStream, transportError, transportFailureEvent } from '../transport';
 import { NativeAuth } from './auth';
 import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
-import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, restoreAgentMessages } from './bridge';
+import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse } from './local';
@@ -154,7 +154,7 @@ export function startRouter(options: RouterOptions) {
       backend.assertAvailable?.(backend.models[body.model] as string);
     }
     const withList = typeof body.input === 'string' ? { ...body, input: [{ role: 'user', content: body.input }] } : body;
-    let expanded = normalizeAgentPayloads(history.expand(withList));
+    let expanded = normalizeToolSearchIds(normalizeAgentPayloads(history.expand(withList)));
     if (!codec || body.generate === false) return expanded;
 
     const local = isLocalModel(body.model);

@@ -5,7 +5,7 @@ import {tmpdir} from 'node:os';
 import { NativeAuth } from '../src/router/auth';
 import { adaptRequest } from '../src/backends/contract';
 import { upstreamHeaders } from '../src/router/upstream';
-import { normalizeAgentPayloads, CompactionBridge } from '../src/router/bridge';
+import { normalizeAgentPayloads, normalizeToolSearchIds, CompactionBridge } from '../src/router/bridge';
 import { HistoryCache, HistoryMiss } from '../src/router/history';
 import { sseEvents, decodeBody } from '../src/protocol/stream';
 import { startRouter } from '../src/router/server';
@@ -24,6 +24,16 @@ test('Claude task payload reaches GPT as text while native ciphertext and other 
  expect(items(normalized)[0]!.author).toBe('/root');expect(items(normalized)[1]!).toBe(other);
  expect(agent.content[1]).toBe(plaintext);
  expect(normalizeAgentPayloads(normalized)).toBe(normalized);
+});
+test('legacy ts_ tool search ids replay to GPT as tsc_ ids',()=>{
+ const legacy={id:'ts_031285811a7f44db',type:'tool_search_call',call_id:'call_1',arguments:{query:'x'}};
+ const current={id:'tsc_abc',type:'tool_search_call',call_id:'call_2',arguments:{query:'y'}};
+ const output={type:'tool_search_output',call_id:'call_1',tools:[]};
+ const normalized=normalizeToolSearchIds({input:[legacy,current,output]});
+ expect(items(normalized)[0]!).toEqual({...legacy,id:'tsc_031285811a7f44db'});
+ expect(items(normalized)[1]!).toBe(current);expect(items(normalized)[2]!).toBe(output);
+ expect(legacy.id).toBe('ts_031285811a7f44db');
+ expect(normalizeToolSearchIds(normalized)).toBe(normalized);
 });
 test('native auth rejects strangers, wrong accounts and browser origins; follows refresh',async()=>{
  const dir=await mkdtemp(tmpdir()+'/mixed-auth-'); const file=dir+'/auth.json';

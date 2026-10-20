@@ -19,7 +19,7 @@ function toolSearchItem(call: ToolCall): OutputItem {
     throw new Error('Tool search arguments must include a query string');
   }
   return {
-    id: randomId('ts'),
+    id: randomId('tsc'),
     type: 'tool_search_call',
     status: 'completed',
     call_id: call.callId ?? randomId('call'),
