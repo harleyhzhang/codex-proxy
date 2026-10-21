@@ -55,7 +55,25 @@ const GENERIC_FAILURE = 'Model request failed; retry or check subscription acces
 /** Native Codex treats its own internal errors as retryable; so does the router (a 500 is retried, a 400 is not). */
 const INTERNAL_FAILURE = 'Internal router error; Codex will retry.';
 
-type SocketData = { headers: Headers; busy: boolean; abort?: AbortController };
+/** `interrupt` is aborted by `response.interrupt` for `responseId`, the turn Codex last saw created. */
+type SocketData = { headers: Headers; busy: boolean; abort?: AbortController; interrupt?: AbortController; responseId?: string };
+/** A `response.interrupt` frame is tiny; larger frames are never parsed twice. */
+const INTERRUPT_MAX_BYTES = 4096;
+
+/** The `response_id` of a `response.interrupt` frame, or undefined for any other message. */
+function interruptTarget(data: string | Buffer): string | undefined {
+  if (typeof data !== 'string' || data.length > INTERRUPT_MAX_BYTES || !data.includes('response.interrupt')) return undefined;
+  try {
+    const message: unknown = JSON.parse(data);
+    if (!isRecord(message) || message.type !== 'response.interrupt') return undefined;
+    return typeof message.response_id === 'string' ? message.response_id : '';
+  } catch { return undefined; }
+}
+
+/** What a turn stopped by `response.interrupt` finishes as; Codex continues from its id. */
+function interruptedResponse(response: ResponseObject, output: OutputItem[]): ResponseObject {
+  return { ...response, output, status: 'incomplete', incomplete_details: { reason: 'interrupted' } };
+}
 
 const isCompaction = (body: ResponsesBody) =>
   Array.isArray(body.input) && body.input.some((item) => item.type === 'compaction_trigger');
@@ -326,13 +344,30 @@ export function startRouter(options: RouterOptions) {
   }
 
   async function handleSocketMessage(ws: ServerWebSocket<SocketData>, data: string | Buffer): Promise<void> {
-    const send = (event: unknown) => ws.send(JSON.stringify(event));
+    const send = (event: unknown) => {
+      if (isRecord(event) && event.type === 'response.created' && isRecord(event.response) && typeof event.response.id === 'string') ws.data.responseId = event.response.id;
+      ws.send(JSON.stringify(event));
+    };
+    // Codex steers a running turn with `response.interrupt` (InstantInterrupt): stop that turn,
+    // finish it as `response.incomplete`, and acknowledge. A turn that already finished is still
+    // acknowledged, since Codex may be waiting for one after reading the completion.
+    const interrupted = interruptTarget(data);
+    if (interrupted !== undefined) {
+      const matched = ws.data.busy && interrupted === ws.data.responseId;
+      log.info('interrupt', { active: ws.data.busy, matched });
+      send({ type: 'response.interrupt.accepted', response_id: interrupted });
+      if (matched) ws.data.interrupt?.abort();
+      return;
+    }
     if (ws.data.busy) {
       send({ type: 'error', status: 400, error: { type: 'invalid_request_error', code: 'invalid_request_error', message: 'A response is already in progress' } });
       return;
     }
     const controller = new AbortController();
+    const interrupt = new AbortController();
     ws.data.abort = controller;
+    ws.data.interrupt = interrupt;
+    ws.data.responseId = undefined;
     ws.data.busy = true;
     const live = () => !controller.signal.aborted;
 
@@ -361,9 +396,16 @@ export function startRouter(options: RouterOptions) {
           } finally { stop?.(); }
         }
       } else if (isLocalModel(body.model)) {
-        await pendingResponse(body, signal => localResponse(body, signal), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
+        await pendingResponse(body, async (signal) => {
+          // Output is buffered until the backend finishes, so an interrupt discards the turn whole.
+          try { return await localResponse(body, AbortSignal.any([signal, interrupt.signal])); }
+          catch (error) {
+            if (!interrupt.signal.aborted || signal.aborted) throw error;
+            return interruptedResponse(responseObject(body, EMPTY_OUTPUT), []);
+          }
+        }, controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
       } else {
-        await relayUpstreamStream(body, ws.data.headers, controller.signal, (event) => live() && send(event), send);
+        await relayUpstreamStream(body, ws.data.headers, controller.signal, interrupt.signal, (event) => live() && send(event), send);
       }
     } catch (error) {
       const network = transportError(error);
@@ -393,25 +435,32 @@ export function startRouter(options: RouterOptions) {
       log.info('request-finished', { cancelled: !live() });
       ws.data.busy = false;
       ws.data.abort = undefined;
+      ws.data.interrupt = undefined;
     }
   }
 
-  /** Streams a GPT turn back over the socket and records it for `previous_response_id`. */
+  /**
+   * Streams a GPT turn back over the socket and records it for `previous_response_id`. The
+   * upstream is HTTP, so `interrupt` cannot be forwarded: the router stops reading instead and
+   * finishes with the items OpenAI completed, discarding partial ones as native does.
+   */
   async function relayUpstreamStream(
     body: ResponsesBody,
     headers: Headers,
     signal: AbortSignal,
+    interrupt: AbortSignal,
     forward: (event: StreamEvent) => void,
     send: (event: unknown) => void,
   ): Promise<void> {
     const { type: _type, previous_response_id: _previous, ...request } = body;
-    const idle = idleDeadline(signal, timeoutMs);
+    const upstreamSignal = AbortSignal.any([signal, interrupt]);
+    const idle = idleDeadline(upstreamSignal, timeoutMs);
     // An outage before OpenAI answers keeps the turn pending with progress frames (the socket is
     // already open, so nothing about the status line is lost); a real HTTP status still arrives below.
     let stop: (() => void) | undefined;
     let response: Response;
     try {
-      response = watchBody(await connectUpstream(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, signal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+      response = watchBody(await connectUpstream(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
     } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
@@ -424,14 +473,27 @@ export function startRouter(options: RouterOptions) {
       return;
     }
     const items: OutputItem[] = [];
-    await sseEvents(response, (event) => {
-      if (event.type === 'response.output_item.done' && isRecord(event.item)) items.push(event.item as OutputItem);
-      if (event.type === 'response.completed' && isRecord(event.response)) {
-        const completed = event.response as ResponseObject;
-        history.remember(body, { ...completed, output: completed.output?.length ? completed.output : items });
-      }
-      forward(event);
-    });
+    const open = new Map<unknown, unknown>();
+    let created: ResponseObject | undefined;
+    try {
+      await sseEvents(response, (event) => {
+        if (event.type === 'response.created' && isRecord(event.response)) created = event.response as ResponseObject;
+        if (event.type === 'response.output_item.added' && isRecord(event.item)) open.set(event.item.id, event.output_index);
+        if (event.type === 'response.output_item.done' && isRecord(event.item)) { items.push(event.item as OutputItem); open.delete(event.item.id); }
+        if (event.type === 'response.completed' && isRecord(event.response)) {
+          const completed = event.response as ResponseObject;
+          history.remember(body, { ...completed, output: completed.output?.length ? completed.output : items });
+        }
+        forward(event);
+      });
+    } catch (error) {
+      if (!interrupt.aborted || signal.aborted || !created) throw error;
+      idle.done();
+      for (const [item_id, output_index] of open) forward({ type: 'response.output_item.interrupted', response_id: created.id, item_id, output_index });
+      const stopped = interruptedResponse(created, items);
+      history.remember(body, stopped);
+      forward({ type: 'response.incomplete', response: stopped });
+    }
   }
 
   return Bun.serve<SocketData>({

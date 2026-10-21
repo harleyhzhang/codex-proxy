@@ -141,7 +141,7 @@ export function* responseEvents(response: ResponseObject): Generator<StreamEvent
     }
     yield event('response.output_item.done', { output_index, item });
   }
-  yield event('response.completed', { response });
+  yield event(response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', { response });
 }
 
 /** Encodes the shared Responses event sequence for an HTTP client. */
