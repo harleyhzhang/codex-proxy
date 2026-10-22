@@ -1,9 +1,9 @@
 // Renders a backend's output as a Responses API object and as the equivalent SSE stream.
 import { randomId } from '../json';
-import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
+import { COMPUTER_TOOL_NAME, requestTools, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
 import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, StreamEvent, ToolCall } from './types';
 
-type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown };
+type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown; input?: unknown };
 
 function parseJson(raw: string, what: string): unknown {
   try {
@@ -55,7 +55,7 @@ function outputItems(request: RequestShape, output: ProxyOutput): OutputItem[] {
       content: [{ type: 'output_text', annotations: [], text: output.text }],
     });
   }
-  const descriptors = toolDescriptors(request.tools ?? []);
+  const descriptors = toolDescriptors(requestTools(request));
   for (const call of output.toolCalls) {
     const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
     if (call.name === TOOL_SEARCH_NAME || descriptor?.type === 'tool_search') {

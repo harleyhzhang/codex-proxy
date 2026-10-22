@@ -55,6 +55,8 @@ import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { BackendError, type SubscriptionBackend } from '../src/backends/contract';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
 import type { ResponsesRequest } from '../src/protocol/types';
+import { responseObject } from '../src/protocol/output';
+import { requestTools, toolDescriptors } from '../src/protocol/prompt';
 import type { JsonRecord } from '../src/json';
 const request: ResponsesRequest = {model:'kimi-k3',input:'test',tools:[{type:'namespace',name:'functions',tools:[{type:'function',name:'read',parameters:{type:'object',properties:{path:{type:'string'}},required:['path'],additionalProperties:false}}]},{type:'custom',name:'apply_patch'}]};
 const output=(value:unknown)=>parseCursorOutput(JSON.stringify(value),request);
@@ -77,6 +79,16 @@ test('Cursor lenient parser tolerates fences, extra keys, extra args and OpenAI-
  expect(()=>parseCursorOutput('this is not the JSON object',request)).toThrow(/no Codex actions were executed/);
 });
 test('Cursor does not classify assistant quota text as a failure',()=>expect(output({text:'quota 429 expired',tool_calls:[]}).text).toBe('quota 429 expired'));
+test('Cursor accepts a tool that an earlier tool_search loaded and replies with its namespace',()=>{
+ const web={type:'namespace',name:'mcp__apps__search',tools:[{type:'function',name:'_web_run',parameters:{type:'object',properties:{q:{type:'string'}}}}]};
+ const loaded:ResponsesRequest={...request,input:[{type:'tool_search_call',call_id:'c1',arguments:{query:'web'}},{type:'tool_search_output',call_id:'c1',tools:[web,request.tools![0]]}]};
+ const text=JSON.stringify({text:'',tool_calls:[{name:'mcp__apps__search._web_run',arguments:{q:'boron'}}]});
+ expect(()=>parseCursorOutput(text,request)).toThrow(/unknown tool/);
+ const parsed=parseCursorOutput(text,loaded);
+ expect(parsed.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['mcp__apps__search._web_run','{"q":"boron"}']]);
+ expect(responseObject(loaded,parsed).output).toContainEqual(expect.objectContaining({type:'function_call',namespace:'mcp__apps__search',name:'_web_run'}));
+ expect(toolDescriptors(requestTools(loaded)).filter(t=>t.proxyName==='functions.read')).toHaveLength(1);
+});
 test('Cursor repairs Kimi miscounted closers at the end of a tool call',()=>{
  const body='{"text":"t","tool_calls":[{"name":"apply_patch","arguments":"x({a:\'{\'})"}';
  for(const tail of ['}]}','}}]}','}}]'])expect(parseCursorOutput(body+tail,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['apply_patch',"x({a:'{'})"]]);

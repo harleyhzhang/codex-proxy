@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, type JsonRecord, randomId, sha256 } from '../json';
 import { logSafe } from '../log';
-import { outputSchema, preparePrompt, requestToPrompt, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
+import { outputSchema, preparePrompt, requestToPrompt, requestTools, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
 import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 import { transportError } from '../transport';
@@ -285,7 +285,7 @@ export function parseGrokOutput(text: string, request: ResponsesRequest): ProxyO
     throw new GrokError('Grok returned invalid structured output; no tools were executed', true, true);
   }
 
-  const allowed = new Map(toolDescriptors(request.tools ?? []).map((tool) => [tool.proxyName, tool]));
+  const allowed = new Map(toolDescriptors(requestTools(request)).map((tool) => [tool.proxyName, tool]));
   const toolCalls: ToolCall[] = value.tool_calls.map((call: unknown) => {
     const descriptor = isRecord(call) && typeof call.name === 'string' ? allowed.get(call.name) : undefined;
     if (!isRecord(call) || !descriptor) {
@@ -331,7 +331,7 @@ function grokArgs(dir: string, effort: string, request: ResponsesRequest, prompt
     '--disable-web-search',
     '--max-turns', String(MAX_TURNS),
     '--system-prompt-override', SYSTEM_PROMPT + retryNote,
-    '--json-schema', JSON.stringify(grokOutputSchema(request.tools ?? [])),
+    '--json-schema', JSON.stringify(grokOutputSchema(requestTools(request))),
     '--output-format', 'streaming-messages-json',
     // Raw `stream_event` deltas keep stdout live while the model thinks, so the run can be bounded
     // by silence instead of a total deadline. `interpretRun` only reads `assistant`/`result` records.

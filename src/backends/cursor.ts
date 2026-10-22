@@ -7,7 +7,7 @@ import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
-import { preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
+import { preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { repairJsonStrings } from './grok';
@@ -276,7 +276,7 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     const message = `Cursor ${reason}; no Codex actions were executed`;
     throw category === 'prose' ? new CursorProseError(message) : new CursorError(message, true, true, retries);
   };
-  const descriptors = toolDescriptors(request.tools ?? []);
+  const descriptors = toolDescriptors(requestTools(request));
   const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));
   let candidate = text.trim();
   let value: unknown = parseNativeToolMarkup(text);

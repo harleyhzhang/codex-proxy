@@ -103,7 +103,27 @@ export function toolDescriptors(tools: ResponseTool[]): ToolDescriptor[] {
       });
     }
   }
-  return descriptors;
+  // A tool_search can load a tool the request already declares; keep the first copy.
+  const seen = new Set<string>();
+  return descriptors.filter((tool) => !seen.has(tool.proxyName) && Boolean(seen.add(tool.proxyName)));
+}
+
+/**
+ * The tools Codex will execute for this request. Tools loaded by a tool_search are not added to
+ * `tools`; Codex keeps them only on the tool_search_output history item, so they are read back here.
+ */
+export function requestTools(request: { tools?: ResponseTool[]; input?: unknown }): ResponseTool[] {
+  const declared = request.tools ?? [];
+  if (!Array.isArray(request.input)) return declared;
+  const loaded = request.input.flatMap((item: unknown) =>
+    isRecord(item) && item.type === 'tool_search_output' && Array.isArray(item.tools)
+      ? item.tools.filter(
+          (tool: unknown): tool is ResponseTool =>
+            isRecord(tool) && typeof tool.type === 'string' && CLIENT_TOOL_TYPES.has(tool.type),
+        )
+      : [],
+  );
+  return loaded.length ? [...declared, ...loaded] : declared;
 }
 
 // Codex marks inter-agent payloads as encrypted; a non-GPT sender leaves them as plaintext.
@@ -174,7 +194,7 @@ export function requestToPrompt(request: ResponsesRequest): string {
     typeof request.input === 'string'
       ? `<user>\n${request.input}\n</user>`
       : request.input.map(serializeItem).join('\n\n');
-  const tools = toolDescriptors(request.tools ?? []);
+  const tools = toolDescriptors(requestTools(request));
   const toolSection = tools.length
     ? `<available_tools>\n${tools.map(describeTool).join('\n')}\n</available_tools>\n\n${TOOL_RULES}`
     : '';

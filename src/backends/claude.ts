@@ -8,7 +8,7 @@ import { resolve, join, isAbsolute } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, randomId } from '../json';
 import { logSafe } from '../log';
-import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, toolDescriptors } from '../protocol/prompt';
+import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { transportError } from '../transport';
 import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
@@ -99,7 +99,7 @@ export function buildClaudeArgs(request: ResponsesRequest): string[] {
     '--append-system-prompt',
     SYSTEM_PROMPT,
     '--json-schema',
-    JSON.stringify(outputSchema(request.tools ?? [])),
+    JSON.stringify(outputSchema(requestTools(request))),
   ];
 }
 
@@ -399,7 +399,7 @@ function sessionSignature(request: ResponsesRequest): string {
               text.startsWith('VERBATIM_HISTORICAL_USER_REQUEST:'),
           );
   return JSON.stringify({
-    tools: toolDescriptors(request.tools ?? []),
+    tools: toolDescriptors(requestTools(request)),
     effort: resolveEffort(request),
     instructions: request.instructions,
     anchors,
@@ -490,7 +490,7 @@ async function runClaudeOnce(request: ResponsesRequest, signal: AbortSignal | un
       throw transportError(error) ?? error;
     }
     const structured = parseStructured(result);
-    const descriptors = new Map(toolDescriptors(request.tools ?? []).map((tool) => [tool.proxyName, tool.type]));
+    const descriptors = new Map(toolDescriptors(requestTools(request)).map((tool) => [tool.proxyName, tool.type]));
     for (const call of structured.tool_calls) {
       if (!descriptors.has(call.name)) throw new Error(`Claude CLI requested unavailable tool: ${call.name}`);
     }
