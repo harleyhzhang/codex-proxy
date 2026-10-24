@@ -1,3 +1,4 @@
+import { positiveInt } from './env';
 import { isRecord, randomId } from './json';
 
 const NETWORK_CODES = new Set([
@@ -79,7 +80,7 @@ export function failureStream(event: unknown): Response {
 export async function reconnectTransport<T>(attempt: () => Promise<T>, signal?: AbortSignal,
   options: { initialDelayMs?: number; maxDelayMs?: number; onRetry?: (attempt: number, delayMs: number) => void } = {}): Promise<T> {
   // OFFLINE_RETRY_BASE_MS exists for test suites that script outages; production keeps 1 s.
-  let delay = options.initialDelayMs ?? Number(process.env.OFFLINE_RETRY_BASE_MS ?? 1000);
+  let delay = options.initialDelayMs ?? positiveInt('OFFLINE_RETRY_BASE_MS', 1000);
   const maxDelay = options.maxDelayMs ?? 30_000;
   for (let attempts = 1; ; attempts++) {
     signal?.throwIfAborted();

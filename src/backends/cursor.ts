@@ -5,7 +5,7 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
-import { positiveInt } from '../env';
+import { childEnvironment, positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
@@ -57,9 +57,7 @@ function cursorRunReason(result: JsonRecord | undefined, run: JsonRecord | undef
 }
 const PRIVATE_ENV = /^(CURSOR_|AGENT_|OPENAI_|ANTHROPIC_|CLAUDE_CODE_|XAI_|GROK_|PROXY_|NODE_OPTIONS$|BUN_OPTIONS$)/;
 export function cursorEnvironment(apiKey: string): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && !PRIVATE_ENV.test(key)) env[key] = value;
-  return { ...env, CURSOR_API_KEY: apiKey, CURSOR_SDK_CLIENT_LANGUAGE: 'typescript' };
+  return { ...childEnvironment((key) => PRIVATE_ENV.test(key)), CURSOR_API_KEY: apiKey, CURSOR_SDK_CLIENT_LANGUAGE: 'typescript' };
 }
 
 export function cursorSelection(model: string, effort = 'high', fastest = false): JsonRecord {

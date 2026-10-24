@@ -1,4 +1,5 @@
 // Talking to the ChatGPT Codex backend on the user's behalf, with the user's own credentials.
+import { nonNegativeInt } from '../env';
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
 import { reconnectTransport, transportError } from '../transport';
@@ -148,8 +149,8 @@ export async function postJson(
   signal: AbortSignal,
 ): Promise<Response> {
   const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(body), signal, redirect: 'error' };
-  const retries = Number(process.env.UPSTREAM_5XX_RETRIES ?? 4);
-  const baseDelayMs = Number(process.env.UPSTREAM_RETRY_BASE_MS ?? 200);
+  const retries = nonNegativeInt('UPSTREAM_5XX_RETRIES', 4);
+  const baseDelayMs = nonNegativeInt('UPSTREAM_RETRY_BASE_MS', 200);
   for (let attempt = 0; ; attempt++) {
     let response: Response;
     try { response = await upstreamFetch(UPSTREAM_URL + path, init); }

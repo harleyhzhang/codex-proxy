@@ -5,7 +5,7 @@ import { resolve, join, isAbsolute } from 'node:path';
 // with every native tool disabled; Codex's tools are described in the prompt and requested
 // through structured output. A session that returned tool calls stays alive briefly so the next
 // turn only has to send the tool results.
-import { positiveInt } from '../env';
+import { childEnvironment, positiveInt } from '../env';
 import { isRecord, randomId } from '../json';
 import { logSafe } from '../log';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
@@ -115,6 +115,11 @@ export type ClaudeAccountOptions = {
  * never answers; a probe whose answer arrived is accepted even if its teardown ran past the budget.
  */
 const IDENTITY_PROBE_TIMEOUT_MS = 45_000;
+// Proxy secrets, API-key/third-party auth routes and nested-session markers the CLI must not inherit.
+const CLAUDE_BLOCKED_ENV = new Set(['CLAUDECODE', 'PROXY_API_KEY', 'CLAUDE_CODE_EFFORT_LEVEL', 'OPENAI_API_KEY',
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_GATEWAY', 'CLAUDE_CODE_HOST_GATEWAY_LINEAGE']);
 
 /**
  * How long a verified identity vouches for a probe that stalled without answering. Under heavy load
@@ -133,11 +138,7 @@ export class ClaudeAccount {
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
   onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
   environment(): Record<string, string> {
-    const env = Object.fromEntries(Object.entries(process.env).filter(([key, value]) => value !== undefined &&
-      !['CLAUDECODE', 'PROXY_API_KEY', 'CLAUDE_CODE_EFFORT_LEVEL', 'OPENAI_API_KEY',
-        'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
-        'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
-        'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_GATEWAY', 'CLAUDE_CODE_HOST_GATEWAY_LINEAGE'].includes(key))) as Record<string, string>;
+    const env = childEnvironment((key) => CLAUDE_BLOCKED_ENV.has(key));
     if (this.options.configDir) env.CLAUDE_CONFIG_DIR = this.options.configDir;
     return env;
   }

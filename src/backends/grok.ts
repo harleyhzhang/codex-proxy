@@ -5,7 +5,7 @@ import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { positiveInt } from '../env';
+import { childEnvironment, positiveInt } from '../env';
 import { isRecord, type JsonRecord, randomId, sha256 } from '../json';
 import { logSafe } from '../log';
 import { outputSchema, preparePrompt, requestToPrompt, requestTools, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
@@ -80,10 +80,7 @@ export function grokProfileHash(): string {
 
 /** The CLI environment: no API keys, and every optional Grok subsystem switched off. */
 export function grokEnvironment(): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined && !BLOCKED_ENV.test(key)) env[key] = value;
-  }
+  const env = childEnvironment((key) => BLOCKED_ENV.test(key));
   Object.assign(env, {
     GROK_HOME: grokHome(),
     GROK_DISABLE_AUTOUPDATER: '1',
