@@ -562,8 +562,12 @@ async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, 
     signal?.throwIfAborted();
     proc = Bun.spawn([options.binary, '--host', '127.0.0.1', '--port', '0', '--workspace', dir, '--state-root', join(dir, 'store'), '--local-store', JSON.stringify({ type: 'jsonl', rootDir: join(dir, 'store') })], { cwd: dir, env: cursorEnvironment(key), stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
     const child = proc;
+    // A fresh bridge is spawned for every turn and is ready in about 0.5 s on an idle machine, but
+    // under heavy host load (benchmark round r2, load average ~95) it missed a 30 s window on 6 of
+    // 12 Grok turns. Nothing has been sent when startup times out, so the turn gets one fresh attempt.
+    const startupMs = positiveInt('CURSOR_STARTUP_TIMEOUT_MS', 60_000);
     const ready = new Promise<JsonRecord>((resolve, reject) => {
-      startup = setTimeout(() => { cancel(); reject(new CursorError('Cursor bridge startup timed out')); }, 30_000);
+      startup = setTimeout(() => { logSafe('cursor-startup-timeout', { startupMs }); cancel(); reject(new CursorError('Cursor bridge startup timed out', true)); }, startupMs);
       void (async () => {
         let line = '', bytes = 0, found = false;
         try {

@@ -33,6 +33,8 @@ await Bun.write('${scratch}/bridge.pid', String(process.pid));
 if (scenario === 'BRIDGE_CRASH') { console.error('bridge: cannot bind'); process.exit(1); }
 if (scenario === 'BRIDGE_GARBAGE') { console.error('cursor-sdk-bridge ready <<not json>>'); await new Promise(() => {}); }
 if (scenario === 'BRIDGE_BADHANDSHAKE') { console.error('cursor-sdk-bridge ready ' + JSON.stringify({ schemaVersion: 2 })); await new Promise(() => {}); }
+if (scenario === 'BRIDGE_SLOW') await new Promise(r => setTimeout(r, 3000));
+if (scenario === 'BRIDGE_SLOW_ONCE') { const marker = '${scratch}/slow-start-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); await new Promise(r => setTimeout(r, 3000)); } }
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 const frame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
@@ -297,6 +299,26 @@ describe('Cursor bridge failures through the router', () => {
       expectTerminal(seen, 'HTTP 500, internal');
       for (const cell of seen) expect(cell.message).not.toContain('key-');
     } finally { await app.close(); }
+  });
+
+  test('a bridge that misses the startup window is retried once with a fresh bridge; the retry succeeds', async () => {
+    const app = await fixtureRouter();
+    process.env.CURSOR_STARTUP_TIMEOUT_MS = '500';
+    try {
+      await scenario('BRIDGE_SLOW_ONCE');
+      expectOk(await everyTransport(app, body('x')), 'CURSOR_OK');
+    } finally { delete process.env.CURSOR_STARTUP_TIMEOUT_MS; await app.close(); }
+  });
+
+  test('a bridge that misses the startup window twice is refused naming the startup timeout', async () => {
+    const app = await fixtureRouter();
+    process.env.CURSOR_STARTUP_TIMEOUT_MS = '500';
+    try {
+      await scenario('BRIDGE_SLOW');
+      expectTerminal(await everyTransport(app, body('x')), 'Cursor bridge startup timed out');
+      await sleep(50);
+      expect(pidAlive(await bridgePid())).toBe(false);
+    } finally { delete process.env.CURSOR_STARTUP_TIMEOUT_MS; await app.close(); }
   });
 
   test('a setup RPC that answers 500 is retried in place with backoff; the turn succeeds', async () => {
