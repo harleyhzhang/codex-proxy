@@ -69,9 +69,9 @@ test('portable compaction retains short user requests even if the model omits mi
  const source=[{role:'user',content:'FRONT=123; NEVER WRITE /locked'},{role:'user',content:'irrelevant '.repeat(9000)},{role:'user',content:[{type:'input_text',text:'MIDDLE=456; pending read-only /next'}]},{role:'user',content:'TAIL=789'}];
  const first=codec.seal(portableSummary('Lossy summary contains only TAIL=789',source));
  const restored=await unwrap(codec,{model:'grok-4.7',input:[{type:'compaction',encrypted_content:first}]});
- expect(JSON.stringify(restored)).toContain('MIDDLE=456');expect(JSON.stringify(restored)).toContain('NEVER WRITE /locked');expect(restored.input).toHaveLength(4);
+ expect(JSON.stringify(restored)).toContain('MIDDLE=456');expect(JSON.stringify(restored)).toContain('NEVER WRITE /locked');expect(restored.input).toHaveLength(5);
  const second=codec.seal(portableSummary('Another lossy summary',items(restored)));
- for(const model of ['gpt-6.1-sol','claude-opus-5-5','grok-4.7']){const again=await unwrap(codec,{model,input:[{type:'compaction',encrypted_content:second}]});expect(JSON.stringify(again)).toContain('MIDDLE=456');expect(again.input).toHaveLength(4);}
+ for(const model of ['gpt-6.1-sol','claude-opus-5-5','grok-4.7']){const again=await unwrap(codec,{model,input:[{type:'compaction',encrypted_content:second}]});expect(JSON.stringify(again)).toContain('MIDDLE=456');expect(again.input).toHaveLength(5);}
  // An oversized chat still compacts: first and newest requests stay exact, the trimmed middle is counted.
  const big=JSON.parse(portableSummary('summary',Array.from({length:100},(_,i)=>({role:'user',content:`REQ${i} `+'x'.repeat(2000)}))));
  expect(big.anchors[0].startsWith('REQ0 ')).toBe(true);expect(big.anchors.at(-1).startsWith('REQ99 ')).toBe(true);

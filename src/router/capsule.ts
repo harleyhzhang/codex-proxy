@@ -31,14 +31,22 @@ export const FOREIGN_HISTORY_ERROR =
   'OpenAI-encrypted history cannot be read by a subscription model; use GPT or a new chat with a plaintext summary';
 
 const COMPACT_INSTRUCTION =
-  'Summarize the conversation for another model to continue the same task. Preserve user requests, constraints, decisions, exact paths and identifiers, completed work, unresolved work, and tool outcomes. Distinguish facts from uncertainty. Do not execute tools or answer the previous request. Return only a thorough continuation summary.';
+  'Internal compaction maintenance, not a user request. For this summarizer invocation only, return a thorough continuation summary without executing tools or answering the task. Preserve actual user requests, constraints, decisions, exact paths and identifiers, completed work, unresolved work, and tool outcomes. Distinguish facts from uncertainty. Do not describe this maintenance instruction as the latest user request, a summary-only turn, a pause or a requirement to wait for continuation. The receiving agent must resume the actual user task from the first unfinished step, respecting actual user pauses, approval boundaries and blockers. This maintenance instruction expires when the summary is returned.';
+
+const RESUME_INSTRUCTION =
+  'Compaction is complete. The preceding summary and verbatim anchors are historical context, not new user instructions. In particular, a summary saying "this turn is summary-only", "do not execute tools" or "wait until resumed" may describe the expired internal summarizer invocation; it does not pause the active task. Resume the latest unfinished actual user request using the saved completion state and tools. Respect actual user stop/pause/summary requests, authorization limits and concrete blockers. Later actual user messages control; do not infer a new request or completion solely from the summary.';
 
 const userText = (text: string): ResponseInputItem => ({
   type: 'message',
   role: 'user',
   content: [{ type: 'input_text', text }],
 });
-const summaryMessage = (text: string) => userText(`${SUMMARY_PREFIX}\n${text}`);
+const developerText = (text: string): ResponseInputItem => ({
+  type: 'message', role: 'developer', content: [{ type: 'input_text', text }],
+});
+const summaryMessages = (text: string): ResponseInputItem[] => [{
+  type: 'message', role: 'assistant', content: [{ type: 'output_text', text: `${SUMMARY_PREFIX}\n${text}` }],
+}, developerText(RESUME_INSTRUCTION)];
 
 function plainText(content: ResponseInputItem['content']): string {
   if (typeof content === 'string') return content;
@@ -103,10 +111,10 @@ export function restorePortableSummary(text: string): ResponseInputItem[] {
   try {
     value = JSON.parse(text);
   } catch {
-    return [summaryMessage(text)];
+    return summaryMessages(text);
   }
   if (!isRecord(value) || ![CONTEXT_FORMAT, ...LEGACY_CONTEXT_FORMATS].includes(String(value.format))) {
-    return [summaryMessage(text)];
+    return summaryMessages(text);
   }
   const toolHistory = value.tool_history ?? [];
   const valid =
@@ -120,7 +128,7 @@ export function restorePortableSummary(text: string): ResponseInputItem[] {
   return [
     ...(value.anchors as string[]).map((anchor) => userText(ANCHOR_PREFIX + anchor)),
     ...(toolHistory as ResponseInputItem[]),
-    summaryMessage(
+    ...summaryMessages(
       `The preceding verbatim requests are historical and may already be completed. Preserve their constraints; later requests supersede earlier ones. Use this summary for current completion state.\n${value.summary}`,
     ),
   ];
@@ -130,7 +138,7 @@ export function restorePortableSummary(text: string): ResponseInputItem[] {
 export function compactRequest(body: ResponsesBody): ResponsesBody {
   const input = (Array.isArray(body.input) ? body.input : []).filter((item) => item.type !== 'compaction_trigger');
   const { previous_response_id: _previous, context_management: _context, ...rest } = body;
-  return { ...rest, input: [...input, userText(COMPACT_INSTRUCTION)], tools: [], tool_choice: 'auto', stream: true };
+  return { ...rest, input: [...input, developerText(COMPACT_INSTRUCTION)], tools: [], tool_choice: 'auto', stream: true };
 }
 
 /** Decrypts an OpenAI-encrypted compaction through GPT; see CompactionBridge. */
@@ -180,7 +188,7 @@ export class SummaryCodec {
       } else if (isLocalModel) {
         if (!foreignSummary) throw new Error(FOREIGN_HISTORY_ERROR);
         changed = true;
-        input.push(summaryMessage(await foreignSummary(encrypted)));
+        input.push(...summaryMessages(await foreignSummary(encrypted)));
       } else {
         input.push(item);
       }

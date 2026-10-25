@@ -65,6 +65,15 @@ Authentication, quota and validation errors still fail promptly. Known gap: the 
 bridge used by `bridgeFor` still has only the finite native retry burst. Reload a running proxy
 after updating its source.
 
+## Compaction and task continuation
+
+The router's summarization request is internal maintenance, not a new user task. Its tool-free,
+summary-only instruction expires when the summary is returned. Restored summaries are assistant
+history followed by a developer boundary directing the agent to resume the actual unfinished
+request. This also applies to older capsules whose summaries mistakenly describe maintenance as
+a user-requested pause. Actual user pauses, approval limits and newer requests still control.
+Verbatim user anchors and tool receipts retain their existing preservation and capacity rules.
+
 ## Retries and errors versus native Codex
 
 The router mirrors the native Codex client's retry and error policy wherever a request passes
