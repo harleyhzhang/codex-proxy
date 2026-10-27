@@ -460,6 +460,37 @@ describe('gpt models × upstream failure modes', () => {
       expect(ws).toMatchObject({ type: 'error', status: 503, error: { code: 'server_is_overloaded' } });
     } finally { await app.close(); }
   });
+
+  test('compaction: a stream OpenAI ends as failed or incomplete reports what happened, not a missing summary', async () => {
+    let events: object[] = [];
+    const app = await fixtureRouter({ summaryKey: Buffer.alloc(32, 5), upstreamFetch: async () =>
+      new Response(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } }) });
+    const compaction = request(GPT, { input: [{ role: 'user', content: 'hi' }, { type: 'compaction_trigger' }] });
+    const summary = { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'PARTIAL SUMMARY' }] };
+    const failed = (error: object) => [{ type: 'response.failed', response: { id: 'r', status: 'failed', output: [], error } }];
+    try {
+      // Regression: reasoning + message streamed, then response.incomplete, was reported as no summary.
+      events = [
+        { type: 'response.output_item.done', item: { type: 'reasoning' } },
+        { type: 'response.output_item.done', item: summary },
+        { type: 'response.incomplete', response: { id: 'r', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [{ type: 'reasoning' }, summary] } },
+      ];
+      const partial = await post(app, compaction);
+      expect(partial.status).toBe(200);
+      expect(JSON.stringify(await partial.json())).toContain('"type":"compaction"');
+
+      events = failed({ code: 'server_error', message: 'boom' });
+      const retryable = await post(app, compaction);
+      expect(retryable.status).toBe(502);
+      expect(((await retryable.json()) as any).error).toMatchObject({ code: 'server_error', message: 'OpenAI compaction failed: boom' });
+
+      events = failed({ code: 'context_length_exceeded', message: 'too long' });
+      expect(await socketTurn(app, compaction)).toMatchObject({ type: 'error', status: 400, error: { code: 'context_length_exceeded' } });
+
+      events = [{ type: 'response.completed', response: { id: 'r', status: 'completed', output: [] } }];
+      expect(await socketTurn(app, compaction)).toMatchObject({ type: 'error', status: 502, error: { type: 'server_error' } });
+    } finally { await app.close(); }
+  });
 });
 
 // ---------------------------------------------------------------------------------------------

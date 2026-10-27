@@ -110,6 +110,28 @@ function errorPrefix(error: unknown, pattern: RegExp): string | undefined {
   return error instanceof Error && pattern.test(error.message) ? error.message : undefined;
 }
 
+const COMPACTION_ERROR_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in_seconds'] as const;
+const QUOTA_CODES = new Set(['usage_limit_reached', 'rate_limit_exceeded', 'insufficient_quota']);
+const REQUEST_FAULT_CODES = new Set(['context_length_exceeded', 'invalid_prompt', 'cyber_policy', 'invalid_request_error']);
+
+/**
+ * A compaction stream that OpenAI ended with `response.failed` or `error`. Its reason and
+ * classifying fields reach Codex, which retries it unless OpenAI called it a quota or request fault.
+ */
+function compactionStreamFailure(event: StreamEvent): UpstreamStatusError {
+  const response = isRecord(event.response) ? event.response : {};
+  const error = isRecord(event.error) ? event.error : isRecord(response.error) ? response.error : {};
+  const fields: UpstreamErrorFields = {};
+  for (const key of COMPACTION_ERROR_FIELDS) {
+    const value = error[key];
+    if (typeof value === 'string' || typeof value === 'number') fields[key] = value;
+  }
+  const code = String(fields.code ?? fields.type ?? '');
+  const status = typeof event.status === 'number' ? event.status : QUOTA_CODES.has(code) ? 429 : REQUEST_FAULT_CODES.has(code) ? 400 : 502;
+  const detail = typeof error.message === 'string' ? error.message.slice(0, 300) : '';
+  return new UpstreamStatusError(`OpenAI compaction failed${detail ? `: ${detail}` : ''}`, status, fields);
+}
+
 function messageText(items: OutputItem[]): string {
   return items
     .filter((item) => item.type === 'message')
@@ -199,6 +221,7 @@ export function startRouter(options: RouterOptions) {
     let response: ResponseObject | undefined;
     const streamedItems: OutputItem[] = [];
     let streamedText = '';
+    let terminal: StreamEvent | undefined;
     if (isLocalModel(body.model)) {
       response = await localResponse(request, signal, { reconnect: offline !== undefined });
     } else {
@@ -218,17 +241,32 @@ export function startRouter(options: RouterOptions) {
         if (event.type === 'response.output_item.done' && isRecord(event.item)) streamedItems.push(event.item as OutputItem);
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') streamedText += event.delta;
         if (event.type === 'response.completed' && isRecord(event.response)) response = event.response as ResponseObject;
+        if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') terminal = event;
       });
+      if (terminal && terminal.type !== 'response.incomplete') {
+        const failure = compactionStreamFailure(terminal);
+        log.warn('compact-failed', { terminal: terminal.type, status: failure.status, code: failure.fields.code ?? null });
+        throw failure;
+      }
+      // An incomplete summary (e.g. the output cap) still carries the work so far, and the capsule keeps
+      // the verbatim requests beside it, so it is used rather than failing the whole compaction.
+      if (terminal && isRecord(terminal.response)) response = terminal.response as ResponseObject;
     }
 
     const items = response?.output?.length ? response.output : streamedItems;
     const summary = messageText(items) || streamedText;
     if (!response || !summary) {
-      log.warn('compact-output', { types: items.map((item) => item.type) });
-      throw new Error('Compaction produced no continuation summary');
+      log.warn('compact-output', { types: items.map((item) => item.type), terminal: terminal?.type ?? 'response.completed' });
+      // An empty reply is a model hiccup, not a fault in the request: 502 so Codex retries it.
+      throw new UpstreamStatusError('Compaction produced no continuation summary; Codex will retry', 502);
+    }
+    if (terminal) {
+      const details = isRecord(response.incomplete_details) ? response.incomplete_details : {};
+      log.warn('compact-incomplete', { reason: typeof details.reason === 'string' ? details.reason.slice(0, 40) : null, chars: summary.length });
     }
     const compacted: ResponseObject = {
       ...response,
+      status: 'completed',
       output: [{ id: randomId('cmp'), type: 'compaction', encrypted_content: codec.seal(portableSummary(summary, input)) }],
     };
     history.remember(body, compacted);
