@@ -29,25 +29,34 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
   }
   return json({user:{userEmail:process.env.CURSOR_API_KEY === 'wrong-owner' ? 'other@example.com' : 'test@example.com', userId:'fixture'}});
  }
- if (method === 'ListModels') return json({items:[{id:'kimi-k3',parameters:[{id:'reasoning',values:['low','high','max'].map(value=>({value}))}]}]});
+ if (method === 'ListModels') return json({items:[{id:'kimi-k3',parameters:[{id:'reasoning',values:['low','high','max'].map(value=>({value}))}]},{id:'grok-4.7',parameters:[{id:'reasoning_effort',values:['low','medium','high','xhigh'].map(value=>({value}))},{id:'context',values:[{value:'256k'}]},{id:'fast',values:[{value:'true'},{value:'false'}]}]}]});
  const bytes = Buffer.from(await req.arrayBuffer());
  const body = JSON.parse((method === 'Send' ? bytes.subarray(5) : bytes).toString());
- if (method === 'CreateAgent') { const agentId = process.pid + '-' + (++next); agents.set(agentId,{model:body.options.model,sends:0,marker:''}); event('create',{agentId,cwd:body.options.local.cwd[0]}); return json({agentId}); }
+ if (method === 'CreateAgent') { const agentId = process.pid + '-' + (++next); agents.set(agentId,{model:body.options.model,sends:0,marker:''}); event('create',{agentId,cwd:body.options.local.cwd[0],model:body.options.model}); return json({agentId}); }
  const agent = agents.get(body.agentId);
  if (method === 'CancelRun') { event('cancel',{agentId:body.agentId,runId:body.runId}); return json({}); }
  if (method === 'CloseAgent') { event('close-start',{agentId:body.agentId}); if (agent?.slowClose) await Bun.sleep(350); if (agent?.failClose) return new Response('{}',{status:500}); agents.delete(body.agentId); event('close-end',{agentId:body.agentId}); return json({}); }
  if (method === 'Send') {
   if (!agent) return new Response('{}',{status:404});
-  const text = body.message.text; agent.sends++; event('send',{agentId:body.agentId,text});
+  const text = body.message.text; agent.sends++; event('send',{agentId:body.agentId,text,images:body.message.images?.length??0});
+  for(const mode of ['REPAIR_CHAIN','REPAIR_NARRATION','REPAIR_CANCEL','REPAIR_NATIVE','REPAIR_STUCK','DRAFT_TEXT']) if(text.includes(mode)) agent.mode=mode;
   const marker = text.match(/history-[A-Z]/)?.[0]; if (marker) agent.marker = marker;
   if (text.includes('SLOW_CLOSE')) agent.slowClose = true;
   if (text.includes('FAIL_CLOSE')) agent.failClose = true;
   const runId = 'run-' + body.agentId + '-' + agent.sends;
+  if (agent.mode === 'REPAIR_CANCEL' && agent.sends > 1) {event('repair-wait',{agentId:body.agentId,runId}); return new Response(new ReadableStream({start(c){c.enqueue(frame({sdkMessage:{message:{runId}}}));}}),{headers:{'content-type':'application/connect+json'}});}
   if (text.includes('CANCEL_THIS')) return new Response(new ReadableStream({ start(c) {c.enqueue(frame({sdkMessage:{message:{runId}}}));} }),{headers:{'content-type':'application/connect+json'}});
   if (text.includes('SLOW_TURN')) await Bun.sleep(150);
   const output = text.includes('<tool_result') ? {text:(agent.sends > 1 ? 'continued:' : 'fresh:') + agent.marker, tool_calls:[]} : text.includes('first-tool') ? {text:'working',tool_calls:[{name:'echo',arguments:{value:'fixture'}}]} : {text:'ok',tool_calls:[]};
   const finished = 'RUN_LIFECYCLE_STATUS_FINISHED';
-  return new Response(Buffer.concat([frame({result:{status:finished,runId,result:{status:finished,result:JSON.stringify(output),model:agent.model,usage:{inputTokens:10,outputTokens:2}}}}),frame({done:{runId}})]),{headers:{'content-type':'application/connect+json'}});
+  let raw=JSON.stringify(output);
+  if(agent.mode==='REPAIR_CHAIN') raw=agent.sends===1?'{"text":"broken", tool_calls: [':JSON.stringify({text:'repaired',tool_calls:[{name:'echo',arguments:{value:agent.sends===2?17:'fixture-repaired'}}]});
+  if(agent.mode==='REPAIR_NARRATION') raw=agent.sends===1?'I will inspect the synthetic fixture next.':JSON.stringify({text:agent.sends===2?'I will inspect the synthetic fixture next.':'repaired',tool_calls:agent.sends===2?[]:[{name:'echo',arguments:{value:'fixture-repaired'}}]});
+  if(agent.mode==='REPAIR_CANCEL') raw='{"text":"broken", tool_calls: [';
+  if(agent.mode==='REPAIR_STUCK') raw=JSON.stringify({text:'I will inspect the synthetic fixture next.',tool_calls:[]});
+  if(agent.mode==='DRAFT_TEXT') raw='I will inspect the synthetic fixture next.';
+  const native=agent.mode==='REPAIR_NATIVE'?[frame({sdkMessage:{message:{content:[{type:'tool_use',name:'shell'}]}}})]:[];
+  return new Response(Buffer.concat([...native,frame({result:{status:finished,runId,result:{status:finished,result:raw,model:agent.model,usage:{inputTokens:10,outputTokens:2}}}}),frame({done:{runId}})]),{headers:{'content-type':'application/connect+json'}});
  }
  return new Response('{}',{status:404});
 }});
@@ -59,7 +68,7 @@ await new Promise(()=>{});
   await writeFile(auth, JSON.stringify({ apiKey: 'fixture-key', email: 'test@example.com', backendUrl: 'https://api2.cursor.sh' }), { mode: 0o600 });
   const saved = process.env.CURSOR_MAX_BRIDGES;
   process.env.CURSOR_MAX_BRIDGES = String(limit);
-  const backend = createCursorBackend({ binary, binaryHash: sha256(source), authFile: auth, cwd: root, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'fixture', label: 'Fixture' });
+  const backend = createCursorBackend({ binary, binaryHash: sha256(source), authFile: auth, cwd: root, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'fixture', label: 'Fixture', fastest: true });
   if (saved === undefined) delete process.env.CURSOR_MAX_BRIDGES; else process.env.CURSOR_MAX_BRIDGES = saved;
   const events = async () => (await readFile(root + '/events.jsonl', 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as unknown).filter(isRecord);
   try { await run({ backend, root, binary, auth, source, events }); }
@@ -77,6 +86,53 @@ async function waitFor(events: Fixture['events'], operation: string): Promise<vo
   }
   throw new Error('fixture event missing: ' + operation);
 }
+
+for(const mode of['REPAIR_CHAIN','REPAIR_NARRATION'])test('Cursor Grok repairs '+mode+' in the same verified agent without changing model pins',()=>fixture(async f=>{
+ const req={...request('Inspect the synthetic fixture '+mode),model:'grok-4.7',reasoning:{effort:'xhigh'}};
+ const output=await f.backend.run(req),events=await f.events();
+ expect(output.toolCalls).toHaveLength(1);expect(JSON.parse(output.toolCalls[0]!.arguments)).toEqual({value:'fixture-repaired'});
+ expect(events.filter(event=>event.operation==='create')).toHaveLength(1);
+ const sends=events.filter(event=>event.operation==='send');expect(sends).toHaveLength(3);expect(new Set(sends.map(event=>event.agentId)).size).toBe(1);
+ expect(events.find(event=>event.operation==='create')?.model).toEqual({id:'grok-4.7',params:[{id:'reasoning_effort',value:'xhigh'},{id:'context',value:'256k'},{id:'fast',value:'true'}]});
+}));
+
+test('Cursor Grok cannot silently finish an action request with repeated promises after its bounded repair budget',()=>fixture(async f=>{
+ const output=await f.backend.run({...request('Inspect the synthetic fixture REPAIR_STUCK'),model:'grok-4.7',reasoning:{effort:'xhigh'}});
+ expect(output.toolCalls).toEqual([]);expect(output.text).toContain('could not produce a valid action');expect(output.text).toContain('Nothing was executed');
+ const events=await f.events();expect(events.filter(event=>event.operation==='send')).toHaveLength(9);expect(events.filter(event=>event.operation==='create')).toHaveLength(3);
+}));
+
+test('Cursor Grok returns a requested draft directly without unnecessary corrective generation',()=>fixture(async f=>{
+ const output=await f.backend.run({...request('Draft an email sentence DRAFT_TEXT'),model:'grok-4.7',reasoning:{effort:'xhigh'}});
+ expect(output.text).toBe('I will inspect the synthetic fixture next.');expect(output.toolCalls).toEqual([]);
+ expect((await f.events()).filter(event=>event.operation==='send')).toHaveLength(1);
+}));
+
+test('Cursor never continues a native-action refusal as a model-output repair',()=>fixture(async f=>{
+ await expect(f.backend.run(request('Inspect the synthetic fixture REPAIR_NATIVE'))).rejects.toThrow(/native tool/);
+ const events=await f.events();expect(events.filter(event=>event.operation==='send')).toHaveLength(1);expect(events.filter(event=>event.operation==='create')).toHaveLength(1);
+}));
+
+test('Cursor cancellation during same-agent output repair stops without a fresh retry',()=>fixture(async f=>{
+ const controller=new AbortController();const pending=f.backend.run(request('Inspect the synthetic fixture REPAIR_CANCEL'),controller.signal);
+ await waitFor(f.events,'repair-wait');controller.abort();await expect(pending).rejects.toThrow();
+ const events=await f.events();expect(events.filter(event=>event.operation==='send')).toHaveLength(2);expect(events.filter(event=>event.operation==='create')).toHaveLength(1);
+}));
+
+test('Cursor Grok forwards recognized image parts as SDK attachments while ordinary tool metadata stays in text',()=>fixture(async f=>{
+ const inline='data:image/png;base64,AAAA';
+ const req:ResponsesRequest={model:'grok-4.7',reasoning:{effort:'xhigh'},tools:[],input:[
+  {role:'user',content:[{type:'input_text',text:'Describe the synthetic attached fixtures.'},{type:'image',mimeType:'image/png',data:'AAAA'}]},
+  {type:'computer_call_output',call_id:'typed',output:{type:'computer_screenshot',image_url:inline}},
+  {type:'computer_call_output',call_id:'legacy',output:{image_url:inline}},
+  {type:'function_call_output',call_id:'metadata',output:{image_url:'https://example.invalid/metadata.png',file_id:'database-row'}},
+ ]};
+ await f.backend.run(req);
+ const send=(await f.events()).find(event=>event.operation==='send');
+ expect(send?.images).toBe(3);expect(String(send?.text)).toContain('https://example.invalid/metadata.png');expect(String(send?.text)).toContain('database-row');
+ expect(f.backend.catalog.find(model=>model.slug==='fixture-grok-4.7')?.inputModalities).toEqual(['text','image']);
+ expect(f.backend.catalog.find(model=>model.slug==='fixture-kimi-k3')?.inputModalities).toEqual(['text']);
+}));
 
 test('Cursor retains a verified agent only for its exact tool-history continuation and sends the delta', () => fixture(async f => {
   const first = request(), output = await f.backend.run(first);

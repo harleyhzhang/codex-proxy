@@ -343,11 +343,32 @@ Everything has a default; set only what you need.
 | `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |
 | `GROK_CWD` | unset | Empty working directory for Grok |
 | `GROK_HOME` | `~/.grok` | Grok profile directory (use a dedicated one) |
-| `GROK_TIMEOUT_MS` | `900000` | Per-turn Grok timeout |
+| `GROK_TIMEOUT_MS` | `300000` | Grok stdout/stderr idle timeout, not a total reasoning deadline |
+| `GROK_KILL_GRACE_MS` | `2000` | Grace before SIGKILL when a Grok process group ignores cancellation |
 | `GROK_BIN_SHA256` | unset | Pause Grok if the binary changes |
 | `GROK_PROFILE_SHA256` | unset | Pause Grok if its config, hooks or plugins change |
 
 ### Grok
+
+The bridge disables Grok Build's native session search: it already supplies the
+complete Codex conversation, so rebuilding an index of every stored CLI session
+before each turn only adds work. Existing CLI history is preserved. Cancellation,
+timeout and output overflow stop the request's whole process group, including
+helpers that keep output pipes open. A rejected or expired subscription login is
+terminal and explains how to sign in again using the same isolated `GROK_HOME`.
+
+Use `[skills] ignore = ["~/.agents/skills"]` in that isolated profile if its
+native personal skills should not supplement Codex's supplied instructions.
+Review the profile and recompute its pin after changing this setting.
+The profile pin covers nested hook/plugin files. Symlinks in those folders
+pause the backend for review rather than allowing unverified target contents.
+
+Valid JSON argument strings retain their exact semantics; malformed string
+escapes can be repaired, and nested tool contracts are validated before any
+action reaches Codex. Explicit new user rechecks and agent-wait polling are
+not treated as stuck repeated reads. Cursor models can repair malformed output
+in the same agent with a bounded correction budget. Authentication, native
+action attempts, model changes and cancelled runs never use that repair path.
 
 Grok Build has its own tools. The proxy hides them and tells Grok that Codex owns execution, but
 the real boundary is a `PreToolUse` hook that denies every native call. Give Grok a dedicated

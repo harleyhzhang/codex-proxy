@@ -95,8 +95,12 @@ test('Grok function arguments: regex and shell backslashes survive as literal ba
  const raw='{"cmd":"'+command+'","workdir":"/repo"}';
  expect(()=>JSON.parse(raw)).toThrow();
  expect(JSON.parse(functionArguments(raw))).toEqual({cmd:command,workdir:'/repo'});
- // \b and \f stay literal: in a command they are regex word boundaries, never backspace or form feed.
- expect(JSON.parse(functionArguments(String.raw`{"cmd":"rg '\bfoo\b' \f"}`)).cmd).toBe(String.raw`rg '\bfoo\b' \f`);
+ // Valid JSON is authoritative, including standard backspace/form-feed escapes. Literal regex
+ // backslashes are preserved when encoded correctly rather than silently changing valid data.
+ const controls=String.raw`{"cmd":"rg '\bfoo\b' \f"}`;
+ expect(functionArguments(controls)).toBe(controls);expect(JSON.parse(functionArguments(controls))).toEqual(JSON.parse(controls));
+ const regex=String.raw`rg '\bfoo\b' \f`;
+ expect(JSON.parse(functionArguments(JSON.stringify({cmd:regex}))).cmd).toBe(regex);
  // Already-valid escapes are untouched byte for byte.
  const valid=String.raw`{"cmd":"a\nb \"q\" A \\ \/ \t"}`;
  expect(functionArguments(valid)).toBe(valid);expect(JSON.parse(functionArguments(valid)).cmd).toBe('a\nb "q" A \\ / \t');
@@ -124,14 +128,14 @@ test('Grok repeat guard refuses a third identical call with an identical result;
  expect(latestStepRecap({...looping,input:[...looping.input,{role:'user',content:'new question'}]})).toBe('');
  expect(latestStepRecap({model:'grok-4.7',input:'hi'} as any)).toBe('');
 });
-test('Grok function arguments may be a real object; custom tools still need a raw string; schema allows both',async()=>{
+test('Grok function arguments may be a real object; custom payloads must be unambiguous raw strings; schema allows both',async()=>{
  const {parseGrokOutput,grokOutputSchema,GrokError}=await import('../src/backends/grok');
  const tools=[{type:'function',name:'exec_command',parameters:{type:'object'}},{type:'custom',name:'apply_patch'}] as any;
  const req={model:'grok-4.7',input:'go',tools} as any;
  const cmd=String.raw`rg -n "a\.b" --glob '!x'`;
  const out=parseGrokOutput(JSON.stringify({text:'',tool_calls:[{name:'exec_command',arguments:{cmd}}]}),req);
  expect(JSON.parse(out.toolCalls[0]!.arguments)).toEqual({cmd});
- for(const bad of [{name:'apply_patch',arguments:{patch:'x'}},{name:'exec_command',arguments:['x']}]){let error:any;try{parseGrokOutput(JSON.stringify({text:'',tool_calls:[bad]}),req);}catch(e){error=e;}expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);}
+ for(const bad of [{name:'apply_patch',arguments:{patch:'x',other:'ambiguous'}},{name:'exec_command',arguments:['x']}]){let error:any;try{parseGrokOutput(JSON.stringify({text:'',tool_calls:[bad]}),req);}catch(e){error=e;}expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);}
  const schema:any=grokOutputSchema(tools);
  expect(schema.properties.tool_calls.items.properties.arguments).toEqual({anyOf:[{type:'object'},{type:'string'}]});
 });

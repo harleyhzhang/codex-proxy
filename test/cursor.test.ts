@@ -7,6 +7,9 @@ test('Cursor unwraps object-wrapped custom tool arguments instead of refusing th
  expect(coerceCustomArguments({input:'*** Begin Patch'})).toBe('*** Begin Patch');
  expect(coerceCustomArguments({whatever:'x'})).toBe('x');
  expect(coerceCustomArguments({a:'x',b:'y'})).toBeUndefined();
+ expect(coerceCustomArguments({code:'text(1)',patch:'different input'})).toBeUndefined();
+ expect(coerceCustomArguments({code:'text(1)',yield_time_ms:1000})).toBeUndefined();
+ expect(coerceCustomArguments({code:'text(1)',call_id:'fixture',index:0})).toBe('text(1)');
  expect(coerceCustomArguments({cmd:1})).toBeUndefined();
  expect(coerceCustomArguments(undefined)).toBe('');
  const req={model:'kimi-k3',input:'t',tools:[{type:'custom',name:'exec'}]} as const;
@@ -56,10 +59,38 @@ import { BackendError, type SubscriptionBackend } from '../src/backends/contract
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
 import type { ResponsesRequest } from '../src/protocol/types';
 import { responseObject } from '../src/protocol/output';
-import { requestTools, toolDescriptors } from '../src/protocol/prompt';
+import { preparePrompt, requestTools, toolDescriptors } from '../src/protocol/prompt';
 import type { JsonRecord } from '../src/json';
 const request: ResponsesRequest = {model:'kimi-k3',input:'test',tools:[{type:'namespace',name:'functions',tools:[{type:'function',name:'read',parameters:{type:'object',properties:{path:{type:'string'}},required:['path'],additionalProperties:false}}]},{type:'custom',name:'apply_patch'}]};
 const output=(value:unknown)=>parseCursorOutput(JSON.stringify(value),request);
+test('Cursor preserves MCP/typed/legacy computer images for actual attachment and keeps ordinary tool metadata as text',()=>{
+ const inline='data:image/png;base64,AAAA';
+ const history=[
+  {type:'function_call_output',call_id:'metadata',output:{image_url:'https://example.invalid/metadata.png',file_id:'database-row',audio_url:'metadata',file_data:'metadata',value:7}},
+  {type:'message',role:'user',content:[{type:'image',mimeType:'image/png',data:'AAAA'}]},
+  {type:'computer_call_output',call_id:'typed',output:{type:'computer_screenshot',image_url:inline}},
+  {type:'computer_call_output',call_id:'legacy',output:{image_url:inline}},
+  {type:'function_call_output',call_id:'unsupported',output:[{type:'input_file',file_id:'attachment'},{type:'input_audio',audio_url:'data:audio/wav;base64,AAAA'},{type:'input_image',image_url:'https://example.invalid/attachment.png'}]},
+ ];
+ const result=sanitizeCursorInput(history);
+ expect(result.dropped).toBe(0);expect(result.replaced).toBe(3);
+ const items=result.input as typeof history;
+ expect(items.slice(0,4)).toEqual(history.slice(0,4));
+ const prepared=preparePrompt({model:'grok-4.7',input:items,tools:[]});
+ expect(prepared.images).toHaveLength(3);
+ expect(prepared.images.map(image=>image.source)).toEqual(Array.from({length:3},()=>({type:'base64',media_type:'image/png',data:'AAAA'})));
+ expect(prepared.prompt).toContain('https://example.invalid/metadata.png');expect(prepared.prompt).toContain('database-row');expect(prepared.prompt).toContain('"file_data":"metadata"');
+ expect(prepared.prompt).not.toContain('data:image/png;base64,AAAA');
+ expect(history[0]?.output).toEqual({image_url:'https://example.invalid/metadata.png',file_id:'database-row',audio_url:'metadata',file_data:'metadata',value:7});
+});
+test('Cursor applies the legacy image exception only to computer outputs, including remote/file-backed placeholders',()=>{
+ const metadata={image_url:'data:image/png;base64,AAAA',file_id:'ordinary-record'};
+ const input=[{type:'function_call_output',call_id:'normal',output:metadata},{type:'computer_call_output',call_id:'remote',output:{image_url:'https://example.invalid/remote.png'}},{type:'computer_call_output',call_id:'file',output:{type:'computer_screenshot',file_id:'unsupported-file'}}];
+ const sanitized=sanitizeCursorInput(input);
+ expect(sanitized.replaced).toBe(2);expect((sanitized.input as typeof input)[0]?.output).toEqual(metadata);
+ const prepared=preparePrompt({model:'grok-4.7',input:sanitized.input as never,tools:[]});
+ expect(prepared.images).toHaveLength(0);expect(prepared.prompt).toContain('ordinary-record');
+});
 test('Cursor preserves namespaced function objects and exact custom raw input',()=>{
  const result=output({text:'',tool_calls:[{name:'functions.read',arguments:{path:'hello'}},{name:'apply_patch',arguments:'*** Begin Patch\n*** End Patch'}]});
  expect(result.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['functions.read','{"path":"hello"}'],['apply_patch','*** Begin Patch\n*** End Patch']]);
@@ -251,4 +282,61 @@ test('Cursor accepts plain text immediately only when the complete tool list is 
  expect(()=>parseCursorOutput('ordinary final answer',request)).toThrow(/wrote the narration/);
  const loaded={...withoutTools,input:[{type:'tool_search_output',tools:[{type:'function',name:'loaded',parameters:{type:'object'}}]}]};
  expect(()=>parseCursorOutput('ordinary final answer',loaded)).toThrow(/wrote the narration/);
+});
+
+test('Cursor accepts standard explicit namespaces and custom envelopes only for exact declared tools',()=>{
+ const req:ResponsesRequest={model:'grok-4.7',input:'Inspect the synthetic fixture.',tools:[{type:'namespace',name:'functions',tools:[{type:'custom',name:'exec'},{type:'function',name:'lookup',parameters:{type:'object',properties:{key:{type:'string'}},required:['key'],additionalProperties:false}}]}]};
+ const custom=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{type:'custom_tool_call',namespace:'functions',name:'exec',input:'text("synthetic");'}]}),req);
+ expect(custom.toolCalls.map(call=>[call.name,call.arguments])).toEqual([['functions.exec','text("synthetic");']]);
+ const wrapped=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{custom:{namespace:'functions',name:'exec',input:'text(1)'}}]}),req);
+ expect(wrapped.toolCalls[0]?.name).toBe('functions.exec');expect(wrapped.toolCalls[0]?.arguments).toBe('text(1)');
+ const standalone=parseCursorOutput(JSON.stringify({type:'custom_tool_call',namespace:'functions',name:'exec',input:'text(2)'}),req);
+ expect(standalone.toolCalls.map(call=>[call.name,call.arguments])).toEqual([['functions.exec','text(2)']]);
+ const fn=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{namespace:'functions',name:'lookup',arguments:{key:'fixture'}}]}),req);
+ expect(fn.toolCalls[0]?.name).toBe('functions.lookup');expect(JSON.parse(fn.toolCalls[0]!.arguments)).toEqual({key:'fixture'});
+ expect(()=>parseCursorOutput(JSON.stringify({text:'',tool_calls:[{namespace:'other',name:'exec',input:'text(1)'}]}),req)).toThrow(/unknown tool/);
+ expect(()=>parseCursorOutput(JSON.stringify({unexpected:'synthetic'}),req)).toThrow(/without text or tool_calls/);
+ expect(()=>parseCursorOutput(JSON.stringify({name:'undeclared',arguments:{}}),req)).toThrow(/unknown tool/);
+});
+
+test('Cursor does not finish a clear short action request with only a future-action promise, even on its final attempt',()=>{
+ const action={...request,input:'Please inspect the synthetic fixture and report the result.'};
+ const narration="I'll inspect the synthetic fixture next.";
+ for(const accept of[false,true]){
+  expect(()=>parseCursorOutput(narration,action,undefined,accept)).toThrow(/narration/);
+  expect(()=>parseCursorOutput(JSON.stringify({text:narration,tool_calls:[]}),action,undefined,accept)).toThrow(/future tool action/);
+ }
+ for(const verb of['call','invoke']){
+  const req={...request,input:`${verb} the declared tool once with the synthetic payload.`};
+  const promise=`I will ${verb} the declared tool now.`;
+  expect(()=>parseCursorOutput(JSON.stringify({text:promise,tool_calls:[]}),req,undefined,true)).toThrow(/future tool action/);
+  expect(parseCursorOutput(promise,{...request,input:'Return exactly this literal sentence: '+promise}).text).toBe(promise);
+  expect(parseCursorOutput(JSON.stringify({text:promise,tool_calls:[]}),{...request,input:'Draft an email using this sentence: '+promise}).text).toBe(promise);
+ }
+});
+
+test('Cursor preserves legitimate quoted wording, drafts, translations, plans and final prose without forcing tools',()=>{
+ const prose="I'll inspect the synthetic fixture next.";
+ for(const input of['Return exactly this sentence: '+prose,'Draft an email that says '+prose,'Translate this quoted sentence into English: '+prose,'Write a plan for checking the synthetic fixture.','Review this draft email wording.']){
+  const req={...request,input};
+  expect(parseCursorOutput(prose,req).text).toBe(prose);
+  expect(parseCursorOutput(JSON.stringify({text:prose,tool_calls:[]}),req).toolCalls).toEqual([]);
+ }
+ expect(parseCursorOutput('The synthetic fixture has three fields.',{...request,input:'Inspect the synthetic fixture.'},undefined,true).text).toBe('The synthetic fixture has three fields.');
+});
+
+test('Cursor lifecycle cancellation is terminal and provider context overflow uses the native context code',()=>{
+ for(const status of['CANCELLED','CANCELED']){
+  try{interpretCursorEvents([{result:{status:'RUN_LIFECYCLE_STATUS_'+status,runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_'+status}}},{done:{runId:'r'}}],request,selection);throw new Error('expected failure');}
+  catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(false)}
+ }
+ try{interpretCursorEvents([{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',error:'prompt is too long for this model'}}},{done:{runId:'r'}}],request,selection);throw new Error('expected failure');}
+ catch(error){expect((error as BackendError).code).toBe('context_length_exceeded');expect((error as BackendError).retryable).toBe(false)}
+});
+
+test('Cursor Connect internal failures retry safely while auth, bad arguments and quota remain terminal',async()=>{
+ for(const [code,retryable]of[['internal',true],['unknown',true],['invalid_argument',false],['unauthenticated',false],['resource_exhausted',false]]as const){
+  try{for await(const _ of connectFrames(stream([frame({error:{code}},2)]))){}throw new Error('expected failure');}
+  catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(retryable)}
+ }
 });

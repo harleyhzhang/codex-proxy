@@ -7,7 +7,7 @@ import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { childEnvironment, positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
-import { preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
+import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { repairJsonStrings } from './grok';
@@ -167,16 +167,17 @@ function parseJsonLoosely(raw: string): unknown {
  * refusing the turn, ignoring id/index metadata keys. Returns undefined when no single string can
  * be recovered (for example only pragma numbers like yield_time_ms and no code at all).
  */
-const CUSTOM_PAYLOAD_KEYS = ['input', 'code', 'source', 'patch', 'script', 'text', 'content', 'arguments', 'argument', 'args', 'raw', 'body', 'value', 'cmd', 'command', 'js', 'javascript'];
 const CUSTOM_METADATA_KEYS = new Set(['call_id', 'callId', 'id', 'index', 'name', 'tool', 'type']);
 export function coerceCustomArguments(value: unknown): string | undefined {
   if (typeof value === 'string') return value;
   if (value === undefined || value === null) return '';
   if (!isRecord(value)) return undefined;
-  for (const key of CUSTOM_PAYLOAD_KEYS) if (typeof value[key] === 'string') return value[key] as string;
   const keys = Object.keys(value).filter(key => !CUSTOM_METADATA_KEYS.has(key));
-  const strings = keys.filter(key => typeof value[key] === 'string');
-  if (keys.length === 1 && strings.length === 1) return value[strings[0]!] as string;
+  // Two payloads (or options beside source) cannot be collapsed without dropping model intent.
+  // The same-agent repair can put exec options in their required first-line pragma instead.
+  if (keys.length !== 1) return undefined;
+  const key = keys[0]!;
+  if (typeof value[key] === 'string') return value[key] as string;
   return undefined;
 }
 
@@ -222,6 +223,25 @@ export function balanceJsonBrackets(raw: string): string {
   return out + stack.reverse().join('');
 }
 const fieldName = (key: unknown) => typeof key === 'string' && /^[A-Za-z0-9_.-]{1,64}$/.test(key) ? key : '(invalid name)';
+// A promised external action is progress, not a final answer. Keep ordinary final prose and
+// quoted examples available; only explicit first-person action narration triggers correction.
+const ACTION_NARRATION = /^(?:(?:I(?:['’]ll| will|(?:['’]m| am) (?:going|about) to))\s+|Let me\s+)(?:read|check|inspect|look|search|run|execute|open|write|edit|update|save|create|delete|remove|install|fetch|test|verify|find|benchmark|load|browse|query|use|collect|gather|scan|pull|review|confirm|send|apply|call|invoke)\b/i;
+const TEXT_ONLY_INTENT = /\b(?:draft|translate|translation|rephrase|rewrite|proofread|quote|verbatim|plan|outline|explain|example|sample|wording|poem|story)\b|\b(?:return|say|respond|reply)(?: with)? exactly\b|\b(?:write|compose) (?:an? |the )?(?:email|message|letter|sentence|speech)\b/i;
+const ACTION_REQUEST = /^(?:(?:please|can (?:you|u)|could you|would you|help me|i (?:want|need) you to)\s+)*(?:(?:actually|quickly|extensively|carefully)\s+)?(?:read|check|inspect|look|search|run|execute|open|write|edit|update|save|create|delete|remove|install|fetch|test|verify|find|benchmark|load|browse|query|use|collect|gather|scan|pull|review|confirm|send|apply|call|invoke|continue|do it)\b(?=\s+\S)/i;
+function latestUserText(request: ResponsesRequest): string {
+  if (typeof request.input === 'string') return request.input.slice(-8192);
+  for (let index = request.input.length - 1; index >= 0; index--) {
+    const item = request.input[index];
+    if (item?.role !== 'user') continue;
+    return (typeof item.content === 'string' ? item.content : (item.content ?? []).map(part => typeof part?.text === 'string' ? part.text : '').join('\n')).slice(-8192);
+  }
+  return '';
+}
+function isUnfinishedNarration(text: string, latest: string): boolean {
+  // Heuristics only raise a bounded repair on clear short action promises in an action request.
+  // A requested quote, translation, draft or plan is useful text even when it says "I'll ...".
+  return text.length <= 400 && !TEXT_ONLY_INTENT.test(latest) && ACTION_REQUEST.test(latest.trim()) && ACTION_NARRATION.test(text.trim().replace(/^[*#>\s]+/, ''));
+}
 
 // Kimi K3 under long tool-heavy contexts abandons the JSON contract and emits its native tool-call
 // markup instead: <|open|>call tool="name" index="1"<|sep|><|open|>argument key="k" type="string"<|sep|>v
@@ -277,6 +297,7 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     throw category === 'prose' ? new CursorProseError(message) : new CursorError(message, true, true, retries);
   };
   const descriptors = toolDescriptors(requestTools(request));
+  const latest = latestUserText(request);
   const allowed = new Map(descriptors.map(tool => [tool.proxyName, tool]));
   let candidate = text.trim();
   let value: unknown = parseNativeToolMarkup(text);
@@ -287,7 +308,7 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     // still bare prose, deliver it as a text-only message rather than a failed turn. No tool runs.
     // With no available actions, wrapping prose cannot recover missing work; another generation
     // only adds latency. Terminal success/model/native-action validation still runs before this.
-    if (!acceptProse && descriptors.length > 0) {
+    if (descriptors.length > 0 && ((!acceptProse && !TEXT_ONLY_INTENT.test(latest)) || isUnfinishedNarration(text, latest))) {
       const quoted = JSON.stringify(text.trim().slice(0, 200));
       return refuse(`wrote the narration ${quoted} instead of acting. Narration is not an action. Your reply must begin with the character { and end with }: put that sentence in "text" and the tool call it describes in "tool_calls", exactly like {"text":${quoted},"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}`, 'prose', {}, 2);
     }
@@ -300,6 +321,14 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
     }
   }
   if (!isRecord(value)) return refuse('returned JSON that is not an object; the reply must be one object with text and tool_calls', 'not-object');
+  if (!Object.hasOwn(value, 'text') && !Object.hasOwn(value, 'tool_calls')) {
+    // A model may copy a single Responses/OpenAI call from history instead of the envelope.
+    // It still passes the same exact-name, custom-input, and schema validation below.
+    const call = value;
+    if ((typeof call.name === 'string' && ['arguments', 'input', 'parameters'].some(key => Object.hasOwn(call, key))) || isRecord(call.function) || isRecord(call.custom)) value = { text: '', tool_calls: [call] };
+    else return refuse('returned a JSON object without text or tool_calls; use the required reply envelope instead of silently ending the turn', 'missing-envelope');
+  }
+  if (!isRecord(value)) return refuse('returned an invalid reply envelope', 'missing-envelope');
   if (candidate !== text.trim()) logSafe('cursor-output-unwrapped', { bytes: text.length });
   const extraTop = Object.keys(value).filter(key => !['text', 'tool_calls'].includes(key));
   if (extraTop.length) logSafe('cursor-output-extra-keys', { count: extraTop.length });
@@ -310,12 +339,15 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   if (rawCalls === undefined || rawCalls === null) rawCalls = [];
   if (!Array.isArray(rawCalls)) return refuse('returned tool_calls that is not an array; use [] when no tool is needed', 'tool-calls-type');
   if (rawCalls.length > 64) return refuse('returned more than 64 tool calls in one reply', 'too-many-calls', { count: rawCalls.length });
+  if (descriptors.length && !rawCalls.length && isUnfinishedNarration(responseText, latest)) return refuse('narrated a future tool action but returned no tool calls. If the original request needs that action, return its actual Codex call in tool_calls. A requested quote, plan, genuine final answer or concrete blocker may finish without tools', 'prose');
   const toolCalls = rawCalls.map((call: unknown, index: number) => {
     if (!isRecord(call)) return refuse(`tool_calls[${index}] is not an object; each call is {"name": string, "arguments": ...}`, 'call-not-object');
     // OpenAI-style {type:'function', function:{name, arguments}} is a common slip; unwrap it.
-    const inner = isRecord(call.function) ? call.function : call;
+    const inner = isRecord(call.function) ? call.function : isRecord(call.custom) ? call.custom : call;
     let name = typeof inner.name === 'string' ? inner.name : undefined;
     if (!name) return refuse(`tool_calls[${index}] has no string name; use an exact tool name from the list`, 'call-no-name');
+    const namespace = typeof inner.namespace === 'string' ? inner.namespace : typeof call.namespace === 'string' ? call.namespace : undefined;
+    if (namespace) name = name.startsWith(namespace + '.') ? name : `${namespace}.${name}`;
     if (!allowed.has(name) && name.startsWith('functions.') && allowed.has(name.slice(10))) name = name.slice(10);
     const descriptor = allowed.get(name);
     if (!descriptor) {
@@ -361,14 +393,12 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
 }
 
 const OPAQUE_ITEM_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction', 'encrypted_content', 'reasoning']);
-const MEDIA_PART_TYPES = new Set(['input_image', 'image', 'input_audio', 'audio', 'input_file', 'file']);
-const IMAGE_PART_TYPES = new Set(['input_image', 'image']);
+const MEDIA_PART_TYPES = new Set(['input_audio', 'audio', 'input_file', 'file']);
 const isOpaque = (value: JsonRecord): boolean => OPAQUE_ITEM_TYPES.has(String(value.type)) || typeof value.encrypted_content === 'string';
-const isMedia = (value: JsonRecord): boolean => MEDIA_PART_TYPES.has(String(value.type)) || Boolean(value.file_id) || Boolean(value.image_url) || Boolean(value.audio_url) || Boolean(value.file_data);
-const imageUrlOf = (value: JsonRecord): string | undefined => typeof value.image_url === 'string' ? value.image_url : isRecord(value.image_url) && typeof value.image_url.url === 'string' ? value.image_url.url : undefined;
 // Inline PNG/JPEG/GIF/WebP data URLs are forwarded to the bridge as SelectedImages (the same path the
-// Cursor app uses for pasted screenshots). Remote URLs, files and audio stay placeholders.
-const isInlineImage = (value: JsonRecord): boolean => IMAGE_PART_TYPES.has(String(value.type)) && !value.file_id && /^data:image\/(?:png|jpeg|gif|webp);base64,/.test(imageUrlOf(value) ?? '');
+// Cursor app uses for pasted screenshots). Share the prompt's typed/MCP/legacy-computer recognition;
+// ordinary tool metadata containing image_url or file_id is text, not an attachment.
+const isInlineImage = (value: JsonRecord, legacyComputerOutput: boolean): boolean => !value.file_id && /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$/.test(imageUrl(value, legacyComputerOutput) ?? '');
 
 /**
  * Cursor cannot replay OpenAI-encrypted reasoning, compaction summaries or non-image attachments. Rather
@@ -379,14 +409,17 @@ const isInlineImage = (value: JsonRecord): boolean => IMAGE_PART_TYPES.has(Strin
  */
 export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: number; replaced: number } {
   const stats = { dropped: 0, replaced: 0 };
-  const walk = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(walk);
+  const walk = (value: unknown, legacyComputerOutput = false): unknown => {
+    if (Array.isArray(value)) return value.map(item => walk(item, legacyComputerOutput));
     if (!isRecord(value)) return value;
-    if (isInlineImage(value)) return value;
-    if (isMedia(value)) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' }; }
+    if (isImagePart(value, legacyComputerOutput)) {
+      if (isInlineImage(value, legacyComputerOutput)) return value;
+      stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' };
+    }
+    if (MEDIA_PART_TYPES.has(String(value.type))) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' }; }
     if (isOpaque(value)) { stats.replaced++; return { type: 'input_text', text: '[encrypted or compacted content from a previous model; unreadable here]' }; }
     const out: JsonRecord = {};
-    for (const [key, child] of Object.entries(value)) out[key] = walk(child);
+    for (const [key, child] of Object.entries(value)) out[key] = walk(child, value.type === 'computer_call_output' && key === 'output');
     return out;
   };
   if (!Array.isArray(input)) return { input: walk(input), ...stats };
@@ -430,7 +463,10 @@ export async function* connectFrames(body: ReadableStream<Uint8Array>): AsyncGen
           // Connect `unavailable` (or a network message) means the bridge could not reach Cursor's
           // servers: the router's shared offline policy keeps the request pending and retries it.
           if (connectUnavailable(value.error)) throw new ProxyTransportError();
-          throw new CursorError('Cursor stream failed; no automatic supplier fallback');
+          const code = isRecord(value.error) && typeof value.error.code === 'string' ? value.error.code : 'unknown';
+          const transient = ['internal', 'unknown', 'aborted', 'deadline_exceeded'].includes(code);
+          logSafe('cursor-stream-refused', { code, transient });
+          throw new CursorError('Cursor stream failed; no automatic supplier fallback', transient);
         }
       } else yield value;
     }
@@ -540,10 +576,12 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
     // terminal frames are kept owner-only so the next opaque failure can be read, not guessed.
     const errored = runStatus !== 'FINISHED' || status !== 'FINISHED';
     const opaque = errored && !reason;
-    const transient = opaque || (!!reason && TRANSIENT_RUN_ERROR.test(reason));
+    const cancelled = /CANCELLED|CANCELED/.test(`${status} ${runStatus}`);
+    const transient = !cancelled && (opaque || (!!reason && TRANSIENT_RUN_ERROR.test(reason)));
     const captured = captureInvalidOutput(captureDir, 'unfinished', JSON.stringify({ result, done, events }, null, 1).slice(0, 262_144));
     const keysOf = (value: unknown) => isRecord(value) ? Object.keys(value).sort().slice(0, 32) : [];
     logSafe('cursor-unfinished', { events: events.length, terminal: terminal.length, status, runStatus, hasDone: isRecord(done), doneMatches: isRecord(done) && !!result && done.runId === result.runId, resultType: typeof run?.result, reasonBytes: reason?.length ?? 0, opaque, transient, resultKeys: keysOf(result), runKeys: keysOf(run), doneKeys: keysOf(done), captured: !!captured });
+    if (reason && CONTEXT_OVERFLOW_TEXT.test(reason)) throw contextOverflowError('Cursor');
     const detail = status === 'FINISHED' && runStatus === 'FINISHED' ? 'the run finished without a result' : `run status ${runStatus}${reason ? `: ${reason}` : opaque ? ' with no reason from Cursor' : ''}`;
     throw new CursorError(`Cursor did not finish successfully (${detail}); no automatic supplier fallback`, transient);
   }
@@ -557,7 +595,8 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   return output;
 }
 
-const PROSE_CORRECTION = 'Your last reply was narration with no JSON object, so nothing ran. Reply again now with ONLY one JSON object that begins with { : put that sentence in "text" and the tool call it describes in "tool_calls". If you meant to finish, put your final answer in "text" with "tool_calls": [].';
+const PROSE_CORRECTION = 'Your last reply needs a valid tool envelope. No Codex action ran. Reply with ONLY one JSON object beginning with { . Recheck the original user request: if an external action is still needed, put progress in "text" and its next actual Codex call in "tool_calls", rather than promising it with an empty array. If the user requested a quote, draft, translation or plan, or your answer is genuinely complete, confirm that final answer unchanged in "text" with "tool_calls": []. A concrete blocker or user-requested pause may also finish without tools. Never claim an action ran without its tool result.';
+const OUTPUT_CORRECTION = 'Your last tool envelope was rejected before any Codex action ran. Continue this same task by correcting that output, using ONLY one JSON object with text and tool_calls. Use exact declared tool names and namespaces, function arguments matching their schema, and raw strings for custom tools. Do not repeat the rejected output or replace a needed action with narration. Refusal detail: ';
 
 type CursorSession = {
   agentId: string; signature: string; historyHash: string; historyLength: number;
@@ -685,6 +724,7 @@ class CursorRuntime {
       if (response.ok) return response;
       const detail: unknown = await response.json().catch(() => undefined);
       const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
+      if (isRecord(detail) && typeof detail.message === 'string' && CONTEXT_OVERFLOW_TEXT.test(detail.message)) throw contextOverflowError('Cursor');
       if (connectUnavailable(detail)) throw new ProxyTransportError();
       const transient = response.status >= 500;
       if (transient && !stream && tries < 3) {
@@ -808,13 +848,18 @@ class CursorRuntime {
       const captureDir = join(dirname(this.options.cwd), 'invalid-output');
       if (images.length) logSafe('cursor-images-attached', { count: images.length });
       const generation = performance.now();
-      const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`, images);
+      let events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`, images);
       let output: ProxyOutput;
-      try { output = interpretCursorEvents(events, request, selection, captureDir); }
-      catch (error) {
-        if (!(error instanceof CursorProseError)) throw error;
-        logSafe('cursor-prose-correction', {});
-        output = interpretCursorEvents(await send(PROSE_CORRECTION), request, selection, captureDir, lastAttempt);
+      for (let correction = 0; ; correction++) {
+        try { output = interpretCursorEvents(events, request, selection, captureDir, lastAttempt && correction === 2); break; }
+        catch (error) {
+          // Only model-written output is repairable in place. Native execution, identity/model
+          // drift, transport/lifecycle failure and cancellation never enter this continuation.
+          if (!(error instanceof CursorError) || !error.modelOutput || !error.retryable || correction >= 2 || combined.aborted) throw error;
+          const prose = error instanceof CursorProseError;
+          logSafe(prose ? 'cursor-prose-correction' : 'cursor-output-correction', { attempt: correction + 1 });
+          events = await send(prose ? PROSE_CORRECTION : OUTPUT_CORRECTION + error.message);
+        }
       }
       runMs = performance.now() - generation;
       combined.throwIfAborted(); successful = true;

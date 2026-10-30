@@ -130,9 +130,9 @@ export type CliFailure =
  * mention any word, so it must never decide the category.
  */
 export function classifyCliFailure(diagnostics: string): { category: CliFailure; retryable: boolean } {
-  const category: CliFailure = /429|rate.?limit|usage limit|quota/i.test(diagnostics)
+  const category: CliFailure = /\b429\b|rate.?limit|usage limit|quota/i.test(diagnostics)
     ? 'subscription usage limit reached'
-    : /401|unauthori[sz]ed|not authenticated|token expired|sign.in|log.in/i.test(diagnostics)
+    : /\b401\b|unauthori[sz]ed|\bunauthenticated\b|not authenticated|token[ _-]expired|\binvalid_grant\b|\b(?:sign|log)[ ._-]?in\b|\b(?:signed|logged)[ ._-]out\b/i.test(diagnostics)
       ? 'authentication failed'
       : /structured.?output|json.?schema|schema validation/i.test(diagnostics)
         ? 'structured output failed'

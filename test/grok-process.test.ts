@@ -20,11 +20,11 @@ test('isolated Grok sessions preserve simultaneous parent/child tasks; native ac
   process.env.GROK_TIMEOUT_MS='50';await expect(runGrok({model:'grok-4.7',input:'HANG'})).rejects.toThrow('timed out');
  }finally{for(const [key,value] of [['GROK_BIN',before.bin],['GROK_CWD',before.cwd],['GROK_TIMEOUT_MS',before.timeout]]){if(value===undefined)delete process.env[key!];else process.env[key!]=value;}await rm(dir,{recursive:true});}
 });
-test('a malformed Grok answer is retried once with the failure named; argument escaping rules are always in the system prompt',async()=>{
+test('a malformed Grok answer is retried once with the failure named and schema-consistent argument guidance',async()=>{
  const dir=await mkdtemp(tmpdir()+'/grok-retry-');const binary=dir+'/fixture';
  await Bun.write(binary,`#!/usr/bin/env bun
  const args=process.argv;const system=args[args.indexOf('--system-prompt-override')+1];
- if(!system.includes('every backslash must be written as'))process.exit(9);
+ if(!system.includes('Ordinary JSON escaping still applies to string values')||!system.includes('not a second JSON encoding')||system.includes('Each arguments value is a JSON string'))process.exit(9);
  const retried=system.includes('rejected before anything ran');
  console.log(JSON.stringify({stopReason:'end_turn',num_turns:1,structuredOutput:retried?{text:'FIXED',tool_calls:[]}:{text:'BROKEN'}}));
  `);await chmod(binary,0o700);

@@ -23,6 +23,13 @@ describe("Responses request adapter", () => {
     const schema = outputSchema([{ type: "custom", name: "apply_patch" }]);
     expect(JSON.stringify(schema)).toContain('"enum":["apply_patch"]');
   });
+  test("keeps vendor names in literal user code while describing the execution boundary neutrally", () => {
+    const phrase = "Claude Code's native tools";
+    const prepared = preparePrompt({ model: "grok-4.7", input: `Return exactly ${phrase}`, tools: [{ type: "function", name: "echo", parameters: { type: "object" } }] });
+    expect(prepared.prompt).toContain(`Return exactly ${phrase}`);
+    expect(prepared.prompt).toContain("The backend's native tools are disabled");
+    expect(prepared.prompt.split(phrase)).toHaveLength(2);
+  });
 
   test("keeps plaintext inter-agent payloads and flags OpenAI-encrypted ones", () => {
     const prompt = requestToPrompt({
@@ -71,6 +78,26 @@ describe("Responses request adapter", () => {
     const prepared = preparePrompt({ model: "opus", input: [{ role: "user", content: [{ type: "input_image", image_url: "data:image/png;base64,aGVsbG8=" }] }, { type: "function_call_output", output: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }] }] });
     expect(prepared.images).toHaveLength(2);
     expect(prepared.prompt).not.toContain("aGVsbG8=");
+  });
+  test("preserves ordinary tool metadata with image URLs and file identifiers as text", () => {
+    const metadata = { image_url: "https://example.com/image.png", file_id: "record-123", nested: { image_url: "data:image/png;base64,aGVsbG8=", label: "metadata only" } };
+    const prepared = preparePrompt({ model: "opus", input: [{ type: "function_call_output", call_id: "call_1", output: metadata }] });
+    expect(prepared.images).toEqual([]);
+    expect(prepared.prompt).toContain(JSON.stringify(metadata));
+    expect(prepared.prompt).not.toContain("Image attached directly");
+  });
+  test("retains typed and legacy computer screenshot attachments", () => {
+    const prepared = preparePrompt({ model: "opus", input: [
+      { type: "computer_call_output", output: { image_url: "data:image/png;base64,aGVsbG8=" } },
+      { type: "computer_call_output", output: { type: "computer_screenshot", image_url: "data:image/png;base64,aGVsbG8=" } },
+    ] });
+    expect(prepared.images).toHaveLength(2);
+    expect(prepared.prompt).not.toContain("aGVsbG8=");
+  });
+  test("refuses declared images whose contents cannot be delivered instead of silently omitting them", () => {
+    for (const part of [{ type: "input_image", file_id: "remote-file" }, { type: "input_image" }, { type: "image", data: [] }]) {
+      expect(() => preparePrompt({ model: "opus", input: [{ role: "user", content: [part] }] })).toThrow("Only inline");
+    }
   });
   test("rejects hosted tools instead of silently pretending they work", () => {
     expect(() => validateRequest({ model: "opus", input: "test", tools: [{ type: "web_search" }] })).toThrow("Unsupported provider-hosted tool");

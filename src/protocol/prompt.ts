@@ -167,7 +167,7 @@ function serializeItem(item: ResponseInputItem): string {
     case 'computer_call':
       return `<assistant_computer_call call_id=${callId}>\n${JSON.stringify(item.actions ?? item.action ?? {})}\n</assistant_computer_call>`;
     case 'computer_call_output':
-      return `<computer_result call_id=${callId}>\n${redactImages(item.output)}\n</computer_result>`;
+      return `<computer_result call_id=${callId}>\n${redactImages(item.output, true)}\n</computer_result>`;
     default: {
       const role = item.role ?? (item.type === 'message' ? 'user' : (item.type ?? 'input'));
       return `<${role}>\n${textFromContent(item.content)}\n</${role}>`;
@@ -187,7 +187,7 @@ function describeTool(tool: ToolDescriptor): string {
     .join('\n');
 }
 
-const TOOL_RULES = `You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls. Claude Code's native tools are disabled; Codex owns all action execution. For a function tool, arguments must be a JSON object encoded as a string. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. Screenshots and images are attached directly to this message; inspect them visually without requesting a native Read tool.`;
+const TOOL_RULES = `You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls. The backend's native tools are disabled; Codex owns all action execution. For a function tool, arguments must represent the JSON object in its contract. If the required output schema uses a string, JSON-encode that object once; otherwise write the object directly. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. Screenshots and images are attached directly to this message; inspect them visually without requesting a native Read tool.`;
 
 export function requestToPrompt(request: ResponsesRequest): string {
   const input =
@@ -251,7 +251,16 @@ export function outputSchema(tools: ResponseTool[]): Record<string, unknown> {
   };
 }
 
-function imageUrl(value: Record<string, unknown>): string | undefined {
+const IMAGE_PART_TYPES = new Set(['input_image', 'image', 'image_url', 'computer_screenshot', 'screenshot']);
+
+/** Ordinary tool JSON may name image URLs without containing image content. */
+export function isImagePart(value: Record<string, unknown>, legacyComputerOutput = false): boolean {
+  return IMAGE_PART_TYPES.has(String(value.type ?? '')) || Boolean(legacyComputerOutput && value.type === undefined &&
+    (typeof value.image_url === 'string' || isRecord(value.image_url) || typeof value.file_id === 'string'));
+}
+
+export function imageUrl(value: Record<string, unknown>, legacyComputerOutput = false): string | undefined {
+  if (!isImagePart(value, legacyComputerOutput)) return undefined;
   if (typeof value.image_url === 'string') return value.image_url;
   if (isRecord(value.image_url) && typeof value.image_url.url === 'string') return value.image_url.url;
   if (value.type === 'image' && typeof value.data === 'string') {
@@ -263,15 +272,16 @@ function imageUrl(value: Record<string, unknown>): string | undefined {
 
 const INLINE_IMAGE = /^data:(image\/(?:png|jpeg|gif|webp));base64,([A-Za-z0-9+/=\s]+)$/;
 
-function collectImages(value: unknown, images: ImageBlock[]): void {
+function collectImages(value: unknown, images: ImageBlock[], legacyComputerOutput = false): void {
   if (Array.isArray(value)) {
-    for (const item of value) collectImages(item, images);
+    for (const item of value) collectImages(item, images, legacyComputerOutput);
     return;
   }
   if (!isRecord(value)) return;
-  const url = imageUrl(value);
+  const url = imageUrl(value, legacyComputerOutput);
   if (url === undefined) {
-    for (const item of Object.values(value)) collectImages(item, images);
+    if (isImagePart(value, legacyComputerOutput)) throw new Error('Only inline PNG/JPEG/GIF/WebP image data is supported; image file references or missing image data cannot be read');
+    for (const [key, item] of Object.entries(value)) collectImages(item, images, value.type === 'computer_call_output' && key === 'output');
     return;
   }
   // Remote URLs are never fetched: that would let a prompt make the proxy issue requests.
@@ -282,11 +292,12 @@ function collectImages(value: unknown, images: ImageBlock[]): void {
   images.push({ type: 'image', source: { type: 'base64', media_type: match[1], data: match[2].replace(/\s/g, '') } });
 }
 
-function redactImages(value: unknown): string {
+function redactImages(value: unknown, legacyComputerOutput = false): string {
+  const legacyItems = legacyComputerOutput && Array.isArray(value) ? new Set<unknown>(value) : undefined;
   return (
     JSON.stringify(value, (_key, item: unknown) =>
-      isRecord(item) && imageUrl(item) !== undefined
-        ? { type: 'image', note: 'Image attached directly to this Claude message' }
+      isRecord(item) && imageUrl(item, legacyComputerOutput && (item === value || legacyItems?.has(item) === true)) !== undefined
+        ? { type: 'image', note: 'Image attached directly to this model message' }
         : item,
     ) ?? ''
   );

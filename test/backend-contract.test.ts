@@ -53,12 +53,19 @@ describe('shared failure policy',()=>{
   test('exit classification: the account is never retried, transient failures are',()=>{
     expect(classifyCliFailure('HTTP 429 rate limit')).toEqual({category:'subscription usage limit reached',retryable:false});
     expect(classifyCliFailure('401 Unauthorized')).toEqual({category:'authentication failed',retryable:false});
+    for (const text of ['Run grok login', 'Please sign in', 'signin required', 'log-in required', 'Refresh rejected: invalid_grant', 'UNAUTHENTICATED', 'token_expired', 'You are signed out']) {
+      expect(classifyCliFailure(text)).toEqual({category:'authentication failed',retryable:false});
+    }
+    expect(classifyCliFailure('binary signing failed')).toEqual({category:'process failed',retryable:true});
+    expect(classifyCliFailure('logging subsystem crashed')).toEqual({category:'process failed',retryable:true});
     expect(classifyCliFailure('json schema validation failed')).toEqual({category:'structured output failed',retryable:true});
     expect(classifyCliFailure('connection reset by peer')).toEqual({category:'connection failed',retryable:true});
     expect(classifyCliFailure('upstream returned 503')).toEqual({category:'connection failed',retryable:true});
     expect(classifyCliFailure('segfault')).toEqual({category:'process failed',retryable:true});
     // A bare number inside an identifier must not read as an HTTP status.
     expect(classifyCliFailure('session a5003f')).toEqual({category:'process failed',retryable:true});
+    expect(classifyCliFailure('request a429001f')).toEqual({category:'process failed',retryable:true});
+    expect(classifyCliFailure('input_tokens 429001')).toEqual({category:'process failed',retryable:true});
   });
 });
 const output={text:'',toolCalls:[],usage:{inputTokens:0,outputTokens:0,totalTokens:0}};
