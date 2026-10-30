@@ -167,6 +167,69 @@ test('Cursor never caches failed identity checks',async()=>{
  const rpc=async()=>{count++;return Response.json({user:{userEmail:'other@example.com',userId:'12'}})};
  for(let i=0;i<2;i++)await expect(verifyCursorProfile(pins,'bad-key',rpc)).rejects.toThrow();expect(count).toBe(2);
 });
+test('Cursor uncancelled profile waiters re-prove identity on their own bridge after the lookup owner aborts',async()=>{
+ const pins={expectedEmail:'cancel-profile@example.com',expectedUserId:'12',binaryHash:'cancel-profile-fixture'};
+ const controller=new AbortController();
+ let began!:()=>void; const started=new Promise<void>(resolve=>{began=resolve});
+ const ownerRpc=async()=>{
+  began();
+  await new Promise<void>((_resolve,reject)=>controller.signal.addEventListener('abort',()=>reject(new DOMException('owner aborted','AbortError')),{once:true}));
+  return Response.json({});
+ };
+ let independent=0;
+ const ownRpc=async(_service:string,method:string)=>{
+  independent++;
+  return Response.json(method==='Me'?{user:{userEmail:pins.expectedEmail,userId:pins.expectedUserId}}:{items:[]});
+ };
+ const owner=verifyCursorProfile(pins,'cancel-profile-key',ownerRpc,controller.signal).catch((error:unknown)=>error);
+ await started;
+ const waiter=verifyCursorProfile(pins,'cancel-profile-key',ownRpc);
+ controller.abort();
+ expect(await owner).toBeInstanceOf(Error);
+ expect(await waiter).toEqual({items:[]});
+ expect(independent).toBe(2);
+});
+test('Cursor cancelling a profile waiter leaves the lookup owner and its cached proof alive',async()=>{
+ const pins={expectedEmail:'waiter-profile@example.com',expectedUserId:'12',binaryHash:'waiter-profile-fixture'};
+ let release!:()=>void; const gate=new Promise<void>(resolve=>{release=resolve});
+ let calls=0;
+ const rpc=async(_service:string,method:string)=>{
+  calls++; if(method==='Me')await gate;
+  return Response.json(method==='Me'?{user:{userEmail:pins.expectedEmail,userId:pins.expectedUserId}}:{items:[]});
+ };
+ const owner=verifyCursorProfile(pins,'waiter-profile-key',rpc);
+ const controller=new AbortController();
+ let waiterCalls=0;
+ const ownRpc=async()=>{waiterCalls++;return Response.json({})};
+ const waiter=verifyCursorProfile(pins,'waiter-profile-key',ownRpc,controller.signal).catch((error:unknown)=>error);
+ controller.abort(new Error('cancel waiter'));
+ expect(await waiter).toEqual(new Error('cancel waiter'));
+ release();
+ expect(await owner).toEqual({items:[]});
+ expect(await verifyCursorProfile(pins,'waiter-profile-key',ownRpc)).toEqual({items:[]});
+ expect(calls).toBe(2);expect(waiterCalls).toBe(0);
+});
+for(const refusal of ['identity','authentication','quota']as const){
+ test('Cursor shared profile '+refusal+' refusals are never retried by a waiter when the owner also cancels',async()=>{
+  const pins={expectedEmail:'refusal-profile@example.com',expectedUserId:'12',binaryHash:'refusal-profile-'+refusal};
+  let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve});
+  const rpc=async()=>{
+   await gate;
+   if(refusal==='identity')return Response.json({user:{userEmail:'wrong@example.com',userId:'12'}});
+   throw new CursorError('terminal '+refusal+' refusal');
+  };
+  const controller=new AbortController();
+  const owner=verifyCursorProfile(pins,'refusal-profile-'+refusal,rpc,controller.signal).catch((error:unknown)=>error);
+  let independent=0;
+  const waiter=verifyCursorProfile(pins,'refusal-profile-'+refusal,async()=>{independent++;return Response.json({})}).catch((error:unknown)=>error);
+  controller.abort();release();
+  expect(await owner).toBeInstanceOf(Error);
+  const error=await waiter;
+  expect(error).toBeInstanceOf(CursorError);
+  expect(String(error)).toContain(refusal==='identity'?'differs from the pinned identity':'terminal '+refusal+' refusal');
+  expect(independent).toBe(0);
+ });
+}
 
 test('Cursor bare prose (Grok narration) refuses on the first attempt with the exact wrap and is delivered as text-only on the retry',()=>{
  expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/wrote the narration \"I'll read those sections next\.\" instead of acting/);
@@ -178,4 +241,14 @@ test('Cursor bare prose (Grok narration) refuses on the first attempt with the e
 });
 test('Cursor malformed JSON containing a brace is still refused as unparseable even on the retry',()=>{
  expect(()=>parseCursorOutput('{"text": "oops", tool_calls: [',request,undefined,true)).toThrow(/parseable JSON object/);
+});
+test('Cursor accepts plain text immediately only when the complete tool list is empty',()=>{
+ const withoutTools={...request,tools:[]};
+ expect(parseCursorOutput('  ordinary final answer\n',withoutTools).text).toBe('ordinary final answer');
+ expect(parseCursorOutput('ordinary final answer',withoutTools).toolCalls).toEqual([]);
+ expect(()=>parseCursorOutput('{"text": broken',withoutTools)).toThrow(/parseable JSON object/);
+ expect(()=>parseCursorOutput('broken JSON }',withoutTools)).toThrow(/parseable JSON object/);
+ expect(()=>parseCursorOutput('ordinary final answer',request)).toThrow(/wrote the narration/);
+ const loaded={...withoutTools,input:[{type:'tool_search_output',tools:[{type:'function',name:'loaded',parameters:{type:'object'}}]}]};
+ expect(()=>parseCursorOutput('ordinary final answer',loaded)).toThrow(/wrote the narration/);
 });

@@ -5,7 +5,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from '
 import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { configuredCursorBackend } from '../src/backends/cursor';
+import { configuredCursorBackend, type CursorBackend } from '../src/backends/cursor';
 import type { SubscriptionBackend } from '../src/backends/contract';
 import { BACKENDS } from '../src/backends/registry';
 import { AUTH_HEADERS, fixtureRouter } from './support';
@@ -14,7 +14,7 @@ const INTERNAL = 'Internal router error; Codex will retry.';
 const EMAIL = 'bridge@example.com';
 const USER = 'user_bridge';
 let scratch = '';
-let backend: SubscriptionBackend | undefined;
+let backend: CursorBackend | undefined;
 const savedTimeout = process.env.CURSOR_TIMEOUT_MS;
 const savedRetry = process.env.CURSOR_RPC_RETRY_MS;
 const savedReachability = process.env.CURSOR_REACHABILITY_URL;
@@ -108,6 +108,7 @@ await new Promise(() => {});
   process.env.CURSOR_REACHABILITY_URL = `http://127.0.0.1:${cursorApi.port}`;
 });
 afterAll(async () => {
+  await backend?.close();
   if (backend) { const at = BACKENDS.indexOf(backend); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
   if (savedTimeout === undefined) delete process.env.CURSOR_TIMEOUT_MS; else process.env.CURSOR_TIMEOUT_MS = savedTimeout;
   if (savedRetry === undefined) delete process.env.CURSOR_RPC_RETRY_MS; else process.env.CURSOR_RPC_RETRY_MS = savedRetry;
@@ -171,13 +172,13 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const bridgePid = async () => Number(await readFile(scratch + '/bridge.pid', 'utf8'));
 
 describe('Cursor bridge failures through the router', () => {
-  test('the scripted bridge serves a normal turn on every transport and is killed afterwards', async () => {
+  test('the scripted bridge serves normal turns on every transport and stays available for reuse', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('OK');
       expectOk(await everyTransport(app, body('hello')), 'CURSOR_OK');
       await sleep(50);
-      expect(pidAlive(await bridgePid())).toBe(false);
+      expect(pidAlive(await bridgePid())).toBe(true);
     } finally { await app.close(); }
   });
 
@@ -376,15 +377,14 @@ describe('Cursor bridge failures through the router', () => {
     const app = await fixtureRouter();
     try {
       await scenario('PROSE_THEN_JSON');
-      for (const cell of await everyTransport(app, body('x'))) {
+      for (const cell of await everyTransport(app, { ...body('x'), tools: [{ type: 'function', name: 'echo', parameters: { type: 'object' } }] })) {
         expect(cell.code, cell.transport).toBe('ok');
         expect(cell.message, cell.transport).toBe('wrapped after correction');
       }
     } finally { await app.close(); }
   });
 
-  test('bare prose (Grok narration) is retried once and then delivered verbatim as a text-only chat message', async () => {
-    // (kept for the case where the agent keeps narrating after the in-agent correction)
+  test('bare prose is delivered immediately when no tools are available', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('BAD_OUTPUT');

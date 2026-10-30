@@ -1,9 +1,9 @@
 // Optional Cursor transport through the vendor's pinned SDK bridge. The proxy has no runtime
-// package dependency: it speaks sdk.v1 Connect JSON to a short-lived loopback child process.
+// package dependency: it speaks sdk.v1 Connect JSON to an exclusively leased loopback process.
 // Every request starts with tools: [], no setting sources, no MCP and no subagents. Cursor never
 // owns execution; validated tool requests return to Codex only after the complete run succeeds.
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { chmod, mkdtemp, rm } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
 import { childEnvironment, positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
@@ -13,6 +13,8 @@ import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisi
 import { repairJsonStrings } from './grok';
 import { logSafe } from '../log';
 import { ProxyTransportError, transportError } from '../transport';
+import { CursorBridgePool, type CursorLease } from './cursor-pool';
+import { responseObject } from '../protocol/output';
 
 export const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
@@ -279,11 +281,13 @@ export function parseCursorOutput(text: string, request: ResponsesRequest, captu
   let candidate = text.trim();
   let value: unknown = parseNativeToolMarkup(text);
   if (value) logSafe('cursor-output-native-markup', { bytes: text.length, calls: (value as JsonRecord).tool_calls instanceof Array ? ((value as JsonRecord).tool_calls as unknown[]).length : 0 });
-  else if (!text.includes('{')) {
+  else if (!/[{}]/.test(text)) {
     // Grok 4.7 narrates mid-task ("I'll read those sections next.") and forgets the envelope entirely.
     // The first time, refuse with the exact wrap so the retry can continue the work; if the retry is
     // still bare prose, deliver it as a text-only message rather than a failed turn. No tool runs.
-    if (!acceptProse) {
+    // With no available actions, wrapping prose cannot recover missing work; another generation
+    // only adds latency. Terminal success/model/native-action validation still runs before this.
+    if (!acceptProse && descriptors.length > 0) {
       const quoted = JSON.stringify(text.trim().slice(0, 200));
       return refuse(`wrote the narration ${quoted} instead of acting. Narration is not an action. Your reply must begin with the character { and end with }: put that sentence in "text" and the tool call it describes in "tool_calls", exactly like {"text":${quoted},"tool_calls":[{"name":"<exact tool name>","arguments":{...}}]}`, 'prose', {}, 2);
     }
@@ -461,21 +465,53 @@ export function assertCursorIdentity(value: unknown, options: Pick<CursorOptions
 // credential and pins, share concurrent lookups, and refresh after five minutes. A rotated key or
 // changed identity pin never reuses another account's proof. Server access policy remains decisive.
 type CursorRpc = (service:string, method:string, body:JsonRecord) => Promise<Response>;
-const profileCache = new Map<string, { expires:number; value:Promise<JsonRecord> }>();
-export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEmail'|'expectedUserId'|'binaryHash'>, key:string, rpc:CursorRpc):Promise<JsonRecord> {
+type CursorProfileProof = { expires:number; value:Promise<JsonRecord>; cancelled:boolean };
+const profileCache = new Map<string, CursorProfileProof>();
+/** Each caller can leave a shared lookup without cancelling a different bridge's owner. */
+function awaitCursorProfile(value: Promise<JsonRecord>, signal?: AbortSignal): Promise<JsonRecord> {
+  signal?.throwIfAborted();
+  if (!signal) return value;
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    const cleanup = () => signal.removeEventListener('abort', abort);
+    value.then(result => { cleanup(); resolve(result); }, error => { cleanup(); reject(error); });
+  });
+}
+export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEmail'|'expectedUserId'|'binaryHash'>, key:string, rpc:CursorRpc, signal?:AbortSignal):Promise<JsonRecord> {
+  signal?.throwIfAborted();
   const cacheKey = sha256(Buffer.from(key))+'|'+options.expectedEmail+'|'+options.expectedUserId+'|'+options.binaryHash;
   const previous = profileCache.get(cacheKey);
-  if (previous && previous.expires > Date.now()) return previous.value;
-  const value = (async () => {
-    assertCursorIdentity(await (await rpc('SdkCursorService','Me',{options:{apiKey:key}})).json(),options);
-    const models:unknown = await (await rpc('SdkCursorService','ListModels',{options:{apiKey:key}})).json();
-    if (!isRecord(models) || !Array.isArray(models.items)) throw new CursorError('Cursor returned an invalid model catalog');
-    return models;
-  })();
-  const entry = {expires:Date.now()+300_000,value};
-  if (profileCache.size >= 32) profileCache.delete(profileCache.keys().next().value!);
-  profileCache.set(cacheKey,entry);
-  try { return await value; } catch(error) { if(profileCache.get(cacheKey)===entry) profileCache.delete(cacheKey); throw error; }
+  let entry: CursorProfileProof;
+  if (previous && previous.expires > Date.now()) entry = previous;
+  else {
+    const value = (async () => {
+      assertCursorIdentity(await (await rpc('SdkCursorService','Me',{options:{apiKey:key}})).json(),options);
+      const models:unknown = await (await rpc('SdkCursorService','ListModels',{options:{apiKey:key}})).json();
+      if (!isRecord(models) || !Array.isArray(models.items)) throw new CursorError('Cursor returned an invalid model catalog');
+      return models;
+    })().catch((error: unknown) => {
+      // A cancelled lookup owner's fetch must not poison uncancelled waiters. Only an actual abort
+      // qualifies: identity/auth/quota/backend refusals retain their original terminal behaviour,
+      // even if the owner also happened to cancel before the rejection was observed.
+      entry.cancelled = !!signal?.aborted && !(error instanceof BackendError)
+        && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'));
+      if (profileCache.get(cacheKey) === entry) profileCache.delete(cacheKey);
+      throw error;
+    });
+    entry = {expires:Date.now()+300_000,value,cancelled:false};
+    if (profileCache.size >= 32) profileCache.delete(profileCache.keys().next().value!);
+    profileCache.set(cacheKey,entry);
+  }
+  try {
+    const result = await awaitCursorProfile(entry.value, signal);
+    signal?.throwIfAborted();
+    return result;
+  } catch(error) {
+    signal?.throwIfAborted();
+    if (entry.cancelled) return verifyCursorProfile(options,key,rpc,signal);
+    throw error;
+  }
 }
 
 export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRequest, selection: JsonRecord, captureDir?: string, acceptProse = false): ProxyOutput {
@@ -523,189 +559,320 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
 
 const PROSE_CORRECTION = 'Your last reply was narration with no JSON object, so nothing ran. Reply again now with ONLY one JSON object that begins with { : put that sentence in "text" and the tool call it describes in "tool_calls". If you meant to finish, put your final answer in "text" with "tool_calls": [].';
 
-async function runCursorOnce(options: CursorOptions, request: ResponsesRequest, signal?: AbortSignal, retryNote = '', lastAttempt = false): Promise<ProxyOutput> {
-  signal?.throwIfAborted();
-  const sanitized = sanitizeCursorInput(request.input);
-  if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
-  request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
-  const selection = cursorSelection(request.model, request.reasoning?.effort, options.fastest);
-  const prepared = preparePrompt(request);
-  // SendRequest.message.images is SdkImage{ data: SdkImageData{ data: bytes, mime_type } }; proto JSON
-  // encodes bytes as base64 and the oneof by field name. The bridge wraps each as a SelectedImage.
-  const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
-  if (sha256(readFileSync(options.binary)) !== options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
-  const key = readCursorKey(options);
-  const dir = await mkdtemp(join(options.cwd, 'request-')); await chmod(dir, 0o700);
-  const controller = new AbortController();
-  let proc: Bun.Subprocess<'ignore', 'ignore', 'pipe'> | undefined;
-  let startup: ReturnType<typeof setTimeout> | undefined;
-  let runId = '', agentId = '', url = '', token = '';
-  let cancellation: Promise<void> | undefined;
-  const cancel = () => {
-    if (controller.signal.aborted) return;
-    controller.abort();
-    if (url && token && runId) {
-      cancellation = fetch(`${url}/sdk.v1.SdkAgentService/CancelRun`, { method:'POST', signal:AbortSignal.timeout(2000), headers:{authorization:`Bearer ${token}`,'content-type':'application/json'},body:JSON.stringify({agentId,runId}) }).then(() => {}, () => {}).finally(() => {proc?.kill();});
-    } else proc?.kill();
-  };
-  let timedOut = false;
-  // Native Codex bounds a model stream by silence, never by total length (model-provider-info
-  // DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s; codex-api "idle timeout waiting for SSE"), and retries
-  // that idle timeout like any dropped stream. A total deadline cut a long xhigh Grok turn that was
-  // still producing frames (benchmark round 38). Every Connect frame restarts the window.
-  const idleMs = positiveInt('CURSOR_TIMEOUT_MS', 300_000);
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  const touch = () => { clearTimeout(timeout); timeout = setTimeout(() => { timedOut = true; cancel(); }, idleMs); };
-  touch();
-  signal?.addEventListener('abort', cancel, { once: true });
-  try {
-    signal?.throwIfAborted();
-    proc = Bun.spawn([options.binary, '--host', '127.0.0.1', '--port', '0', '--workspace', dir, '--state-root', join(dir, 'store'), '--local-store', JSON.stringify({ type: 'jsonl', rootDir: join(dir, 'store') })], { cwd: dir, env: cursorEnvironment(key), stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
-    const child = proc;
-    // A fresh bridge is spawned for every turn and is ready in about 0.5 s on an idle machine, but
-    // under heavy host load (benchmark round r2, load average ~95) it missed a 30 s window on 6 of
-    // 12 Grok turns. Nothing has been sent when startup times out, so the turn gets one fresh attempt.
-    const startupMs = positiveInt('CURSOR_STARTUP_TIMEOUT_MS', 60_000);
-    const ready = new Promise<JsonRecord>((resolve, reject) => {
-      startup = setTimeout(() => { logSafe('cursor-startup-timeout', { startupMs }); cancel(); reject(new CursorError('Cursor bridge startup timed out', true)); }, startupMs);
-      void (async () => {
-        let line = '', bytes = 0, found = false;
-        try {
-          for await (const chunk of child.stderr) {
-            bytes += chunk.length;
-            if (bytes > MAX_BYTES) { cancel(); throw new CursorError('Cursor diagnostics exceeded safety limit'); }
-            line += new TextDecoder().decode(chunk);
-            let boundary: number;
-            while ((boundary = line.indexOf('\n')) >= 0) {
-              const current = line.slice(0, boundary); line = line.slice(boundary + 1);
-              if (!found && current.startsWith('cursor-sdk-bridge ready ')) {
-                const value: unknown = JSON.parse(current.slice(24));
-                if (!isRecord(value)) throw new CursorError('Cursor bridge handshake failed');
-                found = true; clearTimeout(startup); resolve(value);
-              }
-            }
-            if (line.length > 65536) throw new CursorError('Cursor diagnostic line exceeded safety limit');
-          }
-          if (!found) reject(new CursorError('Cursor bridge exited before ready'));
-        } catch { cancel(); reject(new CursorError('Cursor bridge startup or diagnostics failed')); }
-      })();
-    });
-    const info = await ready;
-    if (info.schemaVersion !== 1 || info.host !== '127.0.0.1' || info.protocol !== 'connect' || info.transport !== 'tcp' || typeof info.port !== 'number' || typeof info.authTokenFile !== 'string' || typeof info.url !== 'string' || info.url !== `http://127.0.0.1:${info.port}`) throw new CursorError('Cursor returned an invalid local handshake');
-    url = info.url; token = readFileSync(info.authTokenFile, 'utf8').trim();
-    async function rpc(service: string, method: string, body: JsonRecord, stream = false, rpcSignal: AbortSignal = controller.signal): Promise<Response> {
-      const json = Buffer.from(JSON.stringify(body));
-      const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
-      // Setup lookups (Me, ListModels, CreateAgent) start nothing, so a 5xx is retried in place with a
-      // short backoff before the whole attempt is spent; a 500 is usually gone a second later. Send is
-      // not repeated on the same agent, which may already hold the message; it gets a fresh attempt.
-      const backoff = positiveInt('CURSOR_RPC_RETRY_MS', 1000);
-      for (let tries = 1; ; tries++) {
-        let response: Response;
-        try {
-          response = await fetch(`${url}/sdk.v1.${service}/${method}`, { method: 'POST', signal: rpcSignal, headers: { authorization: `Bearer ${token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
-        } catch (error) {
-          // This socket only reaches the loopback bridge, so a failure here is the bridge dying, never
-          // the internet; it must not be mistaken for an outage the router should wait out.
-          if (rpcSignal.aborted) throw error;
-          throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
-        }
-        if (response.ok) return response;
-        const detail:unknown = await response.json().catch(() => undefined);
-        const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g,'').slice(0,64) : 'unknown';
-        if (connectUnavailable(detail)) throw new ProxyTransportError();
-        // A 5xx is Cursor's own server failing (2026-10-19: Send returned 500 `internal` mid-chat).
-        // Codex runs the tools, so nothing has executed yet and one fresh attempt is safe, the same
-        // single retry native Codex gives a 5xx. 4xx (auth, quota, bad request) stays terminal.
-        const transient = response.status >= 500;
-        if (transient && !stream && tries < 3) {
-          logSafe('cursor-rpc-retry', { service, method, status: response.status, code, attempt: tries });
-          await new Promise<void>((resolve, reject) => {
-            const stop = () => { clearTimeout(timer); reject(rpcSignal.reason); };
-            const timer = setTimeout(() => { rpcSignal.removeEventListener('abort', stop); resolve(); }, backoff * 2 ** (tries - 1));
-            rpcSignal.addEventListener('abort', stop, { once: true });
-          });
-          continue;
-        }
-        // A 5xx that outlasts the retries while Cursor cannot be reached from here is the internet
-        // being down, not Cursor refusing: the router's offline policy holds the request until it returns.
-        const offline = transient && await cursorUnreachable();
-        logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient, offline, tries });
-        if (offline) throw new ProxyTransportError();
-        throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`, transient);
-      }
-    }
-    const models = await verifyCursorProfile(options, key, rpc);
-    const discovered = isRecord(models) && Array.isArray(models.items) ? models.items.find(item => isRecord(item) && item.id === request.model) : undefined;
-    if (!isRecord(discovered) || !Array.isArray(discovered.parameters)) throw new CursorError('Requested model is unavailable on the pinned Cursor account');
-    const definitions = discovered.parameters;
-    const params = selection.params as Array<{ id: string; value: string }>;
-    if (params.some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
-    const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: [] }, disallowedTools: ['task', 'mcp'], local: { cwd: [dir], settingSources: [] } } })).json();
-    if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
-    agentId = created.agentId;
-    const send = async (text: string, attach: typeof images = []): Promise<JsonRecord[]> => {
-      const response = await rpc('SdkAgentService', 'Send', { agentId, message: attach.length ? { text, images: attach } : { text }, options: { enableSteps: true } }, true);
-      if (!response.body) throw new CursorError('Cursor returned an empty stream');
-      const events: JsonRecord[] = [];
-      try {
-        for await (const event of connectFrames(response.body)) {
-          touch();
-          events.push(event);
-          const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
-          if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
-          if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
-        }
-      } catch (error) {
-        // A loopback socket dropping mid-stream is the bridge crashing, not an outage (those arrive as
-        // Connect `unavailable` frames and are rethrown unchanged above).
-        if (error instanceof ProxyTransportError || controller.signal.aborted || !transportError(error)) throw error;
-        throw new CursorError('Cursor bridge stream dropped; no automatic supplier fallback', true);
-      }
-      signal?.throwIfAborted(); controller.signal.throwIfAborted();
-      return events;
-    };
-    const captureDir = join(dirname(options.cwd), 'invalid-output');
-    if (images.length) logSafe('cursor-images-attached', { count: images.length });
-    const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`, images);
+type CursorSession = {
+  agentId: string; signature: string; historyHash: string; historyLength: number;
+  inputLength: number; callIds: Set<string>; expires: number;
+};
+type CursorBridge = {
+  process: Bun.Subprocess<'ignore', 'ignore', 'pipe'>; dir: string; url: string; token: string;
+  id: string; startupMs: number; dead: boolean; agentDirs: Map<string, string>; session?: CursorSession; dispose(): Promise<void>;
+};
+export type CursorBackend = SubscriptionBackend & { close(): Promise<void> };
+// A normal process.exit must not orphan parked bridges. Track immediately after spawn, including
+// children still waiting for their handshake; asynchronous directory cleanup is handled in dispose.
+const residentBridges = new Set<CursorBridge['process']>();
+process.once('exit', () => {
+  for (const child of residentBridges) { try { child.kill(); } catch {} }
+});
+
+/** Bind a continuation to the exact text and images the bridge can read. Responses metadata
+ * (IDs, status, annotations, input_text vs output_text) can be reserialized by Codex. */
+function historyHash(items: unknown[]): string {
+  const prepared = preparePrompt({ model: '', input: items as ResponsesRequest['input'] });
+  return sha256(JSON.stringify(prepared));
+}
+function sessionSignature(request: ResponsesRequest, selection: JsonRecord): string {
+  return JSON.stringify({ selection, instructions: request.instructions, tools: requestTools(request), toolChoice: request.tool_choice, outputLimit: request.max_output_tokens });
+}
+const TOOL_RESULTS = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
+
+class CursorRuntime {
+  private readonly pool: CursorBridgePool<CursorBridge>;
+  private readonly sessions = new Map<string, CursorBridge>();
+  readonly options: Readonly<CursorOptions>;
+  constructor(options: CursorOptions) {
+    this.options = Object.freeze({ ...options });
+    this.pool = new CursorBridgePool(
+      Math.min(32, positiveInt('CURSOR_MAX_BRIDGES', 8)), positiveInt('CURSOR_BRIDGE_IDLE_MS', 120_000),
+      (key, signal) => this.startBridge(key, signal), bridge => bridge.dispose(),
+      bridge => !bridge.dead && bridge.process.exitCode === null,
+    );
+  }
+  close(): Promise<void> { return this.pool.close(); }
+  private forget(bridge: CursorBridge): void {
+    for (const id of bridge.session?.callIds ?? []) if (this.sessions.get(id) === bridge) this.sessions.delete(id);
+    bridge.session = undefined;
+  }
+  private async startBridge(key: string, signal?: AbortSignal): Promise<CursorBridge> {
+    const options = this.options;
+    const started = performance.now();
+    if (sha256(await readFile(options.binary)) !== options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
+    const dir = await mkdtemp(join(options.cwd, 'request-')); await chmod(dir, 0o700);
+    let process: CursorBridge['process'];
     try {
-      return interpretCursorEvents(events, request, selection, captureDir);
+      signal?.throwIfAborted();
+      process = Bun.spawn([options.binary, '--host', '127.0.0.1', '--port', '0', '--workspace', dir, '--state-root', join(dir, 'store'), '--local-store', JSON.stringify({ type: 'jsonl', rootDir: join(dir, 'store') })], { cwd: dir, env: cursorEnvironment(key), stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
+      residentBridges.add(process);
+      const remove = () => { residentBridges.delete(process); };
+      void process.exited.then(remove, remove);
+    } catch (error) { await rm(dir, { recursive: true, force: true }); throw error; }
+    const bridge: CursorBridge = {
+      process, dir, url: '', token: '', id: randomId('bridge'), startupMs: 0, dead: false, agentDirs: new Map(),
+      dispose: () => {
+        if (disposal) return disposal;
+        bridge.dead = true; this.forget(bridge);
+        disposal = (async () => {
+          try { process.kill(); } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'kill' }); }
+          try { await process.exited; } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'exit' }); }
+          try { await rm(dir, { recursive: true, force: true }); } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'directory' }); }
+        })();
+        return disposal;
+      },
+    };
+    let disposal: Promise<void> | undefined;
+    const abort = () => { void bridge.dispose(); };
+    signal?.addEventListener('abort', abort, { once: true });
+    let startup: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const info = await new Promise<JsonRecord>((resolve, reject) => {
+        const startupMs = positiveInt('CURSOR_STARTUP_TIMEOUT_MS', 60_000);
+        startup = setTimeout(() => { logSafe('cursor-startup-timeout', { startupMs }); void bridge.dispose(); reject(new CursorError('Cursor bridge startup timed out', true)); }, startupMs);
+        void (async () => {
+          let line = '', bytes = 0, found = false;
+          try {
+            for await (const chunk of process.stderr) {
+              bytes += chunk.length;
+              if (bytes > MAX_BYTES) throw new CursorError('Cursor diagnostics exceeded safety limit');
+              line += new TextDecoder().decode(chunk);
+              let boundary: number;
+              while ((boundary = line.indexOf('\n')) >= 0) {
+                const current = line.slice(0, boundary); line = line.slice(boundary + 1);
+                if (!found && current.startsWith('cursor-sdk-bridge ready ')) {
+                  const value: unknown = JSON.parse(current.slice(24));
+                  if (!isRecord(value)) throw new Error('invalid handshake');
+                  found = true; clearTimeout(startup); resolve(value);
+                }
+              }
+              if (line.length > 65536) throw new Error('diagnostic line exceeded limit');
+            }
+            if (!found) reject(new CursorError('Cursor bridge exited before ready'));
+          } catch { void bridge.dispose(); reject(new CursorError('Cursor bridge startup or diagnostics failed')); }
+        })();
+      });
+      signal?.throwIfAborted();
+      if (info.schemaVersion !== 1 || info.host !== '127.0.0.1' || info.protocol !== 'connect' || info.transport !== 'tcp' || typeof info.port !== 'number' || typeof info.authTokenFile !== 'string' || typeof info.url !== 'string' || info.url !== `http://127.0.0.1:${info.port}`) throw new CursorError('Cursor returned an invalid local handshake');
+      bridge.url = info.url; bridge.token = (await readFile(info.authTokenFile, 'utf8')).trim();
+      const exited = () => { bridge.dead = true; this.forget(bridge); };
+      void process.exited.then(exited, exited);
+      bridge.startupMs = performance.now() - started;
+      logSafe('cursor-bridge-started', { bridge_id: bridge.id, startup_ms: Math.round(bridge.startupMs) });
+      return bridge;
+    } catch (error) { await bridge.dispose(); signal?.throwIfAborted(); throw error; }
+    finally { clearTimeout(startup); signal?.removeEventListener('abort', abort); }
+  }
+  private async rpc(bridge: CursorBridge, service: string, method: string, body: JsonRecord, signal: AbortSignal, stream = false): Promise<Response> {
+    const json = Buffer.from(JSON.stringify(body));
+    const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
+    const backoff = positiveInt('CURSOR_RPC_RETRY_MS', 1000);
+    for (let tries = 1; ; tries++) {
+      let response: Response;
+      try {
+        response = await fetch(`${bridge.url}/sdk.v1.${service}/${method}`, { method: 'POST', signal, headers: { authorization: `Bearer ${bridge.token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
+      } catch (error) {
+        if (signal.aborted) throw error;
+        throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
+      }
+      if (response.ok) return response;
+      const detail: unknown = await response.json().catch(() => undefined);
+      const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
+      if (connectUnavailable(detail)) throw new ProxyTransportError();
+      const transient = response.status >= 500;
+      if (transient && !stream && tries < 3) {
+        logSafe('cursor-rpc-retry', { service, method, status: response.status, code, attempt: tries });
+        await new Promise<void>((resolve, reject) => {
+          const stop = () => { clearTimeout(timer); reject(signal.reason); };
+          const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, backoff * 2 ** (tries - 1));
+          signal.addEventListener('abort', stop, { once: true });
+          if (signal.aborted) stop();
+        });
+        continue;
+      }
+      const offline = transient && await cursorUnreachable();
+      logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient, offline, tries });
+      if (offline) throw new ProxyTransportError();
+      throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`, transient);
+    }
+  }
+  async run(request: ResponsesRequest, signal?: AbortSignal, retryNote = '', lastAttempt = false): Promise<ProxyOutput> {
+    signal?.throwIfAborted();
+    const started = performance.now(), requestId = randomId('cursor');
+    const sanitized = sanitizeCursorInput(request.input);
+    if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
+    request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
+    const selection = cursorSelection(request.model, request.reasoning?.effort, this.options.fastest);
+    const key = readCursorKey(this.options);
+    signal?.throwIfAborted();
+    const signature = sessionSignature(request, selection);
+    let preferred: CursorBridge | undefined;
+    const reuseBridge = process.env.CURSOR_BRIDGE_REUSE !== '0';
+    const reuseSession = reuseBridge && process.env.CURSOR_SESSION_REUSE !== '0';
+    if (!retryNote && reuseSession && Array.isArray(request.input)) {
+      for (let i = request.input.length - 1; i >= 0; i--) {
+        const callId = request.input[i]?.call_id;
+        if (callId && this.sessions.has(callId)) { preferred = this.sessions.get(callId); break; }
+      }
+    }
+    const controller = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    let lease: CursorLease<CursorBridge> | undefined;
+    let bridge: CursorBridge | undefined;
+    let agentId = '', runId = '', timedOut = false, successful = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    let cancellation: Promise<void> | undefined;
+    const idleMs = positiveInt('CURSOR_TIMEOUT_MS', 300_000);
+    const touch = () => { clearTimeout(timeout); timeout = setTimeout(() => { timedOut = true; cancel(); }, idleMs); };
+    const cancel = () => {
+      controller.abort();
+      // This request exclusively owns the bridge lease, including any retained agent. No other
+      // request can run here until release, so a hard stop is safe even before a run ID arrives.
+      if (bridge) {
+        const owned = bridge;
+        cancellation = (runId ? fetch(`${owned.url}/sdk.v1.SdkAgentService/CancelRun`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${owned.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId, runId }) }).then(() => {}, () => {}) : Promise.resolve()).then(() => owned.dispose());
+      }
+    };
+    signal?.addEventListener('abort', cancel, { once: true });
+    let queuedMs = 0, setupMs = 0, runMs = 0, firstEventMs = 0, continued = false;
+    try {
+      const queued = performance.now();
+      lease = await this.pool.acquire(key, combined, preferred);
+      queuedMs = performance.now() - queued;
+      bridge = lease.value;
+      if (!lease.reused) queuedMs = Math.max(0, queuedMs - bridge.startupMs);
+      combined.throwIfAborted(); touch();
+      // Check at the point a queued request actually acquires ownership. New children verify before
+      // spawn; warm children rehash here. Rotation/expiry while queued cannot inherit a stale login.
+      if (lease.reused && sha256(await readFile(this.options.binary)) !== this.options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
+      if (readCursorKey(this.options) !== key) throw new CursorError('Cursor credential changed while queued; retry the turn', true);
+      combined.throwIfAborted();
+      const activeBridge = bridge;
+      const rpc = (service: string, method: string, body: JsonRecord) => this.rpc(activeBridge, service, method, body, combined);
+      const models = await verifyCursorProfile(this.options, key, rpc, combined);
+      const discovered = isRecord(models) && Array.isArray(models.items) ? models.items.find(item => isRecord(item) && item.id === request.model) : undefined;
+      if (!isRecord(discovered) || !Array.isArray(discovered.parameters)) throw new CursorError('Requested model is unavailable on the pinned Cursor account');
+      const definitions = discovered.parameters;
+      const params = selection.params as Array<{ id: string; value: string }>;
+      if (params.some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
+      let promptRequest = request;
+      const session = bridge.session;
+      if (!retryNote && reuseSession && session && session.expires > Date.now() && session.signature === signature && Array.isArray(request.input) && request.input.length > session.historyLength && historyHash(request.input.slice(0, session.historyLength)) === session.historyHash) {
+        const suffix = request.input.slice(session.historyLength);
+        const results = new Set(suffix.filter(item => TOOL_RESULTS.has(item.type ?? '')).map(item => item.call_id));
+        if (TOOL_RESULTS.has(suffix[0]?.type ?? '') && [...session.callIds].every(id => results.has(id))) {
+          agentId = session.agentId; continued = true;
+          // Include the previous assistant calls so generated Codex call IDs are explicit, followed
+          // only by the new tool results/messages. All earlier context stays in this agent.
+          promptRequest = { ...request, instructions: undefined, tools: undefined, input: request.input.slice(session.inputLength) };
+        }
+      }
+      this.forget(bridge);
+      if (!continued) {
+        if (session) await this.closeAgent(bridge, session.agentId);
+        const agentDir = await mkdtemp(join(bridge.dir, 'agent-')); await chmod(agentDir, 0o700);
+        const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: [] }, disallowedTools: ['task', 'mcp'], local: { cwd: [agentDir], settingSources: [] } } })).json();
+        if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
+        agentId = created.agentId;
+        bridge.agentDirs.set(agentId, agentDir);
+      }
+      const prepared = preparePrompt(promptRequest);
+      const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
+      setupMs = performance.now() - started;
+      const send = async (text: string, attach: typeof images = []): Promise<JsonRecord[]> => {
+        const response = await this.rpc(activeBridge, 'SdkAgentService', 'Send', { agentId, message: attach.length ? { text, images: attach } : { text }, options: { enableSteps: true } }, combined, true);
+        if (!response.body) throw new CursorError('Cursor returned an empty stream');
+        const events: JsonRecord[] = [];
+        try {
+          for await (const event of connectFrames(response.body)) {
+            touch();
+            if (!firstEventMs) firstEventMs = performance.now() - started;
+            events.push(event);
+            const sdk = isRecord(event.sdkMessage) && isRecord(event.sdkMessage.message) ? event.sdkMessage.message : undefined;
+            if (sdk && typeof (sdk.runId ?? sdk.run_id) === 'string') runId = String(sdk.runId ?? sdk.run_id);
+            if (isRecord(event.result) && typeof event.result.runId === 'string') runId = event.result.runId;
+          }
+        } catch (error) {
+          if (error instanceof ProxyTransportError || combined.aborted || !transportError(error)) throw error;
+          throw new CursorError('Cursor bridge stream dropped; no automatic supplier fallback', true);
+        }
+        combined.throwIfAborted(); return events;
+      };
+      const captureDir = join(dirname(this.options.cwd), 'invalid-output');
+      if (images.length) logSafe('cursor-images-attached', { count: images.length });
+      const generation = performance.now();
+      const events = await send(`${OUTPUT_RULES}${retryNote}\n\n${prepared.prompt}\n\n${OUTPUT_RULES}`, images);
+      let output: ProxyOutput;
+      try { output = interpretCursorEvents(events, request, selection, captureDir); }
+      catch (error) {
+        if (!(error instanceof CursorProseError)) throw error;
+        logSafe('cursor-prose-correction', {});
+        output = interpretCursorEvents(await send(PROSE_CORRECTION), request, selection, captureDir, lastAttempt);
+      }
+      runMs = performance.now() - generation;
+      combined.throwIfAborted(); successful = true;
+      if (output.toolCalls.length && reuseSession && Array.isArray(request.input)) {
+        const prior = [...request.input, ...responseObject(request, output).output];
+        const retained: CursorSession = { agentId, signature, historyHash: historyHash(prior), historyLength: prior.length, inputLength: request.input.length, callIds: new Set(output.toolCalls.flatMap(call => call.callId ? [call.callId] : [])), expires: Date.now() + positiveInt('CURSOR_SESSION_IDLE_MS', 900_000) };
+        bridge.session = retained;
+        for (const id of retained.callIds) this.sessions.set(id, bridge);
+      }
+      return output;
     } catch (error) {
-      // A fresh agent given the same prompt repeats the same narration, so ask the agent that wrote
-      // it to wrap its own sentence while it still holds the context. Nothing has run yet.
-      if (!(error instanceof CursorProseError)) throw error;
-      logSafe('cursor-prose-correction', {});
-      return interpretCursorEvents(await send(PROSE_CORRECTION), request, selection, captureDir, lastAttempt);
+      if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic supplier fallback`, true);
+      throw error;
+    } finally {
+      clearTimeout(timeout); signal?.removeEventListener('abort', cancel);
+      logSafe('cursor-turn', { request_id: requestId, bridge_id: bridge?.id, model: request.model, reused: lease?.reused ?? false, continued, success: successful, queue_ms: Math.round(queuedMs), setup_ms: Math.round(setupMs), first_event_ms: Math.round(firstEventMs), run_ms: Math.round(runMs), elapsed_ms: Math.round(performance.now() - started) });
+      if (cancellation) await cancellation;
+      if (lease && bridge) {
+        if (!successful || combined.aborted || bridge.dead) await lease.discard();
+        else if (!reuseBridge) {
+          try { await this.closeAgent(bridge, agentId); } catch {}
+          await lease.discard();
+        }
+        else if (bridge.session) lease.release();
+        else {
+          const owned = lease, activeBridge = bridge, cleanup = performance.now();
+          // Release validated output immediately. The exclusive lease remains held until agent
+          // cleanup finishes; a subsequent request can never race this agent's close or disposal.
+          void this.closeAgent(activeBridge, agentId).then(() => owned.release(), () => {
+            logSafe('cursor-cleanup-failed', { request_id: requestId, stage: 'agent-close' });
+            return owned.discard();
+          }).finally(() => logSafe('cursor-cleanup', { request_id: requestId, elapsed_ms: Math.round(performance.now() - cleanup) }));
+        }
+      }
     }
-  } catch (error) {
-    // The watchdog aborts the local fetch, which surfaces as a bare AbortError. Name it so Codex
-    // shows the real cause instead of the generic internal-router message.
-    if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic supplier fallback`, true);
-    throw error;
-  } finally {
-    clearTimeout(timeout); clearTimeout(startup); signal?.removeEventListener('abort', cancel);
-    if (cancellation) await cancellation;
-    if (proc && url && token && !controller.signal.aborted) {
-      try { await fetch(`${url}/sdk.v1.SdkAgentService/CloseAgent`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId }) }); } catch {}
-    }
-    // Killing this dedicated local bridge ends in-flight runs even if Send disconnected. No shared
-    // bridge is reused, so cancellation can never stop another account/thread's run.
-    proc?.kill(); if (proc) await proc.exited;
-    await rm(dir, { recursive: true, force: true });
+  }
+  private async closeAgent(bridge: CursorBridge, agentId: string): Promise<void> {
+    if (!agentId) return;
+    const response = await fetch(`${bridge.url}/sdk.v1.SdkAgentService/CloseAgent`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${bridge.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId }) });
+    if (!response.ok) throw new CursorError('Cursor agent cleanup failed', true);
+    const dir = bridge.agentDirs.get(agentId);
+    if (dir) { await rm(dir, { recursive: true, force: true }); bridge.agentDirs.delete(agentId); }
   }
 }
 
-export function createCursorBackend(options: CursorOptions): SubscriptionBackend {
+export function createCursorBackend(options: CursorOptions): CursorBackend {
   if (![options.binary, options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt','grok','claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId || !/^[a-f0-9]{64}$/.test(options.binaryHash)) throw new Error('Cursor requires absolute paths, a pinned bridge, account identity and a model namespace');
   const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'claude-opus-5-5'];
+  const runtime = new CursorRuntime(options);
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
     catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
-    run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runCursorOnce(options, request, signal, note, last)),
+    run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runtime.run(request, signal, note, last)),
+    close: () => runtime.close(),
   };
 }
-export function configuredCursorBackend(env: Readonly<Record<string, string | undefined>> = process.env): SubscriptionBackend | undefined {
+export function configuredCursorBackend(env: Readonly<Record<string, string | undefined>> = process.env): CursorBackend | undefined {
   if (!env.CURSOR_BRIDGE_BIN) return undefined;
   return createCursorBackend({ binary: env.CURSOR_BRIDGE_BIN, binaryHash: env.CURSOR_BRIDGE_SHA256 ?? '', authFile: env.CURSOR_AUTH_FILE ?? '', cwd: env.CURSOR_CWD ?? '', expectedEmail: env.CURSOR_EXPECTED_EMAIL ?? '', expectedUserId: env.CURSOR_EXPECTED_USER_ID ?? '', prefix: env.CURSOR_MODEL_PREFIX || 'cursor', label: env.CURSOR_LABEL || 'Cursor', fastest: env.CURSOR_SPEED_POLICY === 'fastest' });
 }

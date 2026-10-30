@@ -22,8 +22,9 @@ beforeAll(async () => {
   // Claude stand-in: a stream-json CLI keyed on tokens in the user message.
   const claude = scratch + '/claude';
   await Bun.write(claude, `#!/bin/sh
-echo $$ > ${scratch}/claude.pid
 while IFS= read -r input; do
+  # Recorded on receipt: the router may also prewarm an idle standby CLI that never gets this prompt.
+  echo $$ > ${scratch}/claude.pid
   case "$input" in
     *CLI_CRASH*) echo 'claude: fatal internal panic' 1>&2; exit 3;;
     *CLI_GARBAGE*) echo 'not json at all'; echo '{"type":"unexpected"}'; sleep 30;;

@@ -7,6 +7,11 @@ import { loadConfig } from './config';
 import { log } from './log';
 import { startRouter } from './router/server';
 
+// Default signal termination skips normal exit hooks. Let the entrypoint preserve conventional
+// signal exit codes while backend hooks synchronously stop every parked/starting child process.
+process.once('SIGTERM', () => process.exit(143));
+process.once('SIGINT', () => process.exit(130));
+
 // Last-resort guard. A broken pipe to an exited CLI child must fail only that request; letting it
 // escape kills the router and every open chat. Anything else is a real bug: log its shape (never
 // its message, which may hold content) and exit so the supervisor restarts a clean process.
@@ -39,5 +44,6 @@ const server = startRouter({
   bridgeModels: config.bridgeModels,
   secondaryAccount: config.secondaryAccount,
   primaryStandard: config.primaryStandard,
+  upstreamWebSocket: config.upstreamWebSocket,
 });
 console.log(`codex-subscription-proxy listening on http://127.0.0.1:${server.port}`);

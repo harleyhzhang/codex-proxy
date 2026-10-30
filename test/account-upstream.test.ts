@@ -1,9 +1,10 @@
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { AccountUpstream, nativeAccountRequest, standardPrimaryFetch, type AccountOptions } from '../src/router/account-upstream';
 import { startRouter } from '../src/router/server';
 import { buildCatalog } from '../src/catalog';
+import { requestJson } from '../src/router/json-request';
 
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(dirs.splice(0).map(dir => rm(dir, { recursive: true, force: true }))); });
@@ -91,6 +92,69 @@ test('concurrent expired requests share native refresh and re-read the renewed i
   await write(0); options.refresh = async () => { throw new Error('synthetic secret must not be surfaced'); };
   await expect(router.fetch(target, request('secondary-gpt-6-astra'))).rejects.toThrow('Secondary Codex login unavailable');
   expect(calls).toBe(5);
+});
+
+test('secondary routing keeps the inspected JSON snapshot if a caller replaces its body during refresh', async () => {
+  const { options, write } = await fixture(0);
+  let release!: () => void;
+  let started!: () => void;
+  const refreshing = new Promise<void>(resolve => { started = resolve; });
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  options.refresh = async () => { started(); await pending; await write(Date.now() / 1000 + 3600); };
+  const init = request('secondary-gpt-6-astra', 'priority', 'max');
+  const original = JSON.parse(String(init.body)) as Record<string, unknown>;
+  original.future_field = { nested: ['synthetic', null, 3] };
+  init.body = JSON.stringify(original);
+  const controller = new AbortController(); init.signal = controller.signal;
+  const router = new AccountUpstream(options, async (_url, sent) => {
+    expect(JSON.parse(String(sent.body))).toEqual({ ...original, model: 'gpt-6-astra' });
+    expect(sent.signal).toBe(controller.signal);
+    expect(new Headers(sent.headers).get('chatgpt-account-id')).toBe('secondary-space');
+    return new Response('{}');
+  });
+  const response = router.fetch(target, init);
+  await refreshing;
+  init.body = JSON.stringify({ model: 'gpt-different', service_tier: 'default', future_field: 'replacement' });
+  release();
+  expect((await response).status).toBe(200);
+});
+
+test('alternate transports share account refresh flights, identity and fastest-tier policy', async () => {
+  const { options, write } = await fixture(0);
+  options.fastest = true;
+  let refreshes = 0, defaults = 0;
+  options.refresh = async () => { refreshes++; await Bun.sleep(10); await write(Date.now() / 1000 + 3600); };
+  const account = new AccountUpstream(options, async () => { defaults++; return new Response('{}'); });
+  const calls: string[] = [];
+  const alternate = (label: string) => account.withTransport(async (_url, sent) => {
+    expect(JSON.parse(String(sent.body))).toMatchObject({ model: 'gpt-6-astra', service_tier: 'ultrafast', reasoning: { effort: 'max' } });
+    expect(new Headers(sent.headers).get('chatgpt-account-id')).toBe('secondary-space');
+    calls.push(label); return new Response('{}');
+  });
+  await Promise.all([alternate('one')(target, request('secondary-gpt-6-astra', 'default', 'max')), alternate('two')(target, request('secondary-gpt-6-astra', 'default', 'max'))]);
+  expect(refreshes).toBe(1); expect(defaults).toBe(0); expect(calls.sort()).toEqual(['one', 'two']);
+  await account.fetch(target, request('secondary-gpt-6-astra'));
+  expect(refreshes).toBe(1); expect(defaults).toBe(1);
+});
+
+test('secondary forwarding and a forced-refresh retry retain the parsed JSON snapshot for alternate transports', async () => {
+  const { options, write } = await fixture(); options.fastest = true;
+  let calls = 0, refreshes = 0;
+  options.refresh = async () => { refreshes++; await write(Date.now() / 1000 + 7200); };
+  const account = new AccountUpstream(options, async () => { throw new Error('default transport must not run'); });
+  const route = account.withTransport(async (_url, sent) => {
+    expect(requestJson(sent)).toMatchObject({ model: 'gpt-6-astra', service_tier: 'ultrafast', benchmark_marker: 'secondary-json', reasoning: { effort: 'max' } });
+    return new Response('{}', { status: ++calls === 1 ? 401 : 200 });
+  });
+  const init = request('secondary-gpt-6-astra', 'default', 'max');
+  init.body = JSON.stringify({ ...JSON.parse(String(init.body)), benchmark_marker: 'secondary-json', future_field: { opaque: [null, 3] } });
+  const parses = spyOn(JSON, 'parse'), serializes = spyOn(JSON, 'stringify');
+  try {
+    expect((await route(target, init)).status).toBe(200);
+    expect(calls).toBe(2); expect(refreshes).toBe(1);
+    expect(parses.mock.calls.filter(([text]) => text.includes('secondary-json'))).toHaveLength(1);
+    expect(serializes.mock.calls.filter(([value]) => typeof value === 'object' && value !== null && 'benchmark_marker' in value)).toHaveLength(1);
+  } finally { parses.mockRestore(); serializes.mockRestore(); }
 });
 
 test('a stale models cache earns one shared native catalog refresh; a failed refresh still refuses', async () => {

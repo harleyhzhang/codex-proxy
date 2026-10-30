@@ -1,11 +1,12 @@
-import { realpathSync, existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve, join, isAbsolute } from 'node:path';
 // Claude through the official Claude Code CLI. Each turn is one `claude -p` stream-json session
 // with every native tool disabled; Codex's tools are described in the prompt and requested
 // through structured output. A session that returned tool calls stays alive briefly so the next
 // turn only has to send the tool results.
-import { childEnvironment, positiveInt } from '../env';
+import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
 import { isRecord, randomId } from '../json';
 import { logSafe } from '../log';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
@@ -129,12 +130,29 @@ const CLAUDE_BLOCKED_ENV = new Set(['CLAUDECODE', 'PROXY_API_KEY', 'CLAUDE_CODE_
  */
 const IDENTITY_STALL_GRACE_MS = 6 * 60 * 60_000;
 
+/**
+ * How long a verified identity is reused without a fresh `auth status`, while the profile's local
+ * account binding (account, organization, email, credential file) is unchanged. Short on purpose:
+ * it absorbs bursts of fresh turns (subagent fan-out, a new user turn after each answer) without
+ * standing in for a real check. 0 probes before every fresh session.
+ */
+const IDENTITY_CACHE_MS = 60_000;
+
+type SharedProbe = { binding: string | undefined; done: Promise<void>; controller: AbortController; waiters: number };
+
+// Unclaimed standbys die with the router instead of outliving it as orphans holding its pipes.
+const parkedWorkers = new Set<ClaudeWorker>();
+process.once('exit', () => { for (const worker of parkedWorkers) worker.discard(); });
+
 /** Each login owns its warm workers, quota snapshot and usage sink. */
 export class ClaudeAccount {
   readonly workers = new Map<string, ClaudeWorker>();
   rateLimitSink?: (info: unknown) => void;
   readonly options: Readonly<ClaudeAccountOptions>;
   private verifiedAt = 0;
+  private verifiedBinding?: string;
+  private probe?: SharedProbe;
+  private readonly standbys: ClaudeWorker[] = [];
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
   onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
   environment(): Record<string, string> {
@@ -143,35 +161,114 @@ export class ClaudeAccount {
     return env;
   }
   binary(): string { return this.options.binary ?? process.env.CLAUDE_BIN ?? 'claude'; }
-  async verifyIdentity(signal?: AbortSignal): Promise<void> {
+  cwd(): string { return this.options.cwd ?? process.env.CLAUDE_CWD ?? process.cwd(); }
+
+  /**
+   * A digest of who this profile is signed in as, read from the CLI's own local account record. It
+   * changes on a different login, logout or credential rewrite; routine fields such as
+   * `profileFetchedAt` are left out so the CLI's frequent rewrites of `.claude.json` do not count.
+   * Undefined when the record is missing or unreadable, which disables the cache.
+   */
+  private binding(): string | undefined {
+    const dir = this.options.configDir ?? process.env.CLAUDE_CONFIG_DIR;
+    const record = dir ? join(dir, '.claude.json') : join(homedir(), '.claude.json');
+    try {
+      const data: unknown = JSON.parse(readFileSync(record, 'utf8'));
+      const account = isRecord(data) && isRecord(data.oauthAccount) ? data.oauthAccount : undefined;
+      if (!account || typeof account.accountUuid !== 'string') return undefined;
+      let credential = 'none';
+      try {
+        const stat = statSync(join(dir ?? join(homedir(), '.claude'), '.credentials.json'));
+        credential = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+      } catch {}
+      return createHash('sha256').update(JSON.stringify([this.binary(), record, account.accountUuid, account.organizationUuid, account.emailAddress, credential])).digest('hex');
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Confirms the login before a fresh session. Concurrent callers for the same local binding share
+   * one probe, and a recent match is reused. A probe only vouches for the binding it started under:
+   * if the profile changes while it runs, the answer is discarded and the new login is probed.
+   */
+  async verifyIdentity(signal?: AbortSignal): Promise<{ cached: boolean }> {
     signal?.throwIfAborted();
-    if (!this.options.expectedEmail && !this.options.expectedOrg) return;
+    if (!this.options.expectedEmail && !this.options.expectedOrg) return { cached: false };
+    const cacheMs = nonNegativeInt('CLAUDE_IDENTITY_CACHE_MS', IDENTITY_CACHE_MS);
+    let binding = this.binding();
+    if (binding && binding === this.verifiedBinding && Date.now() - this.verifiedAt < cacheMs) return { cached: true };
+    for (let attempt = 1; ; attempt++) {
+      await this.awaitProbe(binding, signal);
+      const now = this.binding();
+      if (now === binding) return { cached: false };
+      if (attempt === 2) throw new BackendError('Claude login changed during its identity check; retry the turn', { retryable: true });
+      binding = now;
+    }
+  }
+
+  private async awaitProbe(binding: string | undefined, signal?: AbortSignal): Promise<void> {
+    const current = this.probe;
+    const probe = current && current.binding === binding && !current.controller.signal.aborted ? current : this.startProbe(binding);
+    probe.waiters++;
+    try {
+      if (!signal) await probe.done;
+      else await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error('Claude request cancelled'));
+        signal.addEventListener('abort', abort, { once: true });
+        probe.done.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+      });
+    } finally {
+      // The last caller to give up stops the probe; one cancelled turn never fails the others.
+      if (--probe.waiters === 0 && signal?.aborted) {
+        probe.controller.abort();
+        if (this.probe === probe) this.probe = undefined;
+      }
+    }
+    signal?.throwIfAborted();
+  }
+
+  private startProbe(binding: string | undefined): SharedProbe {
+    const controller = new AbortController();
+    const probe: SharedProbe = { binding, done: this.probeIdentity(binding, controller.signal), controller, waiters: 0 };
+    this.probe = probe;
+    probe.done.then(() => {}, () => {}).finally(() => { if (this.probe === probe) this.probe = undefined; });
+    return probe;
+  }
+
+  private async probeIdentity(binding: string | undefined, signal: AbortSignal): Promise<void> {
     const started = Date.now();
     const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: IDENTITY_PROBE_TIMEOUT_MS, signal});
     const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
     // A cancelled turn kills the probe (SIGTERM, exit 143); that is the caller's abort, not an account problem.
-    signal?.throwIfAborted();
+    if (signal.aborted) throw new Error('Claude identity check cancelled');
     let status: unknown;
     try { status = JSON.parse(output); } catch {}
     const info = isRecord(status) ? status : undefined;
     const emailMatch = !this.options.expectedEmail || info?.email === this.options.expectedEmail;
     const orgMatch = !this.options.expectedOrg || info?.orgId === this.options.expectedOrg;
     const answered = !!info?.loggedIn && emailMatch && orgMatch;
-    if (exitCode === 0 && answered) { this.verifiedAt = Date.now(); return; }
+    // The cache and stall grace bind to the profile the probe ran under, and only while it is unchanged.
+    // A profile that changed during the probe gets a binding no later probe can match.
+    const verified = () => { this.verifiedAt = Date.now(); this.verifiedBinding = this.binding() === binding ? binding : 'changed-during-probe'; };
+    if (exitCode === 0 && answered) { verified(); return; }
     // Bun reports the spawn-timeout SIGTERM as exit 143 and leaves `signalCode` null, so both spellings
     // mean "our own deadline killed it". When the full answer had already been written before that kill
     // (stdout parsed, logged in, email and org match), the account is verified: the CLI's slow teardown
     // under machine stall is not evidence about the login, and refusing it fails a healthy turn.
     const killed = child.signalCode !== null || exitCode === 143;
     if (killed && answered) {
-      this.verifiedAt = Date.now();
+      verified();
       logSafe('claude-identity-check-slow', { ms: Date.now() - started, exit: exitCode });
       return;
     }
     // A probe killed before it wrote anything is a machine stall. A recent verification of this same
     // login still stands; any parsed answer that is not a match means the login changed and clears it.
-    if (info) this.verifiedAt = 0;
-    else if (killed && this.verifiedAt && Date.now() - this.verifiedAt < IDENTITY_STALL_GRACE_MS) {
+    if (info) { this.verifiedAt = 0; this.verifiedBinding = undefined; this.dropStandbys(); }
+    // The grace covers only the login that was verified: a changed local binding needs a real answer. A
+    // profile with no readable account record at either check keeps the earlier behaviour; the cache
+    // above never applies to it.
+    else if (killed && this.verifiedAt && binding === this.verifiedBinding && Date.now() - this.verifiedAt < IDENTITY_STALL_GRACE_MS) {
       logSafe('claude-identity-check-stale', { ms: Date.now() - started, exit: exitCode, verified_ago_ms: Date.now() - this.verifiedAt });
       return;
     }
@@ -189,6 +286,38 @@ export class ClaudeAccount {
     if (!info.loggedIn) throw new BackendError('Claude account is not logged in for this configuration');
     throw new BackendError('Claude account identity does not match its configured login');
   }
+
+  /** A prewarmed CLI launched with exactly these arguments, if one is idle. */
+  takeStandby(key: string): ClaudeWorker | undefined {
+    const index = this.standbys.findIndex((worker) => worker.launchKey === key && worker.idle);
+    const [worker] = index >= 0 ? this.standbys.splice(index, 1) : [];
+    this.pruneStandbys();
+    return worker;
+  }
+
+  /**
+   * Prewarms the next fresh session with the same arguments, so it skips CLI startup. Called only after
+   * this account's identity check passed; a standby still waits for its own check before any prompt.
+   * The newest arguments win when the cap is reached, since they are the likeliest to come next.
+   */
+  keepStandby(request: ResponsesRequest, key: string): void {
+    const max = nonNegativeInt('CLAUDE_STANDBY_MAX', 1);
+    this.pruneStandbys();
+    if (!max || this.standbys.some((worker) => worker.launchKey === key)) return;
+    while (this.standbys.length >= max) this.standbys.shift()?.close();
+    // An unclaimed standby closes its stdin when the window passes, and the CLI exits.
+    this.standbys.push(new ClaudeWorker(request, this, key, positiveInt('CLAUDE_STANDBY_IDLE_MS', 120_000)));
+  }
+
+  private pruneStandbys(): void {
+    for (let index = this.standbys.length - 1; index >= 0; index--) if (!this.standbys[index]!.idle) this.standbys.splice(index, 1);
+  }
+
+  /** A login that no longer matches retires every prewarmed CLI started under it. */
+  private dropStandbys(): void {
+    for (const worker of this.standbys.splice(0)) worker.discard();
+  }
+
   run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
     // One attempt. A dropped connection surfaces as a transport error and the router's shared
     // offline policy (`localResponse`) keeps the request pending and retries it.
@@ -203,7 +332,7 @@ type PendingTurn = { resolve: (result: ClaudeResult) => void; reject: (error: Er
 
 class ClaudeWorker {
   readonly model: string;
-  readonly signature: string;
+  signature: string;
   readonly callIds = new Set<string>();
   private readonly process: Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
   private pending?: PendingTurn;
@@ -211,17 +340,27 @@ class ClaudeWorker {
   private idleTimer?: ReturnType<typeof setTimeout>;
   private touch?: () => void;
   private closed = false;
+  private used = false;
 
-  constructor(request: ResponsesRequest, readonly account: ClaudeAccount) {
+  constructor(request: ResponsesRequest, readonly account: ClaudeAccount, readonly launchKey = workerLaunchKey(request, account), parkedForMs?: number) {
     this.model = request.model;
     this.signature = sessionSignature(request);
     this.process = Bun.spawn([account.binary(), ...buildClaudeArgs(request)], {
       stdin: 'pipe',
       stdout: 'pipe',
       stderr: 'pipe',
-      cwd: account.options.cwd ?? process.env.CLAUDE_CWD ?? process.cwd(),
+      cwd: account.cwd(),
       env: account.environment(),
     });
+    // A parked standby must not keep the router alive. Bun pins the event loop for any pipe read
+    // that starts before `unref`, so this has to happen before the readers below.
+    if (parkedForMs !== undefined) {
+      this.process.unref();
+      this.process.stdin.unref();
+      parkedWorkers.add(this);
+      this.idleTimer = setTimeout(() => this.close(), parkedForMs);
+      this.idleTimer.unref?.();
+    }
     const stdoutDone = this.readStdout().catch((cause: unknown) => this.fail(cause));
     void this.readStderr();
     void this.process.exited.then(async (exitCode) => {
@@ -236,10 +375,26 @@ class ClaudeWorker {
     });
   }
 
+  /** Started and never given a turn, so it holds no conversation and can serve any matching request. */
+  get idle(): boolean { return !this.closed && !this.used && !this.pending; }
+
+  /** Binds a fresh (never used) session to the request that will run in it. */
+  adopt(request: ResponsesRequest): void {
+    clearTimeout(this.idleTimer);
+    parkedWorkers.delete(this);
+    this.process.ref();
+    this.process.stdin.ref();
+    this.signature = sessionSignature(request);
+  }
+
+  /** Ends a session that never received a prompt, such as one whose identity check failed. */
+  discard(): void { this.abort(); }
+
   run(prompt: string, images: ImageBlock[], signal?: AbortSignal): Promise<ClaudeResult> {
     signal?.throwIfAborted();
     if (this.closed) throw new Error('Claude CLI worker is closed');
     if (this.pending) throw new Error('Claude CLI worker is already processing a turn');
+    this.used = true;
     clearTimeout(this.idleTimer);
     // Bound the turn by silence, like native Codex (DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s): any
     // stdout byte restarts the window, and the idle timeout is retried like a dropped stream.
@@ -308,11 +463,19 @@ class ClaudeWorker {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    parkedWorkers.delete(this);
     clearTimeout(this.idleTimer);
     this.detach();
     try {
       this.process.stdin.end();
     } catch {}
+    // A standby that never ran a turn holds nothing worth a graceful exit, and a CLI slow to honour EOF
+    // must not linger untracked once it leaves the parked set: idle expiry and eviction end it outright.
+    if (!this.used) {
+      try {
+        this.process.kill();
+      } catch {}
+    }
   }
 
   private abort(): void {
@@ -350,6 +513,12 @@ class ClaudeWorker {
   }
 
   private acceptLine(line: string): void {
+    // A CLI that has not been sent a prompt has nothing legitimate to report. Its output must never
+    // reach this account's quota state or a later turn, so a standby that speaks first is retired.
+    if (!this.used) {
+      if (line.trim()) this.abort();
+      return;
+    }
     let record: unknown;
     try {
       record = JSON.parse(line);
@@ -407,10 +576,30 @@ function sessionSignature(request: ResponsesRequest): string {
   });
 }
 
+/** Everything a fresh CLI is launched with. Only an identical launch may stand in for another. */
+function workerLaunchKey(request: ResponsesRequest, account: ClaudeAccount): string {
+  return JSON.stringify([account.binary(), account.cwd(), request.model, buildClaudeArgs(request)]);
+}
+
 async function startClaudeWorker(request: ResponsesRequest, account: ClaudeAccount, signal?: AbortSignal): Promise<ClaudeWorker> {
-  await account.verifyIdentity(signal);
-  signal?.throwIfAborted();
-  return new ClaudeWorker(request, account);
+  const started = performance.now();
+  const key = workerLaunchKey(request, account);
+  const standby = account.takeStandby(key);
+  // The CLI starts (or is already warm) while the identity is checked. Nothing is written to it until
+  // the check passes, and a failed or cancelled check ends it unused, so no prompt reaches a wrong login.
+  const worker = standby ?? new ClaudeWorker(request, account, key);
+  let identity: { cached: boolean };
+  try {
+    identity = await account.verifyIdentity(signal);
+    signal?.throwIfAborted();
+  } catch (error) {
+    worker.discard();
+    throw error;
+  }
+  worker.adopt(request);
+  account.keepStandby(request, key);
+  logSafe('claude-worker-start', { standby: !!standby, identity_cached: identity.cached, ms: Math.round(performance.now() - started) });
+  return worker;
 }
 
 /** The live session from this account that issued the newest tool call, if it can continue. */

@@ -99,9 +99,10 @@ test('second Claude account is opt-in with explicit labels, namespaces and nativ
 
 test('cancellation stops a pending identity check without launching inference', async () => {
   const f=await fixtures();
+  // The session CLI may already be starting while the check runs; inference means a prompt reached it.
   await Bun.write(f.binary, `#!/usr/bin/env bun
 if(process.argv.includes('status')) await Bun.sleep(30000);
-else await Bun.write(${JSON.stringify(join(f.dir,'generated'))}, 'unexpected generation');
+else for await (const line of (await import('node:readline')).createInterface({input: process.stdin})) await Bun.write(${JSON.stringify(join(f.dir,'generated'))}, 'unexpected generation');
 `);
   const account=new ClaudeAccount({binary:f.binary,configDir:f.secondary,expectedEmail:'work@example.com'});
   const controller=new AbortController();

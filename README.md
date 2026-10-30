@@ -6,7 +6,7 @@ The proxy sits between Codex and `chatgpt.com`. GPT requests pass straight throu
 Claude or Grok model are answered by the official `claude` or `grok` CLI, signed in with your own
 subscription. Codex keeps running every tool, so approvals, sandboxing and history work as usual,
 and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
-Grok and GPT models from a Cursor subscription without changing the Codex app.
+Grok and Claude models from a Cursor subscription without changing the Codex app.
 
 ```
 Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT models)
@@ -43,6 +43,19 @@ Restart Codex. Claude and Grok now appear in the model picker. Re-run `bun run c
 Codex updates its own model list.
 
 ## Connection recovery
+
+GPT WebSocket clients keep their own upstream WebSocket, including Codex's
+non-generating connection warmup. A continuation sends only new input when its
+previous response and complete history prefix match the same connection.
+Account, authorization or model changes start a new connection; a lost upstream
+response earns one full-history replay before output is exposed. Unsupported
+upgrades fall back to HTTP. HTTP clients continue to use HTTP. Set
+`UPSTREAM_WEBSOCKET=0` to use the former HTTP relay for every client.
+
+Secondary-account identity checks, token refresh and speed policies are shared
+by both transports. Each client's connection and history stay separate.
+
+### Network outages
 
 A network outage is handled once, at the router level, for every backend: Claude (primary,
 secondary and the quota fallback), Grok, Cursor, the GPT relay on HTTP and WebSocket, and GPT
@@ -234,20 +247,38 @@ bun run catalog
 bun start
 ```
 
-The picker adds **Kimi K3 (Work)** and **Grok 4.7 (Work)**, with their own
-supported reasoning choices. Entries are text-only with a conservative 200K
-catalog cap. Reopen Codex after catalog changes.
+The picker adds **Kimi K3 (Work)**, **Grok 4.7 (Work)** and **Opus 5.5 via
+Cursor (Work)**, with their own supported reasoning choices. Kimi is text-only
+with a conservative 200K context cap; Grok supports images and 256K, and Opus
+supports images and 1M. Reopen Codex after catalog changes.
 
-Each request verifies the pinned executable and authenticated account, uses credential-bound account/catalog discovery cached for five minutes,
-validates the exact model parameters, and starts a new private local agent
-with an empty built-in tool list, no setting sources, no MCP and no subagents.
+Each request verifies the pinned executable and authenticated account, uses
+credential-bound account/catalog discovery cached for five minutes, and
+validates the exact model parameters. A bounded pool reuses local bridges;
+each bridge runs only one request at a time. Fresh agents get a separate empty
+working directory, an empty built-in tool list, no setting sources, no MCP and
+no subagents. A validated tool call can retain its agent for the next tool
+result, sending only the new history. Reuse requires matching model parameters,
+instructions, tools and the complete model-visible history prefix. Changed
+history, credentials or expired sessions start a fresh agent with full replay.
 Codex tool calls are parsed and validated before returning any actions. Native
 Cursor tool/compaction events, unsupported attachments, model substitutions,
 partial output and failed streams are refused. Cancellation ends only that
-request's dedicated bridge. The temporary agent store is removed on every exit.
+request's exclusively leased bridge; cancelling a queued request leaves active
+runs alone. Idle bridges and their stores are removed after two minutes by
+default. Idle retained agents yield immediately when other work needs a bridge.
 Cursor's SDK sandbox helper is unavailable in the tested standalone macOS build;
 this adapter enforces no native actions through the tool list and event guard.
 Codex's own execution sandbox and approvals still apply to returned calls.
+
+The default pool holds at most eight bridges, bounding local process and memory
+pressure during helper fan-out. `CURSOR_MAX_BRIDGES` tunes that bound. Set
+`CURSOR_SESSION_REUSE=0` to keep bridge pooling but replay each agent in full,
+or `CURSOR_BRIDGE_REUSE=0` to restore the former per-request process lifecycle.
+Neither setting changes the selected model, reasoning effort, speed policy or
+context limit. Content-free `cursor-turn` phase counters distinguish queue,
+setup, generation and continuation reuse; `cursor-cleanup` reports cleanup
+after validated output has been delivered.
 
 To enable **secondary Opus only → Cursor Opus** on a typed Claude quota refusal:
 
@@ -287,6 +318,7 @@ Everything has a default; set only what you need.
 | `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
+| `UPSTREAM_WEBSOCKET` | `1` | Keep GPT WebSocket clients on native upstream WebSockets; `0` uses HTTP upstream |
 | `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |
 | `CLAUDE_BIN` | `claude` | Claude CLI path |
 | `CLAUDE_CONFIG_DIR` | CLI default | Primary Claude login/configuration directory |
@@ -300,6 +332,14 @@ Everything has a default; set only what you need.
 | `CLAUDE_CWD` | current directory | Working directory for the Claude CLI |
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-turn Claude timeout |
 | `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude session stays warm |
+| `CLAUDE_IDENTITY_CACHE_MS` | `60000` | Reuse a verified identity while its local account binding is unchanged; `0` probes each fresh session |
+| `CLAUDE_STANDBY_MAX` | `1` | Maximum unused prewarmed CLI per account; `0` disables prewarming |
+| `CLAUDE_STANDBY_IDLE_MS` | `120000` | Lifetime of an unused prewarmed Claude CLI |
+| `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
+| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle bridge lifetime, including any retained tool session |
+| `CURSOR_SESSION_IDLE_MS` | `900000` | Maximum age of a retained Cursor tool session; bridge eviction can end it sooner |
+| `CURSOR_BRIDGE_REUSE` | `1` | `0` restores one bridge process per request |
+| `CURSOR_SESSION_REUSE` | `1` | `0` disables agent continuation while retaining bridge pooling |
 | `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |
 | `GROK_CWD` | unset | Empty working directory for Grok |
 | `GROK_HOME` | `~/.grok` | Grok profile directory (use a dedicated one) |

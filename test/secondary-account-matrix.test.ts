@@ -25,6 +25,8 @@ const setIdentity = (value: string, exit = 0) => Promise.all([writeFile(scratch 
 const setTurn = (mode: 'ok' | 'limit' | 'limit-event' | 'error') => writeFile(scratch + '/turn.mode', mode);
 const setBridge = (mode: 'ok' | 'quota') => writeFile(scratch + '/bridge.mode', mode);
 const count = async (name: string) => Number(await readFile(scratch + '/' + name + '.count', 'utf8').catch(() => '0'));
+/** Requests the scripted Cursor bridge served, one line each; bridges are pooled, so a launch count says nothing about generation. */
+const hits = async (name: 'agent' | 'send') => (await readFile(scratch + '/' + name + '.log', 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
 
 beforeAll(async () => {
   scratch = await mkdtemp(tmpdir() + '/secondary-matrix-');
@@ -49,7 +51,9 @@ done
   await chmod(claude, 0o755);
   const bridge = scratch + '/bridge';
   await Bun.write(bridge, `#!/usr/bin/env bun
-const mode = (await Bun.file('${scratch}/bridge.mode').text().catch(() => 'ok')).trim();
+import { appendFileSync } from 'node:fs';
+// The router pools bridges, so behaviour is read per request and work is logged per request, not per launch.
+const mode = async () => (await Bun.file('${scratch}/bridge.mode').text().catch(() => 'ok')).trim();
 await Bun.write('${scratch}/bridge.count', String(Number(await Bun.file('${scratch}/bridge.count').text().catch(() => '0')) + 1));
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 const frame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
@@ -59,9 +63,10 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
   const path = new URL(request.url).pathname;
   if (path.endsWith('/Me')) return json({ user: { userEmail: '${EMAIL}', userId: '${USER}' } });
   if (path.endsWith('/ListModels')) return json(catalog);
-  if (path.endsWith('/CreateAgent')) return mode === 'quota' ? json({ code: 'resource_exhausted' }, 429) : json({ agentId: 'agent-1' });
+  if (path.endsWith('/CreateAgent')) { appendFileSync('${scratch}/agent.log', 'a\\n'); return await mode() === 'quota' ? json({ code: 'resource_exhausted' }, 429) : json({ agentId: 'agent-1' }); }
   if (path.endsWith('/CancelRun') || path.endsWith('/CloseAgent')) return json({});
   if (path.endsWith('/Send')) {
+    appendFileSync('${scratch}/send.log', 's\\n');
     const run = { result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result: JSON.stringify({ text: 'CURSOR_OPUS_OK', tool_calls: [] }), model: { id: 'claude-opus-5-5', params: [{ id: 'effort', value: 'high' }, { id: 'context', value: '1m' }, { id: 'fast', value: 'false' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } };
     return new Response(Buffer.concat([frame(0, run), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers: { 'content-type': 'application/connect+json' } });
   }
@@ -206,11 +211,11 @@ describe('Opus quota fallback into Cursor, end to end', () => {
     try {
       for (const mode of ['limit', 'limit-event'] as const) {
         await setTurn(mode);
-        const before = await count('bridge');
+        const before = await hits('send');
         const seen = await everyTransport(app, body(OPUS, 'needs fallback'));
         expectText(seen, 'CURSOR_OPUS_OK');
         for (const cell of seen) expect(cell.message, cell.transport).toContain('using Cursor Opus 5.5 because the direct Claude subscription reached its usage limit');
-        expect(await count('bridge')).toBe(before + 3);
+        expect(await hits('send')).toBe(before + 3);
       }
     } finally { await app.close(); await setTurn('ok'); }
   });
@@ -219,9 +224,9 @@ describe('Opus quota fallback into Cursor, end to end', () => {
     const app = await fixtureRouter();
     try {
       await setTurn('limit');
-      const before = await count('bridge');
+      const before = await hits('agent');
       expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'claude_usage_limit_reached', 'limit');
-      expect(await count('bridge')).toBe(before);
+      expect(await hits('agent')).toBe(before);
     } finally { await app.close(); await setTurn('ok'); }
   });
 
@@ -229,10 +234,10 @@ describe('Opus quota fallback into Cursor, end to end', () => {
     const app = await fixtureRouter();
     try {
       await setTurn('error');
-      const before = await count('bridge');
+      const before = await hits('agent');
       const seen = await everyTransport(app, body(OPUS, 'x'));
       for (const cell of seen) { expect(cell.code, cell.transport).toBe('server_error'); expect(cell.message).not.toContain('exploded'); }
-      expect(await count('bridge')).toBe(before);
+      expect(await hits('agent')).toBe(before);
     } finally { await app.close(); await setTurn('ok'); }
   });
 
@@ -240,7 +245,11 @@ describe('Opus quota fallback into Cursor, end to end', () => {
     const app = await fixtureRouter();
     try {
       await setTurn('limit'); await setBridge('quota');
+      const [agents, sends] = [await hits('agent'), await hits('send')];
       expectTerminal(await everyTransport(app, body(OPUS, 'x')), 'invalid_request_error', 'HTTP 429, resource_exhausted');
+      // Cursor was asked once per transport and refused; nothing was generated there.
+      expect(await hits('agent')).toBe(agents + 3);
+      expect(await hits('send')).toBe(sends);
     } finally { await app.close(); await setTurn('ok'); await setBridge('ok'); }
   });
 
@@ -263,11 +272,11 @@ describe('Opus quota fallback into Cursor, end to end', () => {
     const app = await fixtureRouter();
     try {
       await setTurn('limit');
-      const before = await count('bridge');
+      const before = await hits('agent');
       const seen = await post(app, body(OPUS, 'x'), { signal: AbortSignal.abort() }).catch(error => error);
       expect(seen).toBeInstanceOf(Error);
       await new Promise(resolve => setTimeout(resolve, 200));
-      expect(await count('bridge')).toBe(before);
+      expect(await hits('agent')).toBe(before);
     } finally { await app.close(); await setTurn('ok'); }
   });
 });

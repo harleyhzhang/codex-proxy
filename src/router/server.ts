@@ -21,6 +21,7 @@ import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse } from './local';
 import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
+import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
 
 export type RouterOptions = {
   port: number;
@@ -38,6 +39,10 @@ export type RouterOptions = {
   bridgeModels?: readonly string[];
   secondaryAccount?: AccountOptions;
   primaryStandard?: boolean;
+  /** Keep native GPT continuations on their client's own upstream WebSocket. */
+  upstreamWebSocket?: boolean;
+  /** Transport injection for tests; production always connects to the native Codex backend. */
+  upstreamSocket?: UpstreamSessionOptions['socket'];
 };
 
 const RESPONSE_PATHS = new Set(['/v1/responses', '/v1/responses/compact', '/v1/responses/lite']);
@@ -56,7 +61,7 @@ const GENERIC_FAILURE = 'Model request failed; retry or check subscription acces
 const INTERNAL_FAILURE = 'Internal router error; Codex will retry.';
 
 /** `interrupt` is aborted by `response.interrupt` for `responseId`, the turn Codex last saw created. */
-type SocketData = { headers: Headers; busy: boolean; abort?: AbortController; interrupt?: AbortController; responseId?: string };
+type SocketData = { headers: Headers; busy: boolean; abort?: AbortController; interrupt?: AbortController; responseId?: string; upstream?: UpstreamSession };
 /** A `response.interrupt` frame is tiny; larger frames are never parsed twice. */
 const INTERRUPT_MAX_BYTES = 4096;
 
@@ -155,8 +160,12 @@ export function startRouter(options: RouterOptions) {
   const auth = new NativeAuth(options.authFile);
   const history = new HistoryCache();
   const base: UpstreamFetch = options.upstreamFetch ?? ((url, init) => fetch(url, init));
-  const routed = options.secondaryAccount ? new AccountUpstream(options.secondaryAccount, base).fetch : base;
-  const upstreamFetch = options.primaryStandard ? standardPrimaryFetch(routed) : routed;
+  const account = options.secondaryAccount ? new AccountUpstream(options.secondaryAccount, base) : undefined;
+  const withPolicy = (transport: UpstreamFetch): UpstreamFetch => {
+    const routed = account ? account.withTransport(transport) : transport;
+    return options.primaryStandard ? standardPrimaryFetch(routed) : routed;
+  };
+  const upstreamFetch = withPolicy(base);
   const timeoutMs = options.upstreamTimeoutMs ?? 900_000;
   const deadline = (signal: AbortSignal) => AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
 
@@ -414,10 +423,25 @@ export function startRouter(options: RouterOptions) {
       const message: unknown = JSON.parse(data);
       if (!isRecord(message)) throw new Error('Unsupported WebSocket command');
       if (message.type && message.type !== 'response.create') throw new Error('Unsupported WebSocket command');
-      const body = await normalize(isRecord(message.response) ? message.response : message, ws.data.headers);
+      const raw = isRecord(message.response) ? message.response : message;
+      const previous = typeof raw.previous_response_id === 'string' ? raw.previous_response_id : undefined;
+      const body = await normalize(raw, ws.data.headers);
       log.info('request', { model: body.model, warmup: body.generate === false, compaction: isCompaction(body) });
 
-      if (body.generate === false) {
+      if (options.upstreamWebSocket && !isLocalModel(body.model) && !isCompaction(body)) {
+        ws.data.upstream ??= new UpstreamSession({
+          enabled: true,
+          socket: options.upstreamSocket,
+          fallback: base,
+        });
+      }
+      const fetchUpstream = ws.data.upstream && !isLocalModel(body.model) && !isCompaction(body)
+        ? withPolicy(ws.data.upstream.transport(previous)) : upstreamFetch;
+
+      if (body.generate === false && ws.data.upstream && !isLocalModel(body.model) && !isCompaction(body)) {
+        // Preserve upstream's real warmup ID so the first turn can continue on this connection.
+        await relayUpstreamStream(body, ws.data.headers, controller.signal, interrupt.signal, (event) => live() && send(event), send, fetchUpstream);
+      } else if (body.generate === false) {
         // Codex continues from a warmup's response id, so warmups are remembered too.
         const warm = responseObject(body, EMPTY_OUTPUT);
         history.remember(body, warm);
@@ -443,7 +467,7 @@ export function startRouter(options: RouterOptions) {
           }
         }, controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
       } else {
-        await relayUpstreamStream(body, ws.data.headers, controller.signal, interrupt.signal, (event) => live() && send(event), send);
+        await relayUpstreamStream(body, ws.data.headers, controller.signal, interrupt.signal, (event) => live() && send(event), send, fetchUpstream);
       }
     } catch (error) {
       const network = transportError(error);
@@ -479,8 +503,8 @@ export function startRouter(options: RouterOptions) {
 
   /**
    * Streams a GPT turn back over the socket and records it for `previous_response_id`. The
-   * upstream is HTTP, so `interrupt` cannot be forwarded: the router stops reading instead and
-   * finishes with the items OpenAI completed, discarding partial ones as native does.
+   * upstream is HTTP or a native WebSocket adapted to SSE. An interrupt stops reading that
+   * transport and finishes with completed items, discarding partial ones as native does.
    */
   async function relayUpstreamStream(
     body: ResponsesBody,
@@ -489,6 +513,7 @@ export function startRouter(options: RouterOptions) {
     interrupt: AbortSignal,
     forward: (event: StreamEvent) => void,
     send: (event: unknown) => void,
+    fetchUpstream: UpstreamFetch = upstreamFetch,
   ): Promise<void> {
     const { type: _type, previous_response_id: _previous, ...request } = body;
     const upstreamSignal = AbortSignal.any([signal, interrupt]);
@@ -498,7 +523,7 @@ export function startRouter(options: RouterOptions) {
     let stop: (() => void) | undefined;
     let response: Response;
     try {
-      response = watchBody(await connectUpstream(upstreamFetch, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+      response = watchBody(await connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
     } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
@@ -560,6 +585,7 @@ export function startRouter(options: RouterOptions) {
       message: handleSocketMessage,
       close(ws) {
         ws.data.abort?.abort();
+        ws.data.upstream?.close();
       },
     },
   });

@@ -21,6 +21,7 @@ describe('loadConfig', () => {
       secondaryAccount: undefined,
       secondaryLabel: 'Secondary',
       primaryStandard: false,
+      upstreamWebSocket: true,
       pinnedEfforts: [],
     });
   });
@@ -50,6 +51,13 @@ describe('loadConfig', () => {
     }
     expect(() => loadConfig({ HOME: '/h', PORT: '70000' })).toThrow('PORT must be at most 65535');
     expect(() => loadConfig({ HOME: '/h', UPSTREAM_TIMEOUT_MS: 'soon' })).toThrow('UPSTREAM_TIMEOUT_MS');
+  });
+
+  test('native upstream WebSockets are enabled by default and can be explicitly disabled', () => {
+    expect(loadConfig({ HOME: '/h' }).upstreamWebSocket).toBe(true);
+    expect(loadConfig({ HOME: '/h', UPSTREAM_WEBSOCKET: '0' }).upstreamWebSocket).toBe(false);
+    expect(loadConfig({ HOME: '/h', UPSTREAM_WEBSOCKET: '1' }).upstreamWebSocket).toBe(true);
+    expect(() => loadConfig({ HOME: '/h', UPSTREAM_WEBSOCKET: 'yes' })).toThrow('UPSTREAM_WEBSOCKET');
   });
 
   test('backend timeouts share the same strict parser', () => {

@@ -5,6 +5,7 @@ import { BackendError } from '../backends/contract';
 import type { UpstreamFetch } from './upstream';
 import { logSafe } from '../log';
 import { isRecord, type JsonRecord } from '../json';
+import { requestJson, requestOptions, rewriteJson } from './json-request';
 
 export type AccountOptions = {
   home: string;
@@ -54,11 +55,12 @@ export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
   return async (url, init) => {
     const target = new URL(url);
     if (target.origin !== 'https://chatgpt.com' || !/^\/backend-api\/codex\/responses(?:\/|$)/.test(target.pathname) || typeof init.body !== 'string') return upstream(url, init);
-    let body: unknown; try { body = JSON.parse(init.body); } catch { return upstream(url, init); }
+    const body = requestJson(init);
     if (!record(body) || typeof body.model !== 'string' || !MODEL_SLUG.test(body.model)) return upstream(url, init);
     logSafe('account-speed', { account: 'primary', model: body.model, tier: 'default' });
     const headers = new Headers(init.headers); headers.delete('content-length');
-    return upstream(url, { ...init, headers, body: JSON.stringify({ ...body, service_tier: 'default' }) });
+    if (body.service_tier === 'default') return upstream(url, requestOptions(init, { headers }));
+    return upstream(url, rewriteJson(init, { service_tier: 'default' }, { headers }));
   };
 }
 
@@ -160,14 +162,21 @@ export class AccountUpstream {
     logSafe('account-catalog', { account: this.options.prefix, model: native, refreshed, listed: Boolean(found.row) });
     return found;
   }
-  fetch: UpstreamFetch = async (url, init) => {
-    let body: unknown;
-    if (typeof init.body === 'string') { try { body = JSON.parse(init.body); } catch {} }
-    if (!record(body)) return this.upstream(url, init);
+  /** Alternate transports share this account's refresh/catalog flights and all routing policy. */
+  withTransport(upstream: UpstreamFetch): UpstreamFetch {
+    return (url, init) => this.route(url, init, upstream);
+  }
+  fetch: UpstreamFetch = (url, init) => this.route(url, init, this.upstream);
+  private async route(url: string, init: RequestInit, upstream: UpstreamFetch): Promise<Response> {
+    const body = requestJson(init);
+    if (!record(body)) return upstream(url, init);
     const native = accountModel(body.model, this.options.prefix, this.options.models);
     if (!native) {
-      return this.upstream(url, init);
+      return upstream(url, init);
     }
+    // Keep the body inspected for routing even if an external caller replaces init.body while
+    // credential/catalog I/O is pending. The original implementation parsed this snapshot too.
+    const snapshot = requestOptions(init);
     // The credentials must never be forwarded to any destination other than Codex's backend.
     const target = new URL(url);
     if (target.origin !== 'https://chatgpt.com' || !target.pathname.startsWith('/backend-api/codex/')) {
@@ -192,14 +201,14 @@ export class AccountUpstream {
       tier = tiers.includes('ultrafast') ? 'ultrafast' : tiers.includes('priority') ? 'priority' : 'default';
     }
     logSafe('account-speed', { account: this.options.prefix, model: native, tier });
-    const outbound = JSON.stringify({ ...body, model: native, ...(tier === undefined ? {} : { service_tier: tier }) });
-    const response = await this.upstream(url, { ...init, headers: authorized(identity), body: outbound });
+    const outbound = rewriteJson(snapshot, { model: native, ...(tier === undefined ? {} : { service_tier: tier }) });
+    const response = await upstream(url, requestOptions(outbound, { headers: authorized(identity) }));
     if (response.status !== 401) return response;
     // Like native Codex, a 401 earns one forced refresh and one retry; a failed refresh keeps the original 401.
     try { identity = await this.ready(true); }
     catch { logSafe('account-unauthorized', { account: this.options.prefix, refreshed: false }); return response; }
     logSafe('account-unauthorized', { account: this.options.prefix, refreshed: true });
     await response.body?.cancel();
-    return this.upstream(url, { ...init, headers: authorized(identity), body: outbound });
-  };
+    return upstream(url, requestOptions(outbound, { headers: authorized(identity) }));
+  }
 }

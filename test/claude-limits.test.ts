@@ -46,7 +46,8 @@ test('real worker recognizes CLI rate_limit before structured output and does no
   const oldBinary = process.env.CLAUDE_BIN;
   claudeLimits.restore(claudeUsageSnapshot({}));
   // A real subprocess exercises stdout parsing and continuation fallback, without model usage.
-  await Bun.write(binary,`#!/bin/sh\nprintf started >> '${dir}/starts'\nread initial\nprintf '%s\\n' '${JSON.stringify({type:'result',is_error:false,structured_output:{text:'',tool_calls:[{name:'step',arguments:'{}'}]}})}'\nread ignored\nprintf '%s\\n' '${JSON.stringify({type:'rate_limit_event',rate_limit_info:rejected({five_hour:exhausted})})}' '${JSON.stringify({type:'assistant',error:'rate_limit'})}'\n`);
+  // Prompts are counted on receipt: a prewarmed standby CLI may launch, but must never be sent a replay.
+  await Bun.write(binary,`#!/bin/sh\nread initial\nprintf p >> '${dir}/prompts'\nprintf '%s\\n' '${JSON.stringify({type:'result',is_error:false,structured_output:{text:'',tool_calls:[{name:'step',arguments:'{}'}]}})}'\nread ignored\nprintf p >> '${dir}/prompts'\nprintf '%s\\n' '${JSON.stringify({type:'rate_limit_event',rate_limit_info:rejected({five_hour:exhausted})})}' '${JSON.stringify({type:'assistant',error:'rate_limit'})}'\n`);
   const { chmod } = await import('node:fs/promises');
   await chmod(binary,0o700);
   process.env.CLAUDE_BIN=binary;
@@ -54,7 +55,8 @@ test('real worker recognizes CLI rate_limit before structured output and does no
     const tools=[{type:'function',name:'step',parameters:{type:'object',properties:{}}}];
     const first=await runClaude({model:'claude-opus-5-5',input:'Test',tools});
     await expect(runClaude({model:'claude-opus-5-5',input:[{type:'function_call_output',call_id:first.toolCalls[0]!.callId,output:'OK'}],tools})).rejects.toThrow(ClaudeUsageLimitError);
-    expect(await Bun.file(dir+'/starts').text()).toBe('started');
+    // The first prompt and its continuation only; replaying the limited turn would add a third.
+    expect(await Bun.file(dir+'/prompts').text()).toBe('pp');
   } finally {
     if(oldBinary===undefined)delete process.env.CLAUDE_BIN;else process.env.CLAUDE_BIN=oldBinary;
     claudeLimits.restore(claudeUsageSnapshot({}));

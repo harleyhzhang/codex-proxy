@@ -132,9 +132,9 @@ test('never reuses a pre-compaction worker that would miss newly anchored constr
   await Bun.write(
     binary,
     `#!/usr/bin/env bun
-await Bun.write('${dir}/starts', (await Bun.file('${dir}/starts').exists() ? await Bun.file('${dir}/starts').text() : '') + 'start\\n');
 const rl = (await import('node:readline')).createInterface({ input: process.stdin });
 for await (const line of rl) {
+  (await import('node:fs')).appendFileSync('${dir}/prompts', process.pid + '\\n');
   const text = JSON.parse(line).message.content[0].text;
   const out = text.includes('ALERT_NO_WRITE') ? { text: 'ALERT_NO_WRITE', tool_calls: [] } : { text: '', tool_calls: [{ name: 'read', arguments: '{}' }] };
   console.log(JSON.stringify({ type: 'result', is_error: false, structured_output: out }));
@@ -156,7 +156,10 @@ for await (const line of rl) {
       ],
     });
     expect(second.text).toBe('ALERT_NO_WRITE');
-    expect(await Bun.file(join(dir, 'starts')).text()).toBe('start\nstart\n');
+    // Two prompts, each to a different CLI session: the pre-compaction worker was not continued.
+    const sessions = (await Bun.file(join(dir, 'prompts')).text()).trim().split('\n');
+    expect(sessions.length).toBe(2);
+    expect(sessions[0]).not.toBe(sessions[1]);
   } finally {
     if (old === undefined) delete process.env.CLAUDE_BIN;
     else process.env.CLAUDE_BIN = old;
