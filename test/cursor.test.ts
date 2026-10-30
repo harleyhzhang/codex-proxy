@@ -125,6 +125,7 @@ test('Cursor repairs Kimi miscounted closers at the end of a tool call',()=>{
  for(const tail of ['}]}','}}]}','}}]'])expect(parseCursorOutput(body+tail,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['apply_patch',"x({a:'{'})"]]);
 });
 test('Cursor model parameters are family specific and unsupported effort is refused',()=>{
+ expect(cursorSelection('muse-wonder-1.0','max',true)).toEqual({id:'muse-wonder-1.0',params:[{id:'reasoning_effort',value:'max'},{id:'context',value:'300k'}]});
  expect(cursorSelection('kimi-k3','max').params).toEqual([{id:'reasoning',value:'max'}]);
  expect(cursorSelection('grok-4.7','xhigh',true).params).toContainEqual({id:'fast',value:'true'});
  expect(cursorSelection('grok-4.7','xhigh').params).toContainEqual({id:'reasoning_effort',value:'xhigh'});

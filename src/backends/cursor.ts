@@ -21,11 +21,13 @@ export const CURSOR_MODELS = {
   // the catalog advertises to Codex so compaction happens at the real limit, not an artificial 200K.
   // Kimi exposes no context parameter and its limit is unverified, so it keeps the 200K default.
   // Kimi K3 is not a vision model on Cursor: a probed image arrives as an on-disk asset path only (2026-10-13).
-  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000, vision: false },
+  'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000, vision: false, fast: false },
   // Grok 4.7: Cursor discovery lists a 500k context, but a run requested at 500k never reaches
   // RUN_LIFECYCLE_STATUS_FINISHED (probed 2026-10-13, text-only prompt); 256k is the largest that works.
-  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 , vision: true },
-  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 , vision: true },
+  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 , vision: true, fast: true },
+  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 , vision: true, fast: true },
+  // Cursor advertises 1m, but currently rejects that selection as invalid parameters; 300k is verified.
+  'muse-wonder-1.0': { name: 'Muse Wonder', efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], parameter: 'reasoning_effort', context: '300k', window: 300_000, vision: true, fast: false },
 } as const;
 export type CursorModel = keyof typeof CURSOR_MODELS;
 export type CursorOptions = {
@@ -66,7 +68,7 @@ export function cursorSelection(model: string, effort = 'high', fastest = false)
   if (!Object.hasOwn(CURSOR_MODELS, model)) throw new CursorError('Unsupported Cursor model');
   const spec = CURSOR_MODELS[model as CursorModel];
   if (!(spec.efforts as readonly string[]).includes(effort)) throw new CursorError('Unsupported Cursor reasoning effort');
-  return { id: model, params: [{ id: spec.parameter, value: effort }, ...(spec.context ? [{ id: 'context', value: spec.context }] : []), ...(model === 'kimi-k3' ? [] : [{ id: 'fast', value: fastest ? 'true' : 'false' }])] };
+  return { id: model, params: [{ id: spec.parameter, value: effort }, ...(spec.context ? [{ id: 'context', value: spec.context }] : []), ...(spec.fast ? [{ id: 'fast', value: fastest ? 'true' : 'false' }] : [])] };
 }
 
 /** Validate common tool argument schemas, including nested objects, enums and union alternatives. */
@@ -907,7 +909,7 @@ class CursorRuntime {
 
 export function createCursorBackend(options: CursorOptions): CursorBackend {
   if (![options.binary, options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt','grok','claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId || !/^[a-f0-9]{64}$/.test(options.binaryHash)) throw new Error('Cursor requires absolute paths, a pinned bridge, account identity and a model namespace');
-  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'claude-opus-5-5'];
+  const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'claude-opus-5-5', 'muse-wonder-1.0'];
   const runtime = new CursorRuntime(options);
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
