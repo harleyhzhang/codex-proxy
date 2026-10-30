@@ -1,6 +1,6 @@
 // Fresh-session startup against a scripted Claude CLI: the shared, binding-checked identity probe and
 // the prewarmed standby worker. The mock logs every probe, launch and prompt by pid.
-import { afterEach, expect, test } from 'bun:test';
+import { afterEach, expect, spyOn, test } from 'bun:test';
 import { chmod, mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,14 +20,17 @@ async function fixture() {
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 const log = (line) => appendFileSync(${file('events')}, line + '\\n');
 if (process.argv.includes('status')) {
-  log('probe');
   const answer = readFileSync(${file('identity')}, 'utf8');
+  // Logged after the answer is read, so a test that waits for this line knows which login it got.
+  log('probe');
   const delay = existsSync(${file('delay')}) ? Number(readFileSync(${file('delay')}, 'utf8')) : 0;
   if (delay) await Bun.sleep(delay);
   console.log(answer);
   process.exit(0);
 }
 log('start ' + process.pid);
+// What a CLI prints at startup, before any prompt (some logins emit UI status records here).
+if (existsSync(${file('preamble')})) console.log(readFileSync(${file('preamble')}, 'utf8'));
 let prompted = false;
 for await (const line of (await import('node:readline')).createInterface({ input: process.stdin })) {
   prompted = true;
@@ -53,6 +56,7 @@ if (!prompted && existsSync(${file('stubborn')})) await new Promise(() => {});
   });
   return {
     account, record, signIn, binary, setDelay: (ms: number) => Bun.write(join(dir, 'delay'), String(ms)), stubborn: () => Bun.write(join(dir, 'stubborn'), '1'),
+    preamble: (record: unknown) => Bun.write(join(dir, 'preamble'), JSON.stringify(record)),
     probes: async () => (await events()).filter((line) => line === 'probe').length,
     starts: async () => (await events()).filter((line) => line.startsWith('start ')).map((line) => line.slice(6)),
     prompts: async () => (await events()).filter((line) => line.startsWith('prompt ')).map((line) => line.slice(7)),
@@ -107,8 +111,10 @@ test('a login that changes while its probe runs is probed again, and the mismatc
   process.env.CLAUDE_IDENTITY_CACHE_MS = '0';
   try {
     const pending = f.account.run(hello());
-    // The in-flight probe still answers as account A; by then the profile belongs to account B.
-    setTimeout(() => void f.signIn('account-b', 'b@example.com'), 100);
+    // The in-flight probe still answers as account A; by then the profile belongs to account B. Switching
+    // only after it has read its answer keeps a slow probe launch from seeing B first.
+    for (let tries = 0; tries < 200 && (await f.probes()) < 2; tries++) await Bun.sleep(10);
+    await f.signIn('account-b', 'b@example.com');
     await expect(pending).rejects.toThrow('identity does not match');
   } finally { delete process.env.CLAUDE_IDENTITY_CACHE_MS; }
   expect(await f.probes()).toBe(3);
@@ -141,13 +147,84 @@ test('an expired or evicted standby is killed even when the CLI ignores end of i
   // and the last expires unclaimed after its idle window. The window has to outlast the `ps` check
   // below on a loaded machine (150 ms did not), and the kill is polled for rather than slept on.
   process.env.CLAUDE_STANDBY_IDLE_MS = '1000';
+  process.env.CLAUDE_STANDBY_MAX = '1';
   try {
     for (const effort of ['high', 'low', 'medium']) await f.account.run(hello(effort));
     expect(await running()).toBeGreaterThan(0);
     for (let waited = 0; waited < 5000 && (await running()) > 0; waited += 100) await Bun.sleep(100);
     expect(await running()).toBe(0);
     expect((await f.prompts()).length).toBe(3);
-  } finally { delete process.env.CLAUDE_STANDBY_IDLE_MS; }
+  } finally { delete process.env.CLAUDE_STANDBY_IDLE_MS; delete process.env.CLAUDE_STANDBY_MAX; }
+});
+
+test('alternating launch arguments each keep a warm standby, and the start log says why one missed', async () => {
+  const f = await fixture();
+  const starts: Array<Record<string, unknown>> = [];
+  const warn = spyOn(console, 'warn').mockImplementation((line: unknown) => {
+    const record = typeof line === 'string' && line.startsWith('{') ? JSON.parse(line) as Record<string, unknown> : undefined;
+    if (record?.event === 'claude-worker-start') starts.push(record);
+  });
+  try {
+    // A main chat and a helper with different arguments (here effort) take turns, as with differing tool sets.
+    for (const effort of ['high', 'low', 'high', 'low', 'high']) {
+      await f.account.run(hello(effort));
+      // A miss launches the worker and a standby; a hit launches only the replacement standby.
+      await launched(f, starts.length + starts.filter((start) => !start.standby).length);
+    }
+  } finally { warn.mockRestore(); }
+  expect(starts.map((start) => start.standby)).toEqual([false, false, true, true, true]);
+  expect(starts[0]?.standby_miss).toBe('none');
+  expect(starts[1]?.standby_miss).toBe('effort');
+  // With a single slot each of these would have found the other's standby: one newer standby was parked.
+  expect(starts.slice(2).map((start) => start.standby_newer)).toEqual([1, 1, 1]);
+  const prompts = await f.prompts();
+  expect(new Set(prompts).size).toBe(prompts.length);
+});
+
+test('the standby cap evicts the arguments wanted least recently', async () => {
+  const f = await fixture();
+  process.env.CLAUDE_STANDBY_MAX = '2';
+  const starts: Array<Record<string, unknown>> = [];
+  const warn = spyOn(console, 'warn').mockImplementation((line: unknown) => {
+    const record = typeof line === 'string' && line.startsWith('{') ? JSON.parse(line) as Record<string, unknown> : undefined;
+    if (record?.event === 'claude-worker-start') starts.push(record);
+  });
+  try {
+    const run = async (effort: string) => {
+      await f.account.run(hello(effort));
+      // A miss launches the worker and a standby; a hit launches only the replacement standby.
+      await launched(f, starts.length + starts.filter((start) => !start.standby).length);
+    };
+    // high then low are parked. A chat-open warmup wants high again, which moves it to the back of the
+    // eviction queue without a launch, so medium evicts low rather than high.
+    await run('high');
+    await run('low');
+    f.account.prewarm(hello('high'));
+    await Bun.sleep(50);
+    for (const effort of ['medium', 'high', 'low']) await run(effort);
+  } finally { warn.mockRestore(); delete process.env.CLAUDE_STANDBY_MAX; }
+  expect(starts.map((start) => start.standby)).toEqual([false, false, false, true, false]);
+});
+
+test('a standby may print UI status records before its prompt; anything else retires it unread', async () => {
+  const f = await fixture();
+  const quota: unknown[] = [];
+  f.account.onRateLimit((info) => quota.push(info));
+  await f.preamble({ type: 'system', subtype: 'ui_invalidate' });
+  const first = await f.account.run(hello());
+  const parked = (await launched(f, 2)).filter((pid) => pid !== first.text);
+  await Bun.sleep(100);
+  // The next standby is launched as this turn starts, so it prints whatever the preamble says then.
+  await f.preamble({ type: 'rate_limit_event', rate_limit_info: { status: 'rejected' } });
+  expect((await f.account.run(hello())).text).toBe(parked[0]!);
+  const all = await launched(f, 3);
+  await Bun.sleep(200);
+  // A record that would touch quota state, written before any prompt, is never acted on: that standby
+  // is retired, and the next turn starts its own CLI (which prints nothing now).
+  await f.preamble({ type: 'system', subtype: 'ui_invalidate' });
+  const next = await f.account.run(hello());
+  expect(all).not.toContain(next.text);
+  expect(quota).toEqual([]);
 });
 
 test('a chat-open prewarm checks the login and parks a CLI without prompting it; the first turn uses both', async () => {

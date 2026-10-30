@@ -334,7 +334,7 @@ Everything has a default; set only what you need.
 | `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude session stays warm |
 | `CLAUDE_IDENTITY_CACHE_MS` | `60000` | Reuse a verified identity while its local account binding is unchanged; `0` probes each fresh session |
 | `CLAUDE_IDENTITY_REFRESH_MS` | `900000` | While an account was used this recently, re-check its identity in the background just before the cache expires; `0` disables |
-| `CLAUDE_STANDBY_MAX` | `1` | Maximum unused prewarmed CLI per account; `0` disables prewarming |
+| `CLAUDE_STANDBY_MAX` | `3` | Unused prewarmed CLIs per account, one per distinct launch (model, effort, tool set), least recently wanted evicted first; each idles at about 125-190 MB; `0` disables prewarming |
 | `CLAUDE_STANDBY_IDLE_MS` | `900000` | Lifetime of an unused prewarmed Claude CLI (also started by a chat-open warmup) |
 | `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
 | `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges; a bridge holding a retained tool session stays until that session expires |

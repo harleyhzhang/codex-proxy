@@ -340,23 +340,31 @@ export class ClaudeAccount {
     void this.verifyIdentity().then(() => this.keepStandby(request, key), () => {});
   }
 
-  /** A prewarmed CLI launched with exactly these arguments, if one is idle. */
-  takeStandby(key: string): ClaudeWorker | undefined {
-    const index = this.standbys.findIndex((worker) => worker.launchKey === key && worker.idle);
-    const [worker] = index >= 0 ? this.standbys.splice(index, 1) : [];
+  /**
+   * A prewarmed CLI launched with exactly these arguments, if one is idle. `newer` counts standbys parked
+   * after it (0: a single standby slot would also have held it); `miss` says why none matched: nothing
+   * parked, or the parked ones were launched for a different model, effort or tool set.
+   */
+  takeStandby(key: string): { worker?: ClaudeWorker; newer: number; miss?: string } {
     this.pruneStandbys();
-    return worker;
+    const index = this.standbys.findIndex((worker) => worker.launchKey === key);
+    if (index < 0) return { newer: 0, miss: this.standbys.length ? standbyMiss(key, this.standbys.map((worker) => worker.launchKey)) : 'none' };
+    const [worker] = this.standbys.splice(index, 1);
+    return { worker, newer: this.standbys.length - index };
   }
 
   /**
    * Prewarms the next fresh session with the same arguments, so it skips CLI startup. Called only after
    * this account's identity check passed; a standby still waits for its own check before any prompt.
-   * The newest arguments win when the cap is reached, since they are the likeliest to come next.
+   * The most recently wanted arguments win when the cap is reached, since they are the likeliest to come
+   * next; a parked standby that is wanted again moves to the back of the eviction queue.
    */
   keepStandby(request: ResponsesRequest, key: string): void {
-    const max = nonNegativeInt('CLAUDE_STANDBY_MAX', 1);
+    const max = nonNegativeInt('CLAUDE_STANDBY_MAX', 3);
     this.pruneStandbys();
-    if (!max || this.standbys.some((worker) => worker.launchKey === key)) return;
+    const parked = this.standbys.findIndex((worker) => worker.launchKey === key);
+    if (parked >= 0) this.standbys.push(...this.standbys.splice(parked, 1));
+    if (!max || parked >= 0) return;
     while (this.standbys.length >= max) this.standbys.shift()?.close();
     // An unclaimed standby closes its stdin when the window passes, and the CLI exits.
     this.standbys.push(new ClaudeWorker(request, this, key, positiveInt('CLAUDE_STANDBY_IDLE_MS', 900_000)));
@@ -567,17 +575,20 @@ class ClaudeWorker {
   }
 
   private acceptLine(line: string): void {
-    // A CLI that has not been sent a prompt has nothing legitimate to report. Its output must never
-    // reach this account's quota state or a later turn, so a standby that speaks first is retired.
-    if (!this.used) {
-      if (line.trim()) this.abort();
-      return;
-    }
     let record: unknown;
     try {
       record = JSON.parse(line);
     } catch {
+      if (!this.used && line.trim()) this.retireStandby('non-json');
       return; // Non-JSON diagnostics from the CLI.
+    }
+    // A CLI that has not been sent a prompt has nothing legitimate to report beyond its own UI status
+    // records (`system` ui_invalidate/commands_changed, which some logins print at startup and which are
+    // never acted on). Anything else must never reach this account's quota state or a later turn, so a
+    // standby that says it is retired.
+    if (!this.used) {
+      if (!isRecord(record) || record.type !== 'system') this.retireStandby(isRecord(record) ? String(record.type ?? '') : 'other');
+      return;
     }
     if (!isRecord(record)) return;
     if (record.type === 'rate_limit_event' && record.rate_limit_info) {
@@ -595,6 +606,11 @@ class ClaudeWorker {
     const pending = this.pending;
     this.pending = undefined;
     pending.resolve(record as ClaudeResult);
+  }
+
+  private retireStandby(kind: string): void {
+    logSafe('claude-standby-retired', { record: kind });
+    this.abort();
   }
 
   private async readStderr(): Promise<void> {
@@ -638,7 +654,7 @@ function workerLaunchKey(request: ResponsesRequest, account: ClaudeAccount): str
 async function startClaudeWorker(request: ResponsesRequest, account: ClaudeAccount, signal?: AbortSignal): Promise<ClaudeWorker> {
   const started = performance.now();
   const key = workerLaunchKey(request, account);
-  const standby = account.takeStandby(key);
+  const { worker: standby, newer, miss } = account.takeStandby(key);
   // The CLI starts (or is already warm) while the identity is checked. Nothing is written to it until
   // the check passes, and a failed or cancelled check ends it unused, so no prompt reaches a wrong login.
   const worker = standby ?? new ClaudeWorker(request, account, key);
@@ -652,8 +668,25 @@ async function startClaudeWorker(request: ResponsesRequest, account: ClaudeAccou
   }
   worker.adopt(request);
   account.keepStandby(request, key);
-  logSafe('claude-worker-start', { standby: !!standby, identity_cached: identity.cached, ms: Math.round(performance.now() - started) });
+  logSafe('claude-worker-start', { standby: !!standby, ...(standby ? { standby_newer: newer } : { standby_miss: miss }), identity_cached: identity.cached, ms: Math.round(performance.now() - started) });
   return worker;
+}
+
+/** Which launch arguments kept every parked standby from matching: model, effort, tools or other. */
+function standbyMiss(key: string, parked: readonly string[]): string {
+  const parse = (launch: string) => {
+    const [binary, cwd, model, args] = JSON.parse(launch) as [string, string, string, string[]];
+    const flag = (name: string) => args[args.indexOf(name) + 1];
+    return { model, effort: flag('--effort'), tools: flag('--json-schema'), rest: JSON.stringify([binary, cwd, args.filter((_, index) => !['--effort', '--json-schema', '--model'].includes(args[index - 1] ?? ''))]) };
+  };
+  const want = parse(key);
+  const reasons = new Set<string>();
+  for (const launch of parked) {
+    const have = parse(launch);
+    reasons.add(have.model !== want.model ? 'model' : have.effort !== want.effort ? 'effort' : have.tools !== want.tools ? 'tools' : 'other');
+  }
+  // Space-separated: logSafe strips commas.
+  return [...reasons].sort().join(' ');
 }
 
 /** The live session from this account that issued the newest tool call, if it can continue. */
