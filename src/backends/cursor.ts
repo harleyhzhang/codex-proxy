@@ -5,7 +5,7 @@
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
-import { childEnvironment, positiveInt } from '../env';
+import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
@@ -637,9 +637,16 @@ class CursorRuntime {
       Math.min(32, positiveInt('CURSOR_MAX_BRIDGES', 8)), positiveInt('CURSOR_BRIDGE_IDLE_MS', 120_000),
       (key, signal) => this.startBridge(key, signal), bridge => bridge.dispose(),
       bridge => !bridge.dead && bridge.process.exitCode === null,
+      // One idle bridge per login outlives the short window, so a pause between messages reuses it.
+      nonNegativeInt('CURSOR_WARM_BRIDGES', 1), positiveInt('CURSOR_WARM_BRIDGE_IDLE_MS', 900_000),
     );
   }
   close(): Promise<void> { return this.pool.close(); }
+  /** Starts a bridge when a chat opens, so its first turn skips the cold start. Never throws. */
+  prewarm(): void {
+    if (process.env.CURSOR_BRIDGE_REUSE === '0') return;
+    try { this.pool.prewarm(readCursorKey(this.options)); } catch {}
+  }
   private forget(bridge: CursorBridge): void {
     for (const id of bridge.session?.callIds ?? []) if (this.sessions.get(id) === bridge) this.sessions.delete(id);
     bridge.session = undefined;
@@ -885,7 +892,8 @@ class CursorRuntime {
           try { await this.closeAgent(bridge, agentId); } catch {}
           await lease.discard();
         }
-        else if (bridge.session) lease.release();
+        // A retained tool session lives until its own expiry, not the shorter idle-bridge window.
+        else if (bridge.session) lease.release(bridge.session.expires - Date.now());
         else {
           const owned = lease, activeBridge = bridge, cleanup = performance.now();
           // Release validated output immediately. The exclusive lease remains held until agent
@@ -916,6 +924,7 @@ export function createCursorBackend(options: CursorOptions): CursorBackend {
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
     catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
     run: (request, signal) => retryOnce('Cursor', signal, (note, last) => runtime.run(request, signal, note, last)),
+    prewarm: () => runtime.prewarm(),
     close: () => runtime.close(),
   };
 }

@@ -19,11 +19,22 @@ import { reconnectTransport } from '../transport';
 export async function localResponse(body: ResponsesBody, signal?: AbortSignal, options: { reconnect?: boolean } = {}): Promise<ResponseObject> {
   const backend = backendFor(body.model);
   if (!backend) throw new BackendError('Unsupported model');
-  if (body.generate === false) return responseObject(body, EMPTY_OUTPUT);
+  if (body.generate === false) {
+    prewarmLocal(body);
+    return responseObject(body, EMPTY_OUTPUT);
+  }
   const request = validateRequest(adaptRequest(body, backend));
   const attempt = () => backend.run(request, signal);
   const output = options.reconnect === false
     ? await attempt()
     : await reconnectTransport(attempt, signal, { onRetry: (attempts, delayMs) => logSafe('backend-offline-retry', { backend: backend.name, attempt: attempts, delay_ms: delayMs }) });
   return responseObject(body, output);
+}
+
+/** Lets the backend ready itself for the turn a warmup announces. Never generates and never fails the warmup. */
+export function prewarmLocal(body: ResponsesBody): void {
+  const backend = backendFor(body.model);
+  if (!backend?.prewarm) return;
+  try { backend.prewarm(validateRequest(adaptRequest(body, backend))); }
+  catch { logSafe('prewarm-skipped', { backend: backend.name }); }
 }

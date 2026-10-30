@@ -1,12 +1,21 @@
 /** Exclusive leases keep a cancelled Cursor run from ever killing another request's bridge. */
-export type CursorLease<T> = { value: T; reused: boolean; release(): void; discard(): Promise<void> };
-type Entry<T> = { key: string; value?: T; busy: boolean; startup?: AbortController; timer?: ReturnType<typeof setTimeout> };
+export type CursorLease<T> = {
+  value: T; reused: boolean;
+  /** Returns the bridge to the pool; `holdMs` keeps it at least that long, e.g. for a retained session. */
+  release(holdMs?: number): void;
+  discard(): Promise<void>;
+};
+type Entry<T> = { key: string; value?: T; busy: boolean; startup?: AbortController; timer?: ReturnType<typeof setTimeout>; idleSince?: number };
 type Waiter<T> = {
   key: string; preferred?: T; signal?: AbortSignal;
   resolve(lease: CursorLease<T>): void; reject(error: unknown): void; abort(): void;
 };
 
-/** A bounded resident pool, including startup and cleanup. Idle sessions yield immediately to work. */
+/**
+ * A bounded resident pool, including startup and cleanup. Idle sessions yield immediately to work.
+ * Idle bridges expire after `idleMs`, except that the last `warm` idle bridges per key stay for
+ * `warmIdleMs`, so a pause between messages does not pay a cold bridge start.
+ */
 export class CursorBridgePool<T> {
   private readonly entries = new Set<Entry<T>>();
   private readonly waiting: Waiter<T>[] = [];
@@ -21,6 +30,8 @@ export class CursorBridgePool<T> {
     private readonly create: (key: string, signal?: AbortSignal) => Promise<T>,
     private readonly destroy: (value: T) => Promise<void>,
     private readonly alive: (value: T) => boolean,
+    private readonly warm = 0,
+    private readonly warmIdleMs = idleMs,
   ) {}
 
   acquire(key: string, signal?: AbortSignal, preferred?: T): Promise<CursorLease<T>> {
@@ -40,6 +51,13 @@ export class CursorBridgePool<T> {
       signal?.addEventListener('abort', waiter.abort, { once: true });
       this.drain();
     });
+  }
+
+  /** Starts one bridge ahead of demand, unless one for this key is idle or starting, or capacity is taken. */
+  prewarm(key: string): void {
+    if (this.closed || this.waiting.length || this.entries.size + this.disposing.size >= this.limit) return;
+    if ([...this.entries].some(entry => entry.key === key && (!entry.busy || entry.startup))) return;
+    this.acquire(key).then(lease => lease.release(), () => {});
   }
 
   private drain(): void {
@@ -87,12 +105,13 @@ export class CursorBridgePool<T> {
     let released = false;
     return {
       value: entry.value!, reused,
-      release: () => {
+      release: (holdMs?: number) => {
         if (released) return;
         released = true;
         if (this.closed || !this.alive(entry.value!)) { this.evict(entry); return; }
         entry.busy = false;
-        entry.timer = setTimeout(() => this.evict(entry), this.idleMs);
+        entry.idleSince = Date.now();
+        entry.timer = setTimeout(() => this.expire(entry), Math.max(this.idleMs, holdMs ?? 0));
         entry.timer.unref?.();
         this.drain();
       },
@@ -102,6 +121,18 @@ export class CursorBridgePool<T> {
         await this.evict(entry);
       },
     };
+  }
+
+  /** The idle window passed: evict, unless this is one of the key's last `warm` idle bridges. */
+  private expire(entry: Entry<T>): void {
+    const others = [...this.entries].filter(other => other !== entry && !other.busy && other.key === entry.key).length;
+    const remaining = (entry.idleSince ?? 0) + this.warmIdleMs - Date.now();
+    if (others < this.warm && remaining > 0) {
+      entry.timer = setTimeout(() => this.expire(entry), remaining);
+      entry.timer.unref?.();
+      return;
+    }
+    void this.evict(entry);
   }
 
   private evict(entry: Entry<T>): Promise<void> {

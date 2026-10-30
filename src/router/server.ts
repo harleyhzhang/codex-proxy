@@ -19,7 +19,7 @@ import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOption
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
-import { localResponse } from './local';
+import { localResponse, prewarmLocal } from './local';
 import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
 import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
 
@@ -442,6 +442,7 @@ export function startRouter(options: RouterOptions) {
         // Preserve upstream's real warmup ID so the first turn can continue on this connection.
         await relayUpstreamStream(body, ws.data.headers, controller.signal, interrupt.signal, (event) => live() && send(event), send, fetchUpstream);
       } else if (body.generate === false) {
+        if (isLocalModel(body.model)) prewarmLocal(body);
         // Codex continues from a warmup's response id, so warmups are remembered too.
         const warm = responseObject(body, EMPTY_OUTPUT);
         history.remember(body, warm);

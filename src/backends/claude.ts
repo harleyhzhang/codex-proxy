@@ -138,6 +138,16 @@ const IDENTITY_STALL_GRACE_MS = 6 * 60 * 60_000;
  */
 const IDENTITY_CACHE_MS = 60_000;
 
+/**
+ * While an account was used this recently, its identity is re-probed in the background shortly before
+ * the cache expires, so a fresh session finds a recent answer instead of waiting on `auth status`
+ * (median about 0.8 s, slow runs 2-3.6 s). The cache window itself is unchanged: every answer a turn
+ * relies on is still at most `CLAUDE_IDENTITY_CACHE_MS` old. 0 disables the refresh.
+ */
+const IDENTITY_REFRESH_MS = 900_000;
+/** How long before the cache expires the background probe starts; covers a slow probe. */
+const IDENTITY_REFRESH_LEAD_MS = 10_000;
+
 type SharedProbe = { binding: string | undefined; done: Promise<void>; controller: AbortController; waiters: number };
 
 // Unclaimed standbys die with the router instead of outliving it as orphans holding its pipes.
@@ -152,6 +162,8 @@ export class ClaudeAccount {
   private verifiedAt = 0;
   private verifiedBinding?: string;
   private probe?: SharedProbe;
+  private lastActiveAt = 0;
+  private refreshTimer?: ReturnType<typeof setTimeout>;
   private readonly standbys: ClaudeWorker[] = [];
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
   onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
@@ -250,7 +262,10 @@ export class ClaudeAccount {
     const answered = !!info?.loggedIn && emailMatch && orgMatch;
     // The cache and stall grace bind to the profile the probe ran under, and only while it is unchanged.
     // A profile that changed during the probe gets a binding no later probe can match.
-    const verified = () => { this.verifiedAt = Date.now(); this.verifiedBinding = this.binding() === binding ? binding : 'changed-during-probe'; };
+    const verified = () => {
+      this.verifiedAt = Date.now(); this.verifiedBinding = this.binding() === binding ? binding : 'changed-during-probe';
+      this.scheduleRefresh();
+    };
     if (exitCode === 0 && answered) { verified(); return; }
     // Bun reports the spawn-timeout SIGTERM as exit 143 and leaves `signalCode` null, so both spellings
     // mean "our own deadline killed it". When the full answer had already been written before that kill
@@ -287,6 +302,44 @@ export class ClaudeAccount {
     throw new BackendError('Claude account identity does not match its configured login');
   }
 
+  /**
+   * Re-probes shortly before the verified identity expires while the account is in use, so the next
+   * fresh session does not wait for `auth status`. A failed or mismatched answer schedules nothing and
+   * is handled exactly as a turn's own probe would handle it (a mismatch clears the cache and standbys).
+   */
+  private scheduleRefresh(): void {
+    clearTimeout(this.refreshTimer);
+    this.refreshTimer = undefined;
+    const windowMs = nonNegativeInt('CLAUDE_IDENTITY_REFRESH_MS', IDENTITY_REFRESH_MS);
+    const cacheMs = nonNegativeInt('CLAUDE_IDENTITY_CACHE_MS', IDENTITY_CACHE_MS);
+    if (!windowMs || !cacheMs || Date.now() - this.lastActiveAt > windowMs) return;
+    this.refreshTimer = setTimeout(() => {
+      this.refreshTimer = undefined;
+      if (Date.now() - this.lastActiveAt > windowMs) return;
+      void this.awaitProbe(this.binding()).catch(() => {});
+    }, Math.max(cacheMs - IDENTITY_REFRESH_LEAD_MS, Math.ceil(cacheMs / 2)));
+    // A refresh must never keep the router alive on its own.
+    this.refreshTimer.unref?.();
+  }
+
+  /**
+   * Records use, which keeps the background identity refresh going for `CLAUDE_IDENTITY_REFRESH_MS`.
+   * After a lapse the cached answer has expired, so the turn's own probe restarts the refresh.
+   */
+  private markActive(): void { this.lastActiveAt = Date.now(); }
+
+  /**
+   * Readies the fresh session a chat that just opened is about to need: the login check runs now and a
+   * CLI with the same launch arguments is parked. Nothing is sent to that CLI until a real turn passes
+   * its own identity check, exactly as for the standby kept after a turn. Never throws.
+   */
+  prewarm(request: ResponsesRequest): void {
+    this.markActive();
+    let key: string;
+    try { key = workerLaunchKey(request, this); } catch { return; }
+    void this.verifyIdentity().then(() => this.keepStandby(request, key), () => {});
+  }
+
   /** A prewarmed CLI launched with exactly these arguments, if one is idle. */
   takeStandby(key: string): ClaudeWorker | undefined {
     const index = this.standbys.findIndex((worker) => worker.launchKey === key && worker.idle);
@@ -306,7 +359,7 @@ export class ClaudeAccount {
     if (!max || this.standbys.some((worker) => worker.launchKey === key)) return;
     while (this.standbys.length >= max) this.standbys.shift()?.close();
     // An unclaimed standby closes its stdin when the window passes, and the CLI exits.
-    this.standbys.push(new ClaudeWorker(request, this, key, positiveInt('CLAUDE_STANDBY_IDLE_MS', 120_000)));
+    this.standbys.push(new ClaudeWorker(request, this, key, positiveInt('CLAUDE_STANDBY_IDLE_MS', 900_000)));
   }
 
   private pruneStandbys(): void {
@@ -319,6 +372,7 @@ export class ClaudeAccount {
   }
 
   run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+    this.markActive();
     // One attempt. A dropped connection surfaces as a transport error and the router's shared
     // offline policy (`localResponse`) keeps the request pending and retries it.
     return runClaudeOnce(request, signal, this);
@@ -736,6 +790,7 @@ export const claudeBackend: SubscriptionBackend = {
   catalog: [claudeModel('claude-opus-5-5', 'Opus 5.5'), claudeModel('claude-fable-5-1', 'Fable 5.1')],
   assertAvailable: (model) => claudeLimits.assertAvailable(model),
   run: runClaude,
+  prewarm: (request) => primaryClaudeAccount.prewarm(request),
 };
 
 export type SecondaryClaudeOptions = ClaudeAccountOptions & { configDir: string; prefix: string; label: string; models?: readonly string[] };
@@ -758,6 +813,7 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
     catalog: selected.map(model => claudeModel(`${options.prefix}-${model}`, `${model === 'claude-opus-5-5' ? 'Opus 5.5' : 'Fable 5.1'} (${options.label})`)),
     assertAvailable: model => account.limits.assertAvailable(model),
     run: (request, signal) => account.run(request, signal),
+    prewarm: request => account.prewarm(request),
   };
   return { account, backend };
 }

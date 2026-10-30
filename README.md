@@ -333,11 +333,14 @@ Everything has a default; set only what you need.
 | `CLAUDE_TIMEOUT_MS` | `900000` | Per-turn Claude timeout |
 | `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude session stays warm |
 | `CLAUDE_IDENTITY_CACHE_MS` | `60000` | Reuse a verified identity while its local account binding is unchanged; `0` probes each fresh session |
+| `CLAUDE_IDENTITY_REFRESH_MS` | `900000` | While an account was used this recently, re-check its identity in the background just before the cache expires; `0` disables |
 | `CLAUDE_STANDBY_MAX` | `1` | Maximum unused prewarmed CLI per account; `0` disables prewarming |
-| `CLAUDE_STANDBY_IDLE_MS` | `120000` | Lifetime of an unused prewarmed Claude CLI |
+| `CLAUDE_STANDBY_IDLE_MS` | `900000` | Lifetime of an unused prewarmed Claude CLI (also started by a chat-open warmup) |
 | `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
-| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle bridge lifetime, including any retained tool session |
-| `CURSOR_SESSION_IDLE_MS` | `900000` | Maximum age of a retained Cursor tool session; bridge eviction can end it sooner |
+| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges; a bridge holding a retained tool session stays until that session expires |
+| `CURSOR_WARM_BRIDGES` | `1` | Idle bridges per login kept for `CURSOR_WARM_BRIDGE_IDLE_MS` instead; a chat-open warmup also starts one |
+| `CURSOR_WARM_BRIDGE_IDLE_MS` | `900000` | Idle lifetime of those warm bridges |
+| `CURSOR_SESSION_IDLE_MS` | `900000` | Maximum age of a retained Cursor tool session |
 | `CURSOR_BRIDGE_REUSE` | `1` | `0` restores one bridge process per request |
 | `CURSOR_SESSION_REUSE` | `1` | `0` disables agent continuation while retaining bridge pooling |
 | `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |

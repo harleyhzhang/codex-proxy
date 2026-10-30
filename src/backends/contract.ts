@@ -29,6 +29,11 @@ export interface SubscriptionBackend {
   /** Pre-generation gate, e.g. a known exhausted quota. Throws a BackendError to refuse. */
   assertAvailable?(model: string): void;
   run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput>;
+  /**
+   * Optional, best effort: readies a process or login check for the turn a `generate: false` warmup
+   * announces (Codex sends one when a chat opens). Must never start a generation, send a prompt or throw.
+   */
+  prewarm?(request: ResponsesRequest): void;
 }
 
 export type FailureOptions = {

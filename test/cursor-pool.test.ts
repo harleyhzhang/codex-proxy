@@ -82,4 +82,36 @@ describe('Cursor bounded exclusive bridge pool', () => {
     expect(await second).toEqual(new Error('Cursor bridge pool is closed'));
     expect(startupSignal?.aborted).toBe(true);
   });
+
+  test('the last idle bridge per key stays warm, a held session outlives the idle window, and prewarm starts one bridge', async () => {
+    let next = 0;
+    const destroyed: number[] = [];
+    const pool = new CursorBridgePool(3, 20, async () => ({ id: ++next, live: true }),
+      async value => { value.live = false; destroyed.push(value.id); }, value => value.live, 1, 150);
+    try {
+      const a = await pool.acquire('key'), b = await pool.acquire('key');
+      a.release(); b.release();
+      await Bun.sleep(60);
+      // One of the two idle bridges expired after the short window; the other is the warm one.
+      expect(destroyed).toHaveLength(1);
+      await Bun.sleep(160);
+      expect(destroyed).toHaveLength(2);
+
+      const held = await pool.acquire('other');
+      held.release(100);
+      await Bun.sleep(60);
+      expect(held.value.live).toBe(true);
+
+      // An idle bridge for the key already exists, so prewarm does nothing; a new key gets one.
+      pool.prewarm('other');
+      await Bun.sleep(5);
+      expect(next).toBe(3);
+      pool.prewarm('third');
+      await Bun.sleep(5);
+      expect(next).toBe(4);
+      const warmed = await pool.acquire('third');
+      expect(warmed.reused).toBe(true);
+      warmed.release();
+    } finally { await pool.close(); }
+  });
 });

@@ -148,3 +148,38 @@ test('an expired or evicted standby is killed even when the CLI ignores end of i
     expect((await f.prompts()).length).toBe(3);
   } finally { delete process.env.CLAUDE_STANDBY_IDLE_MS; }
 });
+
+test('a chat-open prewarm checks the login and parks a CLI without prompting it; the first turn uses both', async () => {
+  const f = await fixture();
+  f.account.prewarm(hello());
+  const parked = await launched(f, 1);
+  expect(parked.length).toBe(1);
+  expect(await f.probes()).toBe(1);
+  expect((await f.prompts()).length).toBe(0);
+  const output = await f.account.run(hello());
+  expect(output.text).toBe(parked[0]!);
+  expect(await f.probes()).toBe(1);
+  // Unsupported launch arguments are skipped silently; a warmup never fails.
+  expect(() => f.account.prewarm(hello('ultra'))).not.toThrow();
+});
+
+test('an account in use re-checks its login in the background before the cached answer expires', async () => {
+  const f = await fixture();
+  process.env.CLAUDE_IDENTITY_CACHE_MS = '400';
+  try {
+    await f.account.run(hello());
+    expect(await f.probes()).toBe(1);
+    await Bun.sleep(320);
+    expect(await f.probes()).toBe(2);
+    // The refreshed answer serves the next fresh session without a probe of its own.
+    await f.account.run(hello());
+    expect(await f.probes()).toBe(2);
+    // Outside the activity window nothing is refreshed.
+    process.env.CLAUDE_IDENTITY_REFRESH_MS = '1';
+    await Bun.sleep(500);
+    await f.account.run(hello());
+    const settled = await f.probes();
+    await Bun.sleep(320);
+    expect(await f.probes()).toBe(settled);
+  } finally { delete process.env.CLAUDE_IDENTITY_CACHE_MS; delete process.env.CLAUDE_IDENTITY_REFRESH_MS; }
+});
