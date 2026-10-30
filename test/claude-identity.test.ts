@@ -138,12 +138,13 @@ test('an expired or evicted standby is killed even when the CLI ignores end of i
   // Counted from the process table, so a standby killed before it even logged its launch still counts.
   const running = async () => (await new Response(Bun.spawn(['ps', '-axo', 'command'], { stdout: 'pipe' }).stdout).text()).split('\n').filter((line) => line.includes(f.binary)).length;
   // Three launches with different arguments: with a cap of one, the first two standbys are evicted
-  // and the last expires unclaimed after its short idle window.
-  process.env.CLAUDE_STANDBY_IDLE_MS = '150';
+  // and the last expires unclaimed after its idle window. The window has to outlast the `ps` check
+  // below on a loaded machine (150 ms did not), and the kill is polled for rather than slept on.
+  process.env.CLAUDE_STANDBY_IDLE_MS = '1000';
   try {
     for (const effort of ['high', 'low', 'medium']) await f.account.run(hello(effort));
     expect(await running()).toBeGreaterThan(0);
-    await Bun.sleep(500);
+    for (let waited = 0; waited < 5000 && (await running()) > 0; waited += 100) await Bun.sleep(100);
     expect(await running()).toBe(0);
     expect((await f.prompts()).length).toBe(3);
   } finally { delete process.env.CLAUDE_STANDBY_IDLE_MS; }

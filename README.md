@@ -399,6 +399,11 @@ Create `~/Library/LaunchAgents/codex-subscription-proxy.plist` with `ProgramArgu
 `bun /path/to/codex-subscription-proxy/src/main.ts`, `RunAtLoad` and `KeepAlive` set to true, then
 `launchctl load` it. The process exits on unexpected errors so launchd restarts it cleanly.
 
+Set `ProcessType` to `Interactive`. Codex waits on every request the router serves, and the CLIs it
+starts inherit its class: under `Background` (CPU and I/O throttled to priority 4) the router's share of
+a cold Claude turn measured 1.0 s median and 3.0 s p90, against 0.29 s and 0.35 s under `Interactive`.
+A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k` keeps the loaded one.
+
 ## Security
 
 - Listens on `127.0.0.1` only.
