@@ -152,6 +152,31 @@ process.exit(1);`);
   expect((await pids('cli.pids')).length).toBe(2);
 });
 
+test('the CLI gets a zero-tool boundary: a recognized allowlist entry that is also denied, exact internal IDs, and the MCP meta tools denied', async () => {
+  // An unknown --tools name makes Grok Build keep its full native toolset, so the allowlist must be a
+  // real ID; denying that same ID leaves the session with no tools to dispatch.
+  await cli(`const tools = args[args.indexOf('--tools') + 1]; const denied = args[args.indexOf('--disallowed-tools') + 1].split(',');
+const ok = tools === 'read_file' && ['read_file', 'run_terminal_cmd', 'write', 'search_tool', 'use_tool', 'bash', 'web_fetch', 'Agent'].every((t) => denied.includes(t))
+  && args.includes('--verbatim') && args[args.indexOf('--permission-mode') + 1] === 'dontAsk' && ['Bash', 'Read', 'Write'].every((t) => args.includes(t));
+console.log(${JSON.stringify(result('__OK__'))}.replace('__OK__', String(ok)));`);
+  expect((await runGrok({ model: 'grok-4.7', input: 'ARGS' })).text).toBe('true');
+});
+
+test('a prompt well over the CLI offload threshold reaches the prompt file whole, with --verbatim so the CLI sends it as given', async () => {
+  await cli(`console.log(${JSON.stringify(result('__SEEN__'))}.replace('__SEEN__', String(args.includes('--verbatim')) + '|' + String(prompt.length) + '|' + String(prompt.includes(process.env.LARGE_HEAD)) + String(prompt.includes(process.env.LARGE_MID)) + String(prompt.includes(process.env.LARGE_TAIL))));`);
+  const [head, mid, tail] = ['LARGE_HEAD_7Q2', 'LARGE_MID_4K9', 'LARGE_TAIL_1Z8'];
+  Object.assign(process.env, { LARGE_HEAD: head, LARGE_MID: mid, LARGE_TAIL: tail });
+  const pad = 'synthetic padding line for the offload threshold\n'.repeat(3000);
+  const input = `${head}\n${pad}${mid}\n${pad}${tail}`;
+  try {
+    const [verbatim, length, markers] = (await runGrok({ model: 'grok-4.7', input })).text.split('|');
+    expect(verbatim).toBe('true');
+    expect(Number(length)).toBeGreaterThan(input.length);
+    expect(input.length).toBeGreaterThan(250_000);
+    expect(markers).toBe('truetruetrue');
+  } finally { for (const key of ['LARGE_HEAD', 'LARGE_MID', 'LARGE_TAIL']) delete process.env[key]; }
+});
+
 test('user text and tool output reach the prompt file byte for byte, vendor phrases included', async () => {
   const phrase = "Claude Code's native tools";
   await cli(`console.log(${JSON.stringify(result('__SEEN__'))}.replace('__SEEN__', String(prompt.split(${JSON.stringify(phrase)}).length - 1) + '|' + String(prompt.includes("Grok Build's native tools are"))));`);

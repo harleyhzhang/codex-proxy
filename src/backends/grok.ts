@@ -19,12 +19,24 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 const MAX_TOOL_CALLS = 64;
 
-/** Grok's own tool names. `--tools` alone does not hide them, so they are also disallowed. */
+/**
+ * Grok's own tool names, denied by exact internal ID (the CLI has no alias map). `run_terminal_cmd`
+ * and `write` are the real shell and write IDs; `search_tool`/`use_tool` are the MCP meta tools the
+ * allowlist always keeps unless they are denied. The older names stay for other CLI versions.
+ */
 const NATIVE_TOOLS = [
   'Agent', 'bash', 'run_terminal_command', 'read_file', 'write_file', 'search_replace', 'apply_patch',
   'list_dir', 'grep_search', 'file_search', 'todo_write', 'web_fetch', 'web_search', 'grep', 'glob', 'ls',
   'view_file', 'edit_file', 'create_file', 'delete_file',
+  'run_terminal_cmd', 'write', 'search_tool', 'use_tool',
 ];
+/**
+ * The `--tools` allowlist. It must name a tool the CLI recognizes: an unknown name makes Grok Build
+ * 1.0.46 log "tools allowlist had unmappable entries; keeping full grok toolset" and enable every
+ * remaining native tool. `read_file` is recognized and also denied above, so the session registers no tools at
+ * all (verified October 30, 2026: tool_count=0, empty tool_definitions).
+ */
+const ALLOWED_TOOLS = 'read_file';
 const DENIED_TOOLS = ['Bash', 'Read', 'Grep', 'Edit', 'Write', 'WebFetch', 'MCPTool'];
 /** The message the PreToolUse hook (scripts/grok-deny-native.py) returns for every native call. */
 export const NATIVE_DENIAL = 'Native Grok actions disabled: Codex owns execution';
@@ -420,7 +432,7 @@ function grokArgs(dir: string, effort: string, request: ResponsesRequest, prompt
     '-m', MODEL,
     '--effort', effort,
     '--permission-mode', 'dontAsk',
-    '--tools', '__codex_external_only__',
+    '--tools', ALLOWED_TOOLS,
     ...DENIED_TOOLS.flatMap((tool) => ['--deny', tool]),
     '--disallowed-tools', NATIVE_TOOLS.join(','),
     '--no-plan',
@@ -434,6 +446,9 @@ function grokArgs(dir: string, effort: string, request: ResponsesRequest, prompt
     // by silence instead of a total deadline. `interpretRun` only reads `assistant`/`result` records.
     '--include-partial-messages',
     '--prompt-file', promptFile,
+    // Without it the CLI replaces any prompt over about 100 KB with an excerpt plus a pointer to an
+    // archived copy, hiding the newest history and the tool list (verified to 614 KB with it).
+    '--verbatim',
   ];
 }
 

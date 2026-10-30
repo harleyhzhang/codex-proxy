@@ -370,11 +370,25 @@ not treated as stuck repeated reads. Cursor models can repair malformed output
 in the same agent with a bounded correction budget. Authentication, native
 action attempts, model changes and cancelled runs never use that repair path.
 
-Grok Build has its own tools. The proxy hides them and tells Grok that Codex owns execution, but
-the real boundary is a `PreToolUse` hook that denies every native call. Give Grok a dedicated
-`GROK_HOME`, register [`scripts/grok-deny-native.py`](scripts/grok-deny-native.py) as its
-`PreToolUse` hook, and pin `GROK_BIN_SHA256` and `GROK_PROFILE_SHA256` so any later change pauses
-the backend instead of running unreviewed.
+The CLI must receive `--verbatim`: Grok Build 1.0.46 otherwise replaces prompts
+over roughly 100 KB with excerpts and an archive pointer, losing history and
+tool contracts even below the model's context window. The bridge keeps the
+full prompt in a private file and sends it without that offload.
+
+Grok's native tool registry is emptied before generation. The bridge allows
+the recognized `read_file` ID, explicitly denies that same ID, and denies the
+`search_tool`/`use_tool` meta tools the CLI otherwise always retains. Unknown
+allowlist placeholders fail open in this CLI and must not be used. The empty
+finalized registry supplies both model definitions and dispatch handlers, so
+native calls have no executable handler. Validate the active session's
+`tool_definitions_count=0` after CLI upgrades before accepting a new binary pin.
+
+Give Grok a dedicated `GROK_HOME` and pin `GROK_BIN_SHA256` and
+`GROK_PROFILE_SHA256` so changes pause the backend for review. The optional
+[`scripts/grok-deny-native.py`](scripts/grok-deny-native.py) hook is an extra
+defense only when runtime loading is verified: 1.0.46 can list a user hook in
+`inspect` while loading none in real sessions. The execution boundary does
+not depend on that hook being present.
 
 ### Run at login (macOS)
 
@@ -387,8 +401,8 @@ Create `~/Library/LaunchAgents/codex-subscription-proxy.plist` with `ProgramArgu
 - Listens on `127.0.0.1` only.
 - Every request must carry the exact ChatGPT token Codex stored in `auth.json`. Requests with an
   `Origin` header (browsers) are rejected.
-- Claude and Grok run with their own tools, MCP servers, hooks and plugins disabled, and with API
-  keys stripped from their environment, so they can only answer through Codex.
+- Claude and Grok run with native execution tools and integrations disabled,
+  with API keys stripped from their environment. Codex executes their returned calls.
 - Cursor uses its separately stored SDK credential and the no-native-tools policy described above.
 - Logs record event names, sizes and counts, never prompt or response content.
 - Compaction capsules for Claude/Grok chats are sealed with AES-256-GCM using a local key.

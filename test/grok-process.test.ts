@@ -7,7 +7,7 @@ test('isolated Grok sessions preserve simultaneous parent/child tasks; native ac
  const dir=await mkdtemp(tmpdir()+'/grok-process-');const binary=dir+'/fixture';
  await Bun.write(binary,`#!/usr/bin/env bun
  const args=process.argv;const file=args[args.indexOf('--prompt-file')+1];const text=await Bun.file(file).text();
- if(args[args.indexOf('--tools')+1]!=='__codex_external_only__' || !args.includes('--no-subagents'))process.exit(9);
+ if(args[args.indexOf('--tools')+1]!=='read_file' || !args.includes('--no-subagents') || !args.includes('--verbatim'))process.exit(9);
  if(text.includes('HANG'))await new Promise(()=>{});
  else {if(text.includes('AUTOCOMPACT'))console.log(JSON.stringify({type:'auto_compact_started'}));console.log(JSON.stringify({stopReason:'end_turn',num_turns:text.includes('NATIVE')?99:1,structuredOutput:{text:text.includes('CHILD')?'CHILD_TOKEN':'PARENT_TOKEN',tool_calls:[]}}));}
  `);await chmod(binary,0o700);
