@@ -8,7 +8,7 @@ import { logSafe } from '../log';
 import { imageUrl, isImagePart, type ToolDescriptor } from '../protocol/prompt';
 import { checkToolArguments, fieldName } from '../protocol/tool-schema';
 import { codexCall, type FunctionTool } from '../protocol/native-tools';
-import type { ResponseInputItem, ToolCall } from '../protocol/types';
+import type { ResponseInputItem, TextSink, ToolCall } from '../protocol/types';
 
 /** The SDK's MCP provider for host-defined tools; every allowed tool call must target it. */
 export const CUSTOM_TOOLS_PROVIDER = 'custom-user-tools';
@@ -76,6 +76,7 @@ export class NativeRun {
   private finished = false;
   private failure?: Error;
   private wake?: () => void;
+  private sink?: TextSink;
   closed = false;
 
   constructor(readonly byKey: Map<string, ToolDescriptor>, private readonly settleMs: number) {}
@@ -102,7 +103,16 @@ export class NativeRun {
     });
   }
 
-  appendText(text: string): void { this.text += text; }
+  appendText(text: string): void { this.text += text; this.sink?.text(text); }
+
+  /**
+   * Streams this run's text to the Codex turn now waiting on it, starting with any text written while
+   * no turn was waiting. The turn's yield detaches it; later text waits for the next turn.
+   */
+  attach(sink: TextSink | undefined): void {
+    this.sink = sink;
+    if (sink && this.text) sink.text(this.text);
+  }
   finish(): void { this.finished = true; clearTimeout(this.settle); this.settled = true; this.wake?.(); }
   fail(error: Error): void { this.failure ??= error; this.wake?.(); }
 
@@ -117,6 +127,7 @@ export class NativeRun {
         for (const call of calls) { const held = this.held.get(call.callId!); if (held) { this.held.delete(held.callId); this.delivered.set(held.callId, held); } }
         const text = this.text;
         this.text = '';
+        this.sink = undefined;
         return { text, calls, finished: this.finished && !calls.length, usage: this.usage };
       }
       await new Promise<void>((resolve, reject) => {

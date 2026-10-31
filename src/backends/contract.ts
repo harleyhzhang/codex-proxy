@@ -3,7 +3,7 @@
 import { randomId } from '../json';
 import { logSafe } from '../log';
 import { CLIENT_TOOL_TYPES } from '../protocol/prompt';
-import type { ProxyOutput, ResponsesBody, ResponsesRequest } from '../protocol/types';
+import type { ProxyOutput, ResponsesBody, ResponsesRequest, TextSink } from '../protocol/types';
 
 /** One entry in the model picker. */
 export type CatalogModel = {
@@ -28,7 +28,8 @@ export interface SubscriptionBackend {
   readonly catalog: readonly CatalogModel[];
   /** Pre-generation gate, e.g. a known exhausted quota. Throws a BackendError to refuse. */
   assertAvailable?(model: string): void;
-  run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput>;
+  /** `sink`, when given, receives the turn's assistant text as it arrives. */
+  run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput>;
   /**
    * Optional, best effort: readies a process or login check for the turn a `generate: false` warmup
    * announces (Codex sends one when a chat opens). Must never start a generation, send a prompt or throw.
@@ -41,16 +42,8 @@ type FailureOptions = {
   code?: string;
   /** A content-free event the router logs when it delivers this refusal. */
   logEvent?: Record<string, unknown>;
-  /** True only when the backend refused before anything reached Codex, so one more attempt is safe. */
+  /** A provider-side transient failure before anything reached Codex, so one more attempt is safe. */
   retryable?: boolean;
-  /** How many fresh attempts this refusal earns (default 1). Model-output refusals that a stronger note usually fixes may ask for 2. */
-  retries?: number;
-  /**
-   * True when the refusal is about what the model wrote (unparseable reply, bad tool arguments, unknown
-   * tool). After the one retry, such a refusal is delivered as a chat message instead of a failed turn.
-   * Process crashes, transport failures and native-tool attempts must leave this false.
-   */
-  modelOutput?: boolean;
 };
 
 /**
@@ -61,8 +54,6 @@ export class BackendError extends Error {
   readonly code: string;
   readonly logEvent?: Record<string, unknown>;
   readonly retryable: boolean;
-  readonly modelOutput: boolean;
-  readonly retries: number;
 
   constructor(message: string, options: FailureOptions = {}) {
     super(message);
@@ -70,83 +61,20 @@ export class BackendError extends Error {
     this.code = options.code ?? 'invalid_request_error';
     this.logEvent = options.logEvent;
     this.retryable = options.retryable ?? false;
-    this.modelOutput = options.modelOutput ?? false;
-    this.retries = Math.max(1, options.retries ?? 1);
   }
 }
 
-export const RETRY_MARKER = 'rejected before anything ran';
-
 /**
- * The one retry policy every backend shares. A retryable refusal means nothing reached Codex, so a
- * second attempt is safe and is told why the first was rejected. Cancellation, timeouts, auth and
- * quota failures are never retryable and surface immediately.
- *
- * When the retry is also refused and the refusal is about the model's own output (`modelOutput`),
- * the turn is not failed. The refusal is delivered as an ordinary assistant message: Codex keeps the
- * turn open, the user sees what went wrong in the chat, and can reply naturally instead of hitting an
- * error card and typing "continue". No tool call is emitted. Crashes and transport failures still fail.
+ * The one retry policy every backend shares. A retryable refusal is a provider-side transient failure
+ * before anything reached Codex, so one fresh attempt is safe; text Codex already shows rules it out.
+ * Whatever happens next reaches Codex with its real reason.
  */
-export async function retryOnce(
-  backend: string,
-  signal: AbortSignal | undefined,
-  attempt: (retryNote: string, lastAttempt: boolean) => Promise<ProxyOutput>,
-): Promise<ProxyOutput> {
-  // The first refusal decides how many fresh attempts follow (usually one). Each attempt is told
-  // whether it is the last so a backend can relax a recoverable check (e.g. accept bare prose as a
-  // chat message) only when nothing else is left to try. Non-retryable errors propagate unchanged.
-  let error: BackendError | undefined;
-  let budget = 1;
-  for (let index = 0; index <= budget; index++) {
-    const last = index === budget;
-    try {
-      const note = error ? ` Your previous answer was ${RETRY_MARKER}: ${error.message}. Follow the output rules exactly this time.` : '';
-      return await attempt(note, last);
-    } catch (caught) {
-      if (!(caught instanceof BackendError) || !caught.retryable || signal?.aborted) throw caught;
-      if (index === 0) budget = caught.retries;
-      if (last) {
-        if (!caught.modelOutput) throw caught;
-        logSafe('backend-refusal-as-message', { backend, reason: caught.message });
-        return refusalMessage(backend, caught);
-      }
-      logSafe('backend-retry', { backend, reason: caught.message, attempt: index + 1, budget });
-      error = caught;
-    }
+export async function retryOnce(backend: string, signal: AbortSignal | undefined, attempt: () => Promise<ProxyOutput>, sink?: TextSink): Promise<ProxyOutput> {
+  try { return await attempt(); } catch (error) {
+    if (!(error instanceof BackendError) || !error.retryable || signal?.aborted || sink?.started) throw error;
+    logSafe('backend-retry', { backend, reason: error.message });
   }
-  throw error;
-}
-
-/** A text-only output that explains a refusal in the chat instead of failing the turn. */
-function refusalMessage(backend: string, error: BackendError): ProxyOutput {
-  const text = `${backend} could not produce a valid action for this turn, even after one retry: ${error.message}. Nothing was executed. Reply to continue, or rephrase the request.`;
-  return { text, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
-}
-
-type CliFailure =
-  | 'subscription usage limit reached'
-  | 'authentication failed'
-  | 'structured output failed'
-  | 'connection failed'
-  | 'process failed';
-
-/**
- * Classifies a failed CLI run. Pass only stderr and the CLI's own status records: model text can
- * mention any word, so it must never decide the category.
- */
-export function classifyCliFailure(diagnostics: string): { category: CliFailure; retryable: boolean } {
-  const category: CliFailure = /\b429\b|rate.?limit|usage limit|quota/i.test(diagnostics)
-    ? 'subscription usage limit reached'
-    : /\b401\b|unauthori[sz]ed|\bunauthenticated\b|not authenticated|token[ _-]expired|\binvalid_grant\b|\b(?:sign|log)[ ._-]?in\b|\b(?:signed|logged)[ ._-]out\b/i.test(diagnostics)
-      ? 'authentication failed'
-      : /structured.?output|json.?schema|schema validation/i.test(diagnostics)
-        ? 'structured output failed'
-        : /network|connection|timeout|timed out|dns|socket|request failed|fetch|\b5\d\d\b/i.test(diagnostics)
-          ? 'connection failed'
-          : 'process failed';
-  // A retry cannot fix the account itself.
-  const retryable = category !== 'subscription usage limit reached' && category !== 'authentication failed';
-  return { category, retryable };
+  return attempt();
 }
 
 /**

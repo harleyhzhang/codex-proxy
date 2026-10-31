@@ -3,8 +3,8 @@ import { backendFor } from '../backends/registry';
 import { logSafe } from '../log';
 import { responseObject } from '../protocol/output';
 import { validateRequest } from '../protocol/prompt';
-import { EMPTY_OUTPUT, type ResponseObject, type ResponsesBody } from '../protocol/types';
-import { reconnectTransport } from '../transport';
+import { EMPTY_OUTPUT, type ResponseObject, type ResponsesBody, type TextSink } from '../protocol/types';
+import { ProxyTransportError, reconnectTransport, transportError } from '../transport';
 
 /**
  * Runs one turn on a subscription backend. Warmups (`generate: false`) are answered locally and
@@ -14,9 +14,11 @@ import { reconnectTransport } from '../transport';
  * reach its provider reports a transport error, and because nothing has reached Codex yet the same
  * request is retried with 1-30 s backoff until the network returns or Codex cancels. Callers that
  * stream progress keep the client alive meanwhile (`pendingResponse`); the plain JSON path has no
- * channel for that, so it passes `reconnect: false` and fails like a native request would.
+ * channel for that, so it passes `reconnect: false` and fails like a native request would. Once
+ * `sink` has streamed text, a dropped connection is no longer replayed here: it fails the turn as a
+ * retryable server error, as a dropped OpenAI stream does.
  */
-export async function localResponse(body: ResponsesBody, signal?: AbortSignal, options: { reconnect?: boolean } = {}): Promise<ResponseObject> {
+export async function localResponse(body: ResponsesBody, signal?: AbortSignal, options: { reconnect?: boolean; sink?: TextSink } = {}): Promise<ResponseObject> {
   const backend = backendFor(body.model);
   if (!backend) throw new BackendError('Unsupported model');
   if (body.generate === false) {
@@ -24,7 +26,11 @@ export async function localResponse(body: ResponsesBody, signal?: AbortSignal, o
     return responseObject(body, EMPTY_OUTPUT);
   }
   const request = validateRequest(adaptRequest(body, backend));
-  const attempt = () => backend.run(request, signal);
+  const { sink } = options;
+  const attempt = () => backend.run(request, signal, sink).catch((error: unknown) => {
+    if (sink?.started && transportError(error)?.reconnectable) throw new ProxyTransportError(false, false);
+    throw error;
+  });
   const output = options.reconnect === false
     ? await attempt()
     : await reconnectTransport(attempt, signal, { onRetry: (attempts, delayMs) => logSafe('backend-offline-retry', { backend: backend.name, attempt: attempts, delay_ms: delayMs }) });

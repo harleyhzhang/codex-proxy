@@ -68,6 +68,13 @@ type Usage = { inputTokens: number; outputTokens: number; totalTokens: number };
 /** What a subscription backend returns for one turn. */
 export type ProxyOutput = { text: string; toolCalls: ToolCall[]; usage: Usage };
 
+/**
+ * Where a backend streams the assistant text of the turn it is running, as it arrives. `started` turns
+ * true with the first delta: from then on the text has reached Codex, so the turn must not be retried
+ * or replayed (the same text would appear twice). The final output's text must begin with what was streamed.
+ */
+export type TextSink = { text(delta: string): void; readonly started: boolean };
+
 export type OutputItem = { type: string; id?: string; [key: string]: unknown };
 
 /** Token accounting in the Responses API wire format. */

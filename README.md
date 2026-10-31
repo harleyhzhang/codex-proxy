@@ -3,14 +3,15 @@
 Use Claude, Grok and optional Cursor models inside [OpenAI Codex](https://github.com/openai/codex), next to GPT, in the same chat.
 
 The proxy sits between Codex and `chatgpt.com`. GPT requests pass straight through. Requests for a
-Claude model are answered by the official `claude` CLI and Grok requests by xAI's Grok endpoint,
-each signed in with your own subscription. Codex keeps running every tool, so approvals, sandboxing and history work as usual,
-and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
+Claude model go to Anthropic's Messages API and Grok requests to xAI's Grok endpoint, each signed in
+with your own subscription's login; no CLI runs per turn. Claude and Grok make real tool calls and their
+text streams into Codex as it is written. Codex keeps running every tool, so approvals, sandboxing and
+history work as usual, and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
 Grok and Claude models from a Cursor subscription without changing the Codex app.
 
 ```
 Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT models)
-                           ├──► claude CLI           (claude-*)
+                           ├──► Anthropic Messages   (claude-*)
                            ├──► xAI Grok endpoint    (grok-*)
                            └──► Cursor SDK bridge    (cursor-*, optional)
 ```
@@ -19,7 +20,7 @@ Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT mode
 
 - [Bun](https://bun.sh) 1.2+
 - Codex (desktop app or CLI), signed in with ChatGPT
-- For Claude: the [Claude Code](https://docs.anthropic.com/claude-code) CLI, signed in (`claude login`)
+- For Claude: a Claude subscription login from the [Claude Code](https://docs.anthropic.com/claude-code) CLI (`claude auth login`); the CLI is not run afterwards
 - For Grok (optional): a SuperGrok login from the Grok Build CLI (`grok login`); the CLI is not run afterwards
 
 ## Quick start
@@ -65,9 +66,11 @@ The outage therefore never consumes Codex's own stream reconnect budget, so a lo
 does not end as "Reconnecting 5/5" and a dropped turn. Recovery preserves the original request
 and tool receipts. Stop/cancel also stops the pending request and its retries.
 
-Only transport failures qualify: reset or refused sockets, DNS failures, a subscription CLI
-exiting with a network error, Cursor reporting `unavailable`. A plain (non-streaming) JSON
-request cannot be held, so it still gets an immediate 503 with a generic "Network connection
+Only transport failures qualify: reset or refused sockets, DNS failures, a Claude or Grok stream
+that ends before its terminal event, Cursor reporting `unavailable`. Once text has streamed into
+Codex the request is never replayed; a drop after that fails the turn as a retryable error.
+A plain (non-streaming) JSON request cannot be held, so it still gets an immediate 503 with a
+generic "Network connection
 interrupted" message. Timeouts are not outages: the per-turn model deadline stays terminal and
 Codex owns that budget. The native GPT relay keeps its 4-retry burst first and only switches to
 the pending loop once that burst fails on a reconnectable error. `OFFLINE_RETRY_BASE_MS`
@@ -89,7 +92,7 @@ Verbatim user anchors and tool receipts retain their existing preservation and c
 ## Retries and errors versus native Codex
 
 The router mirrors the native Codex client's retry and error policy wherever a request passes
-through to ChatGPT, and adapts it where a subscription CLI is the model. Native source of truth:
+through to ChatGPT, and adapts it where a subscription backend is the model. Native source of truth:
 `codex-rs/model-provider-info` (4 request retries, 200 ms doubling backoff, 5xx and transport
 retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames skipped,
 `response.failed` codes classified) and `codex-rs/protocol/src/error.rs` (which errors retry).
@@ -105,10 +108,11 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 | Upstream `response.failed` | classified by code | forwarded verbatim so Codex classifies it |
 | Internal router/backend crash | retryable | `server_error` 500 on every transport; diagnostic never leaked |
 | Malformed request body / unknown model | 400, not retried | 400, not retried |
-| Subscription CLI refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
+| Subscription refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
 | Prompt over the model's context window | `context_length_exceeded`, not retried | a Claude, Grok or Cursor "prompt is too long" becomes the same native `context_length_exceeded` code, so Codex stops retrying and offers compaction |
-| Provider overloaded | `server_is_overloaded`, not retried | a Claude or Grok overload (529) reported after the CLI's own retries becomes native `server_is_overloaded` instead of a retried 500 that reruns the whole CLI turn |
-| Subscription CLI network drop (Claude, Grok, Cursor) | n/a | same pending loop as above; see Connection recovery |
+| Provider 5xx (Claude, Grok) | retried 4x, 200 ms doubling | same burst before anything streams; a lasting one reaches Codex as a retryable `server_error` |
+| Provider overloaded | `server_is_overloaded`, not retried | a Claude or Grok overload (529) that outlasts that burst becomes native `server_is_overloaded` |
+| Subscription network drop (Claude, Grok, Cursor) | n/a | same pending loop as above; see Connection recovery |
 
 `test/failure-matrix.test.ts` exercises every registered model row (GPT relay, personal and
 secondary Claude, Cursor, Grok, the Opus quota fallback) against each row above on plain HTTP,
@@ -168,8 +172,8 @@ in this repository.
 
 ### A second Claude subscription
 
-Keep the second Claude login in a separate configuration directory. The same CLI
-binary can serve both accounts; a second desktop app is unnecessary.
+Keep the second Claude login in a separate configuration directory. The CLI is only
+used to sign in; a second desktop app is unnecessary.
 
 ```sh
 export CLAUDE_ACCOUNT_CONFIG_DIR="$HOME/.claude-secondary"
@@ -185,8 +189,8 @@ bun start
 
 Keep these variables set for both catalog generation and the router, then reopen
 Codex. The picker adds **Opus 5.5 (Secondary)** and **Fable 5.1 (Secondary)** while
-preserving the primary entries. Each account has its own subprocess environment,
-warm tool continuations and persisted quota snapshot. Switching accounts replays
+preserving the primary entries. Each account has its own login, token refresh and
+persisted quota snapshot. Switching accounts replays
 the shared Codex history to the selected account. A failed login or exhausted
 account never falls back to the other Claude subscription. The optional Cursor
 quota policy below applies only to secondary Opus when explicitly enabled.
@@ -194,8 +198,8 @@ quota policy below applies only to secondary Opus when explicitly enabled.
 Only enable models that the second subscription can use. `CLAUDE_ACCOUNT_MODELS`
 optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1`.
 `CLAUDE_ACCOUNT_EXPECTED_EMAIL` and `CLAUDE_ACCOUNT_EXPECTED_ORG` can pin the
-identity returned by `auth status`; they are checked before starting each new
-worker. The second profile must differ from the primary `CLAUDE_CONFIG_DIR`
+identity Anthropic reports for the login; they are checked once per access token,
+before its first turn. The second profile must differ from the primary `CLAUDE_CONFIG_DIR`
 (or `~/.claude`), including through symlinks. These options are independent of
 the optional second native Codex account and disabled by default.
 
@@ -330,22 +334,14 @@ Everything has a default; set only what you need.
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
 | `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |
-| `CLAUDE_BIN` | `claude` | Claude CLI path |
-| `CLAUDE_CONFIG_DIR` | CLI default | Primary Claude login/configuration directory |
+| `CLAUDE_CONFIG_DIR` | `~/.claude` | Primary Claude login (Claude Code configuration directory); the router uses and refreshes it |
 | `CLAUDE_EXPECTED_EMAIL`, `CLAUDE_EXPECTED_ORG` | unset | Optional primary Claude identity pins |
 | `CLAUDE_ACCOUNT_CONFIG_DIR` | unset | Enables a separate second Claude login |
 | `CLAUDE_ACCOUNT_MODEL_PREFIX` | `secondary` | Prefix for second-account Claude slugs |
 | `CLAUDE_ACCOUNT_LABEL` | `Secondary` | Picker label for the second Claude account |
 | `CLAUDE_ACCOUNT_MODELS` | both supported Claude models | Optional second-account model subset |
-| `CLAUDE_ACCOUNT_BIN`, `CLAUDE_ACCOUNT_CWD` | primary CLI settings | Optional second-account binary and working directory |
 | `CLAUDE_ACCOUNT_EXPECTED_EMAIL`, `CLAUDE_ACCOUNT_EXPECTED_ORG` | unset | Optional second Claude identity pins |
-| `CLAUDE_CWD` | current directory | Working directory for the Claude CLI |
-| `CLAUDE_TIMEOUT_MS` | `900000` | Per-turn Claude timeout |
-| `CLAUDE_SESSION_IDLE_MS` | `900000` | How long an idle Claude session stays warm |
-| `CLAUDE_IDENTITY_CACHE_MS` | `60000` | Reuse a verified identity while its local account binding is unchanged; `0` probes each fresh session |
-| `CLAUDE_IDENTITY_REFRESH_MS` | `900000` | While an account was used this recently, re-check its identity in the background just before the cache expires; `0` disables |
-| `CLAUDE_STANDBY_MAX` | `3` | Unused prewarmed CLIs per account, one per distinct launch (model, effort, tool set), least recently wanted evicted first; each idles at about 125-190 MB; `0` disables prewarming |
-| `CLAUDE_STANDBY_IDLE_MS` | `900000` | Lifetime of an unused prewarmed Claude CLI (also started by a chat-open warmup) |
+| `CLAUDE_TIMEOUT_MS` | `300000` | Claude stream idle timeout, not a total reasoning deadline |
 | `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
 | `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges |
 | `CURSOR_WARM_BRIDGES` | `1` | Idle bridges per login kept for `CURSOR_WARM_BRIDGE_IDLE_MS` instead; a chat-open warmup also starts one |
@@ -354,6 +350,23 @@ Everything has a default; set only what you need.
 | `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
 | `GROK_HOME` | `~/.grok` | Grok Build profile holding the login the router uses and refreshes (use a dedicated one) |
 | `GROK_TIMEOUT_MS` | `300000` | Grok stream idle timeout, not a total reasoning deadline |
+
+### Claude
+
+Claude turns go straight to Anthropic's Messages API with the Claude Code login of
+`CLAUDE_CONFIG_DIR` (its macOS keychain item, or `.credentials.json` elsewhere), identified
+as Claude Code, so no CLI process runs. Codex's tools are sent as Claude tools and Claude makes
+real, parallel tool calls; raw-input tools such as `apply_patch` take their input as the
+string field `input`, and namespaced tools are flattened and mapped back. History keeps its
+structure; every tool call is paired with its result as Anthropic requires. Claude's thinking
+is kept in memory and put back before its own calls on the next turn. Prompt caching marks the
+tools, the system prompt and the newest turn, so each turn reads what the previous one wrote.
+Quota comes from Anthropic's rate-limit headers on every reply.
+
+The router owns the login while it runs: it refreshes the access token shortly before expiry
+(one refresh shared by concurrent turns) and writes the rotated tokens back where Claude Code
+keeps them. Running the `claude` CLI on the same profile at the same time can invalidate the
+router's refresh token; sign in again with `claude auth login` if a turn says so.
 
 ### Grok
 
@@ -387,9 +400,9 @@ Create `~/Library/LaunchAgents/codex-subscription-proxy.plist` with `ProgramArgu
 `bun /path/to/codex-subscription-proxy/src/main.ts`, `RunAtLoad` and `KeepAlive` set to true, then
 `launchctl load` it. The process exits on unexpected errors so launchd restarts it cleanly.
 
-Set `ProcessType` to `Interactive`. Codex waits on every request the router serves, and the CLIs it
-starts inherit its class: under `Background` (CPU and I/O throttled to priority 4) the router's share of
-a cold Claude turn measured 1.0 s median and 3.0 s p90, against 0.29 s and 0.35 s under `Interactive`.
+Set `ProcessType` to `Interactive`. Codex waits on every request the router serves, and the Cursor
+bridges it starts inherit its class: under `Background` (CPU and I/O throttled to priority 4) the
+router's share of a cold turn measured 1.0 s median and 3.0 s p90, against 0.29 s and 0.35 s.
 A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k` keeps the loaded one.
 
 ## Security
@@ -397,9 +410,9 @@ A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k`
 - Listens on `127.0.0.1` only.
 - Every request must carry the exact ChatGPT token Codex stored in `auth.json`. Requests with an
   `Origin` header (browsers) are rejected.
-- Claude runs with native execution tools and integrations disabled, with API keys stripped from
-  its environment. Grok gets only Codex's tools, as function tools. Codex executes every call.
-- The Grok login token is sent only to `auth.x.ai` (refresh) and xAI's Grok endpoint.
+- Claude and Grok get only Codex's tools, as function tools. Codex executes every call.
+- The Claude login token is sent only to Anthropic (`api.anthropic.com`, and `platform.claude.com`
+  to refresh); the Grok one only to `auth.x.ai` (refresh) and xAI's Grok endpoint.
 - Cursor uses its separately stored SDK credential and the no-native-tools policy described above.
 - Logs record event names, sizes and counts, never prompt or response content.
 - Compaction capsules for Claude/Grok chats are sealed with AES-256-GCM using a local key.
@@ -414,8 +427,8 @@ See [AGENTS.md](AGENTS.md) for the layout.
 
 ## Disclaimer
 
-Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It drives the official Claude CLI,
-xAI's Grok Build endpoint and the optional official Cursor SDK bridge with your own accounts; you are
+Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It calls Anthropic's and xAI's
+endpoints as their official clients do, and the optional official Cursor SDK bridge, with your own accounts; you are
 responsible for following each provider's terms.
 
 ## License

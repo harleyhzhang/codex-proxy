@@ -192,3 +192,16 @@ test('a stream that ends without a terminal event is a dropped connection, and s
 test('the catalog row advertises images and the real 500K window', () => {
   expect(backend(login(0)).catalog).toEqual([expect.objectContaining({ slug: 'grok-4.7', inputModalities: ['text', 'image'], contextWindow: 500_000, efforts: ['low', 'medium', 'high', 'xhigh'] })]);
 });
+
+test('xAI text deltas stream through the sink, and a stream failure after text is not retried', async () => {
+  const grok = backend(login(3_600_000));
+  const deltas: string[] = [];
+  const sink = { text: (delta: string) => { deltas.push(delta); }, get started() { return deltas.length > 0; } };
+  replies.push(() => sse({ type: 'response.output_text.delta', delta: 'Hel' }, { type: 'response.output_text.delta', delta: 'lo' }, { type: 'response.completed', response: { status: 'completed', output: [say('Hello')], usage: {} } }));
+  expect((await grok.run(hello(), undefined, sink)).text).toBe('Hello');
+  expect(deltas).toEqual(['Hel', 'lo']);
+  seen.length = 0;
+  replies.push(() => sse({ type: 'response.output_text.delta', delta: 'x' }, { type: 'response.failed', response: { error: { message: 'sampler crashed' } } }));
+  await expect(grok.run(hello(), undefined, sink)).rejects.toThrow('sampler crashed');
+  expect(responses()).toHaveLength(1);
+});

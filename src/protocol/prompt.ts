@@ -1,5 +1,5 @@
-// Turns a Responses request into a single text prompt plus image blocks for a CLI model, and
-// describes Codex's tools so the model can request them through structured output.
+// Codex's tools as descriptors for the native tool-calling backends, request validation, and the
+// conversation as one text prompt plus image blocks (how Cursor receives it).
 import { isRecord } from '../json';
 import type { ResponseInputItem, ResponsesRequest, ResponseTool } from './types';
 
@@ -14,13 +14,6 @@ export const CLIENT_TOOL_TYPES: ReadonlySet<string> = new Set([
   'computer',
   'computer_use_preview',
   'tool_search',
-]);
-
-const TOOL_OUTPUT_TYPES = new Set([
-  'function_call_output',
-  'custom_tool_call_output',
-  'computer_call_output',
-  'tool_search_output',
 ]);
 
 export type ToolDescriptor = {
@@ -47,26 +40,6 @@ const TOOL_SEARCH_CONTRACT = {
   additionalProperties: false,
 };
 
-const COMPUTER_ACTIONS = {
-  actions: [
-    { type: 'click', x: 100, y: 200, button: 'left', keys: [] },
-    { type: 'double_click', x: 100, y: 200, keys: [] },
-    { type: 'move', x: 100, y: 200, keys: [] },
-    { type: 'scroll', x: 100, y: 200, scroll_x: 0, scroll_y: 500, keys: [] },
-    { type: 'keypress', keys: ['ENTER'] },
-    { type: 'type', text: 'text to enter' },
-    {
-      type: 'drag',
-      path: [
-        { x: 100, y: 200 },
-        { x: 200, y: 300 },
-      ],
-      keys: [],
-    },
-    { type: 'screenshot' },
-    { type: 'wait' },
-  ],
-};
 
 /** Flattens namespaces and assigns every Codex tool the exact name a model must use. */
 export function toolDescriptors(tools: ResponseTool[]): ToolDescriptor[] {
@@ -129,7 +102,7 @@ export function requestTools(request: { tools?: ResponseTool[]; input?: unknown 
 // Codex marks inter-agent payloads as encrypted; a non-GPT sender leaves them as plaintext.
 function encryptedText(value: unknown): string {
   if (typeof value !== 'string') return '';
-  return value.startsWith('gAAAA') ? '[OpenAI-encrypted content from a GPT agent; unreadable by Claude]' : value;
+  return value.startsWith('gAAAA') ? '[OpenAI-encrypted content from a GPT agent; unreadable here]' : value;
 }
 
 function textFromContent(content: ResponseInputItem['content']): string {
@@ -175,81 +148,15 @@ function serializeItem(item: ResponseInputItem): string {
   }
 }
 
-function describeTool(tool: ToolDescriptor): string {
-  const contract = tool.type === 'computer' ? COMPUTER_ACTIONS : tool.contract;
-  return [
-    `- name: ${tool.proxyName}`,
-    `  type: ${tool.type}`,
-    tool.description ? `  description: ${tool.description}` : '',
-    contract ? `  argument_contract: ${JSON.stringify(contract)}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
-}
-
-const TOOL_RULES = `You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls. The backend's native tools are disabled; Codex owns all action execution. For a function tool, arguments must represent the JSON object in its contract. If the required output schema uses a string, JSON-encode that object once; otherwise write the object directly. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. Screenshots and images are attached directly to this message; inspect them visually without requesting a native Read tool.`;
-
-/** `tools: false` leaves out the tool list and its JSON calling rules, for backends with native tool calls. */
-export function requestToPrompt(request: ResponsesRequest, options: { tools?: boolean } = {}): string {
+/** The conversation as text; the backend receives Codex's tools natively. */
+export function requestToPrompt(request: ResponsesRequest): string {
   const input =
     typeof request.input === 'string'
       ? `<user>\n${request.input}\n</user>`
       : request.input.map(serializeItem).join('\n\n');
-  const tools = options.tools === false ? [] : toolDescriptors(requestTools(request));
-  const toolSection = tools.length
-    ? `<available_tools>\n${tools.map(describeTool).join('\n')}\n</available_tools>\n\n${TOOL_RULES}`
-    : '';
-  return [request.instructions ? `<instructions>\n${request.instructions}\n</instructions>` : '', input, toolSection]
+  return [request.instructions ? `<instructions>\n${request.instructions}\n</instructions>` : '', input]
     .filter(Boolean)
     .join('\n\n');
-}
-
-/**
- * The suffix of a request that a still-running CLI session has not seen yet: everything from the
- * first result of a tool call that session issued. Undefined when the session cannot continue.
- * The tool list is dropped too: a session only continues when its signature (tool list included)
- * matches, so it already holds those descriptions and its output schema. Resending them on every
- * tool result added ~20K tokens per call and filled the context window in a handful of commands.
- */
-export function continuationRequest(
-  request: ResponsesRequest,
-  callIds: ReadonlySet<string>,
-): ResponsesRequest | undefined {
-  if (typeof request.input === 'string') return undefined;
-  const first = request.input.findIndex(
-    (item) =>
-      typeof item.call_id === 'string' && callIds.has(item.call_id) && TOOL_OUTPUT_TYPES.has(item.type ?? ''),
-  );
-  if (first < 0) return undefined;
-  return { ...request, instructions: undefined, tools: undefined, input: request.input.slice(first) };
-}
-
-/** The JSON schema a CLI model's structured output must satisfy: text plus listed tool calls. */
-export function outputSchema(tools: ResponseTool[]): Record<string, unknown> {
-  const descriptors = toolDescriptors(tools);
-  const toolCalls = descriptors.length
-    ? {
-        type: 'array',
-        items: {
-          type: 'object',
-          properties: {
-            name: { type: 'string', enum: descriptors.map((tool) => tool.proxyName) },
-            arguments: { type: 'string' },
-          },
-          required: ['name', 'arguments'],
-          additionalProperties: false,
-        },
-      }
-    : { type: 'array', maxItems: 0 };
-  return {
-    type: 'object',
-    properties: {
-      text: { type: 'string', description: 'Assistant text to show before or instead of tool calls.' },
-      tool_calls: toolCalls,
-    },
-    required: ['text', 'tool_calls'],
-    additionalProperties: false,
-  };
 }
 
 const IMAGE_PART_TYPES = new Set(['input_image', 'image', 'image_url', 'computer_screenshot', 'screenshot']);
@@ -305,11 +212,11 @@ function redactImages(value: unknown, legacyComputerOutput = false): string {
 }
 
 /** The prompt text plus every inline image in the conversation, in order. */
-export function preparePrompt(request: ResponsesRequest, options: { tools?: boolean } = {}): PreparedPrompt {
+export function preparePrompt(request: ResponsesRequest): PreparedPrompt {
   const images: ImageBlock[] = [];
   if (typeof request.input !== 'string') collectImages(request.input, images);
   const note = images.length ? `\n\n${images.length} image(s) from the conversation/tool results are attached in order.` : '';
-  return { prompt: requestToPrompt(request, options) + note, images };
+  return { prompt: requestToPrompt(request) + note, images };
 }
 
 /** Checks the shape every backend relies on. Throws a plain Error naming the first problem. */

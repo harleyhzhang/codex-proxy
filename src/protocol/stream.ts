@@ -48,7 +48,7 @@ export async function decodeBody(req: Request): Promise<JsonRecord> {
  * Feeds each server-sent event to `consume` and resolves at the first terminal event. A stream
  * that ends without one was dropped, so it rejects with a retryable transport error.
  */
-export async function sseEvents(response: Response, consume: (event: StreamEvent) => void): Promise<void> {
+export async function sseEvents(response: Response, consume: (event: StreamEvent) => void, terminal: ReadonlySet<string> = TERMINAL_EVENTS): Promise<void> {
   if (!response.body) throw new Error('Missing upstream response');
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -68,7 +68,7 @@ export async function sseEvents(response: Response, consume: (event: StreamEvent
     catch { logSafe('sse-frame-skipped', { bytes: data.length }); return false; }
     if (!isRecord(event)) { logSafe('sse-frame-skipped', { bytes: data.length }); return false; }
     consume(event);
-    return TERMINAL_EVENTS.has(event.type);
+    return terminal.has(event.type);
   };
 
   try {

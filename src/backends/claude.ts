@@ -1,797 +1,462 @@
-import { createHash } from 'node:crypto';
-import { realpathSync, existsSync, readFileSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
-import { resolve, join, isAbsolute } from 'node:path';
-// Claude through the official Claude Code CLI. Each turn is one `claude -p` stream-json session
-// with every native tool disabled; Codex's tools are described in the prompt and requested
-// through structured output. A session that returned tool calls stays alive briefly so the next
-// turn only has to send the tool results.
-import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
-import { isRecord, randomId } from '../json';
+// Claude through Anthropic's Messages API, signed in with the Claude Code login of a config directory
+// (its macOS keychain item, or `.credentials.json`), refreshed here. Codex's tools become Claude tools,
+// so Claude makes real tool calls, and its text streams to Codex as it is written.
+import { readFileSync, renameSync, writeFileSync, existsSync, realpathSync } from 'node:fs';
+import { homedir, userInfo } from 'node:os';
+import { isAbsolute, join, resolve } from 'node:path';
+import { positiveInt } from '../env';
+import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
-import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
-import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
-import { abortable, transportError } from '../transport';
-import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
-import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, type SubscriptionBackend } from './contract';
+import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools } from '../protocol/native-tools';
+import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { sseEvents } from '../protocol/stream';
+import type { ProxyOutput, ResponsesRequest, TextSink, ToolCall } from '../protocol/types';
+import { abortable, ProxyTransportError, sleep } from '../transport';
+import { claudeLimits, ClaudeUsageLimitError, ClaudeUsageLimits, rateLimitInfo } from './claude-limits';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
-const MODEL_ALIASES: Readonly<Record<string, string>> = {
-  opus: 'opus',
-  sonnet: 'sonnet',
-  haiku: 'haiku',
-  'claude-opus': 'opus',
-  'claude-sonnet': 'sonnet',
-  'claude-haiku': 'haiku',
-};
-// Every level the pinned Claude CLI accepts (`claude --help`: low, medium, high, xhigh, max).
+const MODEL_ALIASES: Readonly<Record<string, string>> = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5' };
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+/** Claude Code's public OAuth client and its request identity; subscription logins accept only these. */
+const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const CLIENT_VERSION = '2.1.286';
+const BETAS = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24';
+const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
+const REFRESH_LEAD_MS = 5 * 60_000;
+/** Native Codex retries a 5xx four times with a doubling 200 ms backoff. */
+const SERVER_RETRIES = 4;
+const MAX_OUTPUT_TOKENS = 128_000;
 
-const SYSTEM_PROMPT = `You are running inside a Codex agent loop. Tools described in <available_tools> are real, available Codex tools even though they are not present in Claude Code's native tool registry. Invoke them by returning their exact name and arguments in the required structured tool_calls output. Never claim that a listed Codex tool is unavailable merely because it is absent from the native registry. When a Codex browser, node_repl, cua_repl, or computer tool is listed, use it for browser requests instead of substituting WebFetch, web search, curl, or another native tool.`;
+export class ClaudeError extends BackendError {
+  constructor(message: string, retryable = false) {
+    super(message, { retryable });
+    this.name = 'ClaudeError';
+  }
+}
 
-const USAGE_LIMIT_TEXT = /you['’]ve hit your (?:session|weekly|usage) limit|usage limit reached/i;
-
-type ClaudeResult = {
-  type: 'result';
-  subtype?: string;
-  is_error: boolean;
-  result?: string;
-  structured_output?: StructuredOutput;
-  usage?: unknown;
-};
-type StructuredOutput = { text: string; tool_calls: Array<{ name: string; arguments: string }> };
-
-/**
- * Token counts of the last API call behind a CLI result. Anthropic's `input_tokens` excludes cached
- * tokens, so the prompt the model actually held is input + cache creation + cache reads; the per-call
- * breakdown lives in `usage.iterations` and the top level is the turn total. Each `result` is one
- * turn, not the session, so this never accumulates across a worker's continuation turns.
- */
-export function reportedUsage(usage: unknown): { promptTokens: number; outputTokens: number } | undefined {
-  if (!isRecord(usage)) return undefined;
-  const iterations = Array.isArray(usage.iterations) ? usage.iterations.filter(isRecord) : [];
-  const last = iterations.length ? iterations[iterations.length - 1] : usage;
-  const count = (key: string): number => (typeof last[key] === 'number' && last[key] > 0 ? last[key] : 0);
-  const promptTokens = count('input_tokens') + count('cache_creation_input_tokens') + count('cache_read_input_tokens');
-  return promptTokens > 0 ? { promptTokens, outputTokens: count('output_tokens') } : undefined;
+/** The router has already mapped public slugs and aliases to Anthropic's model ids. */
+export function resolveModel(model: string): string {
+  if (!/^claude-[a-z0-9.-]+$/.test(model)) throw new ClaudeError(`Unsupported Claude model: ${model}`);
+  return model;
 }
 
 function resolveEffort(request: ResponsesRequest): string {
   const effort = request.reasoning?.effort ?? 'high';
-  if (!(EFFORTS as readonly string[]).includes(effort)) throw new Error(`Unsupported staged effort: ${effort}`);
+  if (!(EFFORTS as readonly string[]).includes(effort)) throw new ClaudeError(`Unsupported Claude reasoning effort: ${effort}`);
   return effort;
 }
 
-function resolveModel(model: string): string {
-  const resolved = MODEL_ALIASES[model] ?? model;
-  const known = resolved.startsWith('claude-') || ['opus', 'sonnet', 'haiku'].includes(resolved);
-  if (!/^[a-zA-Z0-9._-]+$/.test(resolved) || !known) throw new Error(`Unsupported Claude model: ${model}`);
-  return resolved;
+type LoginStore = { read(): Promise<JsonRecord | undefined>; write(value: JsonRecord): Promise<void> };
+
+/** The keychain item Claude Code keeps for a config directory: a hashed suffix for any non-default one. */
+function keychainStore(configDir: string | undefined): LoginStore {
+  const service = configDir ? `Claude Code-credentials-${sha256(configDir).slice(0, 8)}` : 'Claude Code-credentials';
+  const account = process.env.USER || userInfo().username;
+  return {
+    async read() {
+      const child = Bun.spawn(['security', 'find-generic-password', '-s', service, '-a', account, '-w'], { stdout: 'pipe', stderr: 'ignore' });
+      const [text, code] = await Promise.all([new Response(child.stdout).text(), child.exited]);
+      try { const value: unknown = code === 0 ? JSON.parse(text) : undefined; return isRecord(value) ? value : undefined; } catch { return undefined; }
+    },
+    // Written as Claude Code writes it: through `security -i` with a hex value, so it never appears in argv.
+    async write(value) {
+      const child = Bun.spawn(['security', '-i'], { stdin: 'pipe', stdout: 'ignore', stderr: 'ignore' });
+      child.stdin.write(`add-generic-password -U -a "${account}" -s "${service}" -X "${Buffer.from(JSON.stringify(value)).toString('hex')}"\n`);
+      await child.stdin.end();
+      if (await child.exited !== 0) throw new ClaudeError('Could not save the refreshed Claude login to the keychain; retry the turn', true);
+    },
+  };
 }
 
-/** CLI flags for an isolated session: no tools, MCP, hooks, settings, slash commands or history. */
-export function buildClaudeArgs(request: ResponsesRequest): string[] {
-  return [
-    '-p',
-    '--tools',
-    '',
-    '--strict-mcp-config',
-    '--mcp-config',
-    '{"mcpServers":{}}',
-    '--setting-sources',
-    '',
-    '--settings',
-    '{"disableAllHooks":true,"fastMode":false}',
-    '--no-chrome',
-    '--disable-slash-commands',
-    '--no-session-persistence',
-    '--input-format',
-    'stream-json',
-    '--output-format',
-    'stream-json',
-    // Partial chunks keep stdout live while the model thinks, so the turn can be bounded by
-    // silence (native Codex's 300 s stream idle timeout) instead of a total deadline that
-    // cuts long xhigh turns. `acceptLine` ignores every record type it does not settle on.
-    '--include-partial-messages',
-    '--verbose',
-    '--model',
-    resolveModel(request.model),
-    '--effort',
-    resolveEffort(request),
-    '--append-system-prompt',
-    SYSTEM_PROMPT,
-    '--json-schema',
-    JSON.stringify(outputSchema(requestTools(request))),
-  ];
+function fileStore(path: string): LoginStore {
+  return {
+    async read() {
+      try { const value: unknown = JSON.parse(readFileSync(path, 'utf8')); return isRecord(value) ? value : undefined; } catch { return undefined; }
+    },
+    async write(value) {
+      writeFileSync(`${path}.tmp-router`, JSON.stringify(value), { mode: 0o600 });
+      renameSync(`${path}.tmp-router`, path);
+    },
+  };
 }
 
 export type ClaudeAccountOptions = {
-  configDir?: string; binary?: string; cwd?: string;
-  expectedEmail?: string; expectedOrg?: string;
+  /** The Claude Code config directory whose login this account uses; unset means the default profile. */
+  configDir?: string;
+  expectedEmail?: string;
+  expectedOrg?: string;
+  /** Overrides for tests; production uses Anthropic, its token endpoint and the profile's own store. */
+  apiUrl?: string;
+  tokenUrl?: string;
+  credentialsFile?: string;
 };
 
 /**
- * Wall-clock budget for one `claude auth status` probe. The CLI answers in well under a second on an
- * idle machine, but under swap pressure or a busy router its startup and teardown each stretch past
- * twenty seconds (observed 20.1-23.4 s on October 11-15, 2026). The budget only bounds a probe that
- * never answers; a probe whose answer arrived is accepted even if its teardown ran past the budget.
+ * Claude's thinking for the calls it made, put back in front of those calls when the history returns,
+ * so a tool loop keeps its train of thought. Anthropic accepts the history without it (another model's
+ * calls, or after a restart), so a miss only costs continuity.
  */
-const IDENTITY_PROBE_TIMEOUT_MS = 45_000;
-// Proxy secrets, API-key/third-party auth routes and nested-session markers the CLI must not inherit.
-const CLAUDE_BLOCKED_ENV = new Set(['CLAUDECODE', 'PROXY_API_KEY', 'CLAUDE_CODE_EFFORT_LEVEL', 'OPENAI_API_KEY',
-  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_OAUTH_TOKEN',
-  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
-  'CLAUDE_CODE_HOST_CREDS_FILE', 'CLAUDE_CODE_HOST_GATEWAY', 'CLAUDE_CODE_HOST_GATEWAY_LINEAGE']);
+class ThinkingReplay {
+  private readonly byCall = new Map<string, JsonRecord[]>();
+  remember(callId: string, blocks: JsonRecord[]): void {
+    this.byCall.delete(callId);
+    this.byCall.set(callId, blocks);
+    while (this.byCall.size > 512) this.byCall.delete(this.byCall.keys().next().value!);
+  }
+  get(callId: unknown): JsonRecord[] | undefined { return typeof callId === 'string' ? this.byCall.get(callId) : undefined; }
+}
+
+const TEXT_PARTS = new Set(['input_text', 'output_text', 'text']);
+const text = (value: string): JsonRecord[] => (value ? [{ type: 'text', text: value }] : []);
+const toolId = (id: unknown) => String(id ?? '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128) || 'call';
+
+function imageBlock(value: JsonRecord, legacy: boolean): JsonRecord[] {
+  const url = imageUrl(value, legacy) ?? '';
+  const inline = /^data:(image\/(?:png|jpeg|gif|webp));base64,(.*)$/s.exec(url);
+  if (inline) return [{ type: 'image', source: { type: 'base64', media_type: inline[1], data: inline[2]!.replace(/\s/g, '') } }];
+  if (url.startsWith('https://')) return [{ type: 'image', source: { type: 'url', url } }];
+  return text('[image omitted: only inline PNG/JPEG/GIF/WebP or web images can be shown]');
+}
+
+/** Message or tool-output content as Claude blocks: text and images keep their kind, anything else is JSON text. */
+function blocks(value: unknown, legacy = false): JsonRecord[] {
+  if (typeof value === 'string') return text(value);
+  if (Array.isArray(value)) return value.flatMap(part => blocks(part, legacy));
+  if (!isRecord(value)) return value === undefined || value === null ? [] : text(JSON.stringify(value));
+  if (isImagePart(value, legacy)) return imageBlock(value, legacy);
+  if (TEXT_PARTS.has(String(value.type)) && typeof value.text === 'string') return text(value.text);
+  if (value.type === 'encrypted_content') return text('[encrypted content from a GPT agent; unreadable here]');
+  return text(JSON.stringify(value));
+}
+
+type Turn = { role: 'user' | 'assistant'; content: JsonRecord[] };
 
 /**
- * How long a verified identity vouches for a probe that stalled without answering. Under heavy load
- * (October 17, 2026: load average 13 during a disk cleanup) `claude auth status` printed nothing for
- * the full 45 s budget and a healthy Poly turn was refused. A stall says nothing about the login; only
- * a parsed answer can show a mismatch or a logout, and either one clears the verification.
+ * Codex's history as Claude turns. Calls and results keep their structure; a call with no result gets
+ * one saying it did not finish, and a result with no call becomes text, since Anthropic requires every
+ * tool_use to be answered in the next user turn and every tool_result to answer one.
  */
-const IDENTITY_STALL_GRACE_MS = 6 * 60 * 60_000;
-
-/**
- * How long a verified identity is reused without a fresh `auth status`, while the profile's local
- * account binding (account, organization, email, credential file) is unchanged. Short on purpose:
- * it absorbs bursts of fresh turns (subagent fan-out, a new user turn after each answer) without
- * standing in for a real check. 0 probes before every fresh session.
- */
-const IDENTITY_CACHE_MS = 60_000;
-
-/**
- * While an account was used this recently, its identity is re-probed in the background shortly before
- * the cache expires, so a fresh session finds a recent answer instead of waiting on `auth status`
- * (median about 0.8 s, slow runs 2-3.6 s). The cache window itself is unchanged: every answer a turn
- * relies on is still at most `CLAUDE_IDENTITY_CACHE_MS` old. 0 disables the refresh.
- */
-const IDENTITY_REFRESH_MS = 900_000;
-/** How long before the cache expires the background probe starts; covers a slow probe. */
-const IDENTITY_REFRESH_LEAD_MS = 10_000;
-
-type SharedProbe = { binding: string | undefined; done: Promise<void>; controller: AbortController; waiters: number };
-
-// Unclaimed standbys die with the router instead of outliving it as orphans holding its pipes.
-const parkedWorkers = new Set<ClaudeWorker>();
-process.once('exit', () => { for (const worker of parkedWorkers) worker.discard(); });
-
-/** Each login owns its warm workers, quota snapshot and usage sink. */
-export class ClaudeAccount {
-  readonly workers = new Map<string, ClaudeWorker>();
-  rateLimitSink?: (info: unknown) => void;
-  readonly options: Readonly<ClaudeAccountOptions>;
-  private verifiedAt = 0;
-  private verifiedBinding?: string;
-  private probe?: SharedProbe;
-  private lastActiveAt = 0;
-  private refreshTimer?: ReturnType<typeof setTimeout>;
-  private readonly standbys: ClaudeWorker[] = [];
-  constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) { this.options = Object.freeze({...options}); }
-  onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
-  environment(): Record<string, string> {
-    const env = childEnvironment((key) => CLAUDE_BLOCKED_ENV.has(key));
-    if (this.options.configDir) env.CLAUDE_CONFIG_DIR = this.options.configDir;
-    return env;
-  }
-  binary(): string { return this.options.binary ?? process.env.CLAUDE_BIN ?? 'claude'; }
-  cwd(): string { return this.options.cwd ?? process.env.CLAUDE_CWD ?? process.cwd(); }
-
-  /**
-   * A digest of who this profile is signed in as, read from the CLI's own local account record. It
-   * changes on a different login, logout or credential rewrite; routine fields such as
-   * `profileFetchedAt` are left out so the CLI's frequent rewrites of `.claude.json` do not count.
-   * Undefined when the record is missing or unreadable, which disables the cache.
-   */
-  private binding(): string | undefined {
-    const dir = this.options.configDir ?? process.env.CLAUDE_CONFIG_DIR;
-    const record = dir ? join(dir, '.claude.json') : join(homedir(), '.claude.json');
-    try {
-      const data: unknown = JSON.parse(readFileSync(record, 'utf8'));
-      const account = isRecord(data) && isRecord(data.oauthAccount) ? data.oauthAccount : undefined;
-      if (!account || typeof account.accountUuid !== 'string') return undefined;
-      let credential = 'none';
-      try {
-        const stat = statSync(join(dir ?? join(homedir(), '.claude'), '.credentials.json'));
-        credential = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
-      } catch {}
-      return createHash('sha256').update(JSON.stringify([this.binary(), record, account.accountUuid, account.organizationUuid, account.emailAddress, credential])).digest('hex');
-    } catch {
-      return undefined;
-    }
-  }
-
-  /**
-   * Confirms the login before a fresh session. Concurrent callers for the same local binding share
-   * one probe, and a recent match is reused. A probe only vouches for the binding it started under:
-   * if the profile changes while it runs, the answer is discarded and the new login is probed.
-   */
-  async verifyIdentity(signal?: AbortSignal): Promise<{ cached: boolean }> {
-    signal?.throwIfAborted();
-    if (!this.options.expectedEmail && !this.options.expectedOrg) return { cached: false };
-    const cacheMs = nonNegativeInt('CLAUDE_IDENTITY_CACHE_MS', IDENTITY_CACHE_MS);
-    let binding = this.binding();
-    if (binding && binding === this.verifiedBinding && Date.now() - this.verifiedAt < cacheMs) return { cached: true };
-    for (let attempt = 1; ; attempt++) {
-      await this.awaitProbe(binding, signal);
-      const now = this.binding();
-      if (now === binding) return { cached: false };
-      if (attempt === 2) throw new BackendError('Claude login changed during its identity check; retry the turn', { retryable: true });
-      binding = now;
-    }
-  }
-
-  private async awaitProbe(binding: string | undefined, signal?: AbortSignal): Promise<void> {
-    const current = this.probe;
-    const probe = current && current.binding === binding && !current.controller.signal.aborted ? current : this.startProbe(binding);
-    probe.waiters++;
-    try {
-      await abortable(probe.done, signal);
-    } finally {
-      // The last caller to give up stops the probe; one cancelled turn never fails the others.
-      if (--probe.waiters === 0 && signal?.aborted) {
-        probe.controller.abort();
-        if (this.probe === probe) this.probe = undefined;
-      }
-    }
-    signal?.throwIfAborted();
-  }
-
-  private startProbe(binding: string | undefined): SharedProbe {
-    const controller = new AbortController();
-    const probe: SharedProbe = { binding, done: this.probeIdentity(binding, controller.signal), controller, waiters: 0 };
-    this.probe = probe;
-    probe.done.then(() => {}, () => {}).finally(() => { if (this.probe === probe) this.probe = undefined; });
-    return probe;
-  }
-
-  private async probeIdentity(binding: string | undefined, signal: AbortSignal): Promise<void> {
-    const started = Date.now();
-    const child = Bun.spawn([this.binary(), 'auth', 'status'], {env: this.environment(), stdout: 'pipe', stderr: 'pipe', timeout: IDENTITY_PROBE_TIMEOUT_MS, signal});
-    const [output, exitCode] = await Promise.all([new Response(child.stdout).text(), child.exited, new Response(child.stderr).text()]);
-    // A cancelled turn kills the probe (SIGTERM, exit 143); that is the caller's abort, not an account problem.
-    if (signal.aborted) throw new Error('Claude identity check cancelled');
-    let status: unknown;
-    try { status = JSON.parse(output); } catch {}
-    const info = isRecord(status) ? status : undefined;
-    const emailMatch = !this.options.expectedEmail || info?.email === this.options.expectedEmail;
-    const orgMatch = !this.options.expectedOrg || info?.orgId === this.options.expectedOrg;
-    const answered = !!info?.loggedIn && emailMatch && orgMatch;
-    // The cache and stall grace bind to the profile the probe ran under, and only while it is unchanged.
-    // A profile that changed during the probe gets a binding no later probe can match.
-    const verified = () => {
-      this.verifiedAt = Date.now(); this.verifiedBinding = this.binding() === binding ? binding : 'changed-during-probe';
-      this.scheduleRefresh();
-    };
-    if (exitCode === 0 && answered) { verified(); return; }
-    // Bun reports the spawn-timeout SIGTERM as exit 143 and leaves `signalCode` null, so both spellings
-    // mean "our own deadline killed it". When the full answer had already been written before that kill
-    // (stdout parsed, logged in, email and org match), the account is verified: the CLI's slow teardown
-    // under machine stall is not evidence about the login, and refusing it fails a healthy turn.
-    const killed = child.signalCode !== null || exitCode === 143;
-    if (killed && answered) {
-      verified();
-      logSafe('claude-identity-check-slow', { ms: Date.now() - started, exit: exitCode });
-      return;
-    }
-    // A probe killed before it wrote anything is a machine stall. A recent verification of this same
-    // login still stands; any parsed answer that is not a match means the login changed and clears it.
-    if (info) { this.verifiedAt = 0; this.verifiedBinding = undefined; this.dropStandbys(); }
-    // The grace covers only the login that was verified: a changed local binding needs a real answer. A
-    // profile with no readable account record at either check keeps the earlier behaviour; the cache
-    // above never applies to it.
-    else if (killed && this.verifiedAt && binding === this.verifiedBinding && Date.now() - this.verifiedAt < IDENTITY_STALL_GRACE_MS) {
-      logSafe('claude-identity-check-stale', { ms: Date.now() - started, exit: exitCode, verified_ago_ms: Date.now() - this.verifiedAt });
-      return;
-    }
-    // Content-free diagnostics: which condition failed and how long the probe took, never the identity values.
-    logSafe('claude-identity-check-failed', { exit: exitCode, killed, ms: Date.now() - started, parsed: !!info, logged_in: !!info?.loggedIn, email_match: emailMatch, org_match: orgMatch });
-    // Only a parsed, logged-in answer with the wrong email/org is an identity mismatch. A killed probe (the
-    // spawn timeout under machine stall), a non-zero exit or unreadable output is a probe failure and
-    // must say so, or a transient stall reads as a login problem.
-    if (killed) throw new BackendError(`Claude identity check was killed before it answered (claude auth status exceeded ${IDENTITY_PROBE_TIMEOUT_MS / 1000}s); retry the turn`);
-    // The CLI exits 1 for a parsed logged-out answer, including when its credential store cannot be
-    // read. Retrying the turn cannot repair that state; preserve the answer before the generic exit error.
-    if (info?.loggedIn === false) throw new BackendError('Claude account is not logged in for this configuration, or its credential store is inaccessible; restore credential access or sign in again');
-    if (exitCode !== 0) throw new BackendError(`Claude identity check failed (claude auth status exited ${exitCode}); retry the turn`);
-    if (!info) throw new BackendError('Claude identity check returned unreadable output; retry the turn');
-    if (!info.loggedIn) throw new BackendError('Claude account is not logged in for this configuration');
-    throw new BackendError('Claude account identity does not match its configured login');
-  }
-
-  /**
-   * Re-probes shortly before the verified identity expires while the account is in use, so the next
-   * fresh session does not wait for `auth status`. A failed or mismatched answer schedules nothing and
-   * is handled exactly as a turn's own probe would handle it (a mismatch clears the cache and standbys).
-   */
-  private scheduleRefresh(): void {
-    clearTimeout(this.refreshTimer);
-    this.refreshTimer = undefined;
-    const windowMs = nonNegativeInt('CLAUDE_IDENTITY_REFRESH_MS', IDENTITY_REFRESH_MS);
-    const cacheMs = nonNegativeInt('CLAUDE_IDENTITY_CACHE_MS', IDENTITY_CACHE_MS);
-    if (!windowMs || !cacheMs || Date.now() - this.lastActiveAt > windowMs) return;
-    this.refreshTimer = setTimeout(() => {
-      this.refreshTimer = undefined;
-      if (Date.now() - this.lastActiveAt > windowMs) return;
-      void this.awaitProbe(this.binding()).catch(() => {});
-    }, Math.max(cacheMs - IDENTITY_REFRESH_LEAD_MS, Math.ceil(cacheMs / 2)));
-    // A refresh must never keep the router alive on its own.
-    this.refreshTimer.unref?.();
-  }
-
-  /**
-   * Records use, which keeps the background identity refresh going for `CLAUDE_IDENTITY_REFRESH_MS`.
-   * After a lapse the cached answer has expired, so the turn's own probe restarts the refresh.
-   */
-  private markActive(): void { this.lastActiveAt = Date.now(); }
-
-  /**
-   * Readies the fresh session a chat that just opened is about to need: the login check runs now and a
-   * CLI with the same launch arguments is parked. Nothing is sent to that CLI until a real turn passes
-   * its own identity check, exactly as for the standby kept after a turn. Never throws.
-   */
-  prewarm(request: ResponsesRequest): void {
-    this.markActive();
-    let key: string;
-    try { key = workerLaunchKey(request, this); } catch { return; }
-    void this.verifyIdentity().then(() => this.keepStandby(request, key), () => {});
-  }
-
-  /**
-   * A prewarmed CLI launched with exactly these arguments, if one is idle. `newer` counts standbys parked
-   * after it (0: a single standby slot would also have held it); `miss` says why none matched: nothing
-   * parked, or the parked ones were launched for a different model, effort or tool set.
-   */
-  takeStandby(key: string): { worker?: ClaudeWorker; newer: number; miss?: string } {
-    this.pruneStandbys();
-    const index = this.standbys.findIndex((worker) => worker.launchKey === key);
-    if (index < 0) return { newer: 0, miss: this.standbys.length ? standbyMiss(key, this.standbys.map((worker) => worker.launchKey)) : 'none' };
-    const [worker] = this.standbys.splice(index, 1);
-    return { worker, newer: this.standbys.length - index };
-  }
-
-  /**
-   * Prewarms the next fresh session with the same arguments, so it skips CLI startup. Called only after
-   * this account's identity check passed; a standby still waits for its own check before any prompt.
-   * The most recently wanted arguments win when the cap is reached, since they are the likeliest to come
-   * next; a parked standby that is wanted again moves to the back of the eviction queue.
-   */
-  keepStandby(request: ResponsesRequest, key: string): void {
-    const max = nonNegativeInt('CLAUDE_STANDBY_MAX', 3);
-    this.pruneStandbys();
-    const parked = this.standbys.findIndex((worker) => worker.launchKey === key);
-    if (parked >= 0) this.standbys.push(...this.standbys.splice(parked, 1));
-    if (!max || parked >= 0) return;
-    while (this.standbys.length >= max) this.standbys.shift()?.close();
-    // An unclaimed standby closes its stdin when the window passes, and the CLI exits.
-    this.standbys.push(new ClaudeWorker(request, this, key, positiveInt('CLAUDE_STANDBY_IDLE_MS', 900_000)));
-  }
-
-  private pruneStandbys(): void {
-    for (let index = this.standbys.length - 1; index >= 0; index--) if (!this.standbys[index]!.idle) this.standbys.splice(index, 1);
-  }
-
-  /** A login that no longer matches retires every prewarmed CLI started under it. */
-  private dropStandbys(): void {
-    for (const worker of this.standbys.splice(0)) worker.discard();
-  }
-
-  run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
-    this.markActive();
-    // One attempt. A dropped connection surfaces as a transport error and the router's shared
-    // offline policy (`localResponse`) keeps the request pending and retries it.
-    return runClaudeOnce(request, signal, this);
-  }
-}
-
-const primaryClaudeAccount = new ClaudeAccount({expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG}, claudeLimits);
-export function onClaudeRateLimit(sink: (info: unknown) => void): void { primaryClaudeAccount.onRateLimit(sink); }
-
-type PendingTurn = { resolve: (result: ClaudeResult) => void; reject: (error: Error) => void };
-
-class ClaudeWorker {
-  readonly model: string;
-  signature: string;
-  readonly callIds = new Set<string>();
-  private readonly process: Bun.Subprocess<'pipe', 'pipe', 'pipe'>;
-  private pending?: PendingTurn;
-  private stderr = '';
-  private idleTimer?: ReturnType<typeof setTimeout>;
-  private touch?: () => void;
-  private closed = false;
-  private used = false;
-
-  constructor(request: ResponsesRequest, readonly account: ClaudeAccount, readonly launchKey = workerLaunchKey(request, account), parkedForMs?: number) {
-    this.model = request.model;
-    this.signature = sessionSignature(request);
-    this.process = Bun.spawn([account.binary(), ...buildClaudeArgs(request)], {
-      stdin: 'pipe',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      cwd: account.cwd(),
-      env: account.environment(),
-    });
-    // A parked standby must not keep the router alive. Bun pins the event loop for any pipe read
-    // that starts before `unref`, so this has to happen before the readers below.
-    if (parkedForMs !== undefined) {
-      this.process.unref();
-      this.process.stdin.unref();
-      parkedWorkers.add(this);
-      this.idleTimer = setTimeout(() => this.close(), parkedForMs);
-      this.idleTimer.unref?.();
-    }
-    const stdoutDone = this.readStdout().catch((cause: unknown) => this.fail(cause));
-    void this.readStderr();
-    void this.process.exited.then(async (exitCode) => {
-      // Drain terminal rate-limit and result frames before treating the exit as a failure;
-      // otherwise an exited CLI can race the reader and trigger an unsafe continuation replay.
-      await stdoutDone;
-      this.closed = true;
-      this.detach();
-      const pending = this.pending;
-      this.pending = undefined;
-      pending?.reject(new Error(this.stderr.trim() || `Claude CLI exited with code ${exitCode}`));
-    });
-  }
-
-  /** Started and never given a turn, so it holds no conversation and can serve any matching request. */
-  get idle(): boolean { return !this.closed && !this.used && !this.pending; }
-
-  /** Binds a fresh (never used) session to the request that will run in it. */
-  adopt(request: ResponsesRequest): void {
-    clearTimeout(this.idleTimer);
-    parkedWorkers.delete(this);
-    this.process.ref();
-    this.process.stdin.ref();
-    this.signature = sessionSignature(request);
-  }
-
-  /** Ends a session that never received a prompt, such as one whose identity check failed. */
-  discard(): void { this.abort(); }
-
-  run(prompt: string, images: ImageBlock[], signal?: AbortSignal): Promise<ClaudeResult> {
-    signal?.throwIfAborted();
-    if (this.closed) throw new Error('Claude CLI worker is closed');
-    if (this.pending) throw new Error('Claude CLI worker is already processing a turn');
-    this.used = true;
-    clearTimeout(this.idleTimer);
-    // Bound the turn by silence, like native Codex (DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s): any
-    // stdout byte restarts the window, and the idle timeout is retried like a dropped stream.
-    const idleMs = positiveInt('CLAUDE_TIMEOUT_MS', 300_000);
-
-    return new Promise<ClaudeResult>((resolve, reject) => {
-      const settle = (error: Error) => {
-        const pending = this.pending;
-        this.pending = undefined;
-        this.abort();
-        pending?.reject(error);
-      };
-      let timeout: ReturnType<typeof setTimeout> | undefined;
-      const arm = () => {
-        clearTimeout(timeout);
-        timeout = setTimeout(
-          () => settle(new BackendError(`Claude CLI timed out after ${Math.round(idleMs / 1000)}s without output`, { retryable: true })),
-          idleMs,
-        );
-      };
-      this.touch = arm;
-      arm();
-      const cancel = () => settle(new Error('Claude request cancelled'));
-      const cleanup = () => {
-        clearTimeout(timeout);
-        this.touch = undefined;
-        signal?.removeEventListener('abort', cancel);
-      };
-      this.pending = {
-        resolve: (result) => {
-          cleanup();
-          resolve(result);
-        },
-        reject: (error) => {
-          cleanup();
-          reject(error);
-        },
-      };
-      signal?.addEventListener('abort', cancel, { once: true });
-
-      const message = { type: 'user', message: { role: 'user', content: [{ type: 'text', text: prompt }, ...images] } };
-      // The CLI can exit between the closed check and this write. A broken pipe must fail only this
-      // turn: left uncaught, EPIPE takes down the whole router and every open chat with it.
-      const brokenPipe = (cause: unknown) => this.fail(transportError(cause) ?? cause);
-      try {
-        for (const result of [this.process.stdin.write(`${JSON.stringify(message)}\n`), this.process.stdin.flush()]) {
-          if (result instanceof Promise) result.catch(brokenPipe);
-        }
-      } catch (cause) {
-        brokenPipe(cause);
-      }
-    });
-  }
-
-  /** Keeps the session for the turn that will carry these calls' results, until it idles out. */
-  retainFor(callIds: string[]): void {
-    this.detach();
-    for (const callId of callIds) {
-      this.callIds.add(callId);
-      this.account.workers.set(callId, this);
-    }
-    this.idleTimer = setTimeout(() => this.close(), positiveInt('CLAUDE_SESSION_IDLE_MS', 900_000));
-    this.idleTimer.unref?.();
-  }
-
-  close(): void {
-    if (this.closed) return;
-    this.closed = true;
-    parkedWorkers.delete(this);
-    clearTimeout(this.idleTimer);
-    this.detach();
-    try {
-      this.process.stdin.end();
-    } catch {}
-    // A standby that never ran a turn holds nothing worth a graceful exit, and a CLI slow to honour EOF
-    // must not linger untracked once it leaves the parked set: idle expiry and eviction end it outright.
-    if (!this.used) {
-      try {
-        this.process.kill();
-      } catch {}
-    }
-  }
-
-  private abort(): void {
-    this.close();
-    try {
-      this.process.kill();
-    } catch {}
-  }
-
-  private fail(cause: unknown): void {
-    const pending = this.pending;
-    this.pending = undefined;
-    this.abort();
-    pending?.reject(cause instanceof Error ? cause : new Error(String(cause)));
-  }
-
-  private detach(): void {
-    for (const callId of this.callIds) {
-      if (this.account.workers.get(callId) === this) this.account.workers.delete(callId);
-    }
-    this.callIds.clear();
-  }
-
-  private async readStdout(): Promise<void> {
-    const decoder = new TextDecoder();
-    let buffer = '';
-    for await (const chunk of this.process.stdout) {
-      this.touch?.();
-      buffer += decoder.decode(chunk, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) this.acceptLine(line);
-    }
-    if (buffer) this.acceptLine(buffer);
-  }
-
-  private acceptLine(line: string): void {
-    let record: unknown;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      if (!this.used && line.trim()) this.retireStandby('non-json');
-      return; // Non-JSON diagnostics from the CLI.
-    }
-    // A CLI that has not been sent a prompt has nothing legitimate to report beyond its own UI status
-    // records (`system` ui_invalidate/commands_changed, which some logins print at startup and which are
-    // never acted on). Anything else must never reach this account's quota state or a later turn, so a
-    // standby that says it is retired.
-    if (!this.used) {
-      if (!isRecord(record) || record.type !== 'system') this.retireStandby(isRecord(record) ? String(record.type ?? '') : 'other');
-      return;
-    }
-    if (!isRecord(record)) return;
-    if (record.type === 'rate_limit_event' && record.rate_limit_info) {
-      this.account.limits.update(record.rate_limit_info);
-      try {
-        this.account.rateLimitSink?.(record.rate_limit_info);
-      } catch {}
-      return;
-    }
-    if (record.type === 'assistant' && record.error === 'rate_limit') {
-      this.fail(this.account.limits.blocked(this.model) ?? new ClaudeUsageLimitError());
-      return;
-    }
-    if (record.type !== 'result' || !this.pending) return;
-    const pending = this.pending;
-    this.pending = undefined;
-    pending.resolve(record as ClaudeResult);
-  }
-
-  private retireStandby(kind: string): void {
-    logSafe('claude-standby-retired', { record: kind });
-    this.abort();
-  }
-
-  private async readStderr(): Promise<void> {
-    const decoder = new TextDecoder();
-    for await (const chunk of this.process.stderr) {
-      this.stderr = (this.stderr + decoder.decode(chunk, { stream: true })).slice(-65_536);
-    }
-  }
-}
-
-/**
- * A session can only continue a turn whose tools, effort, instructions and compaction anchors are
- * unchanged. Anything else would leave the model working from stale context.
- */
-function sessionSignature(request: ResponsesRequest): string {
-  const anchors =
-    typeof request.input === 'string'
-      ? []
-      : request.input
-          .flatMap((item) =>
-            typeof item.content === 'string' ? [item.content] : (item.content ?? []).map((part) => part.text ?? ''),
-          )
-          .filter(
-            (text) =>
-              text.startsWith('Earlier conversation context summary:') ||
-              text.startsWith('VERBATIM_HISTORICAL_USER_REQUEST:'),
-          );
-  return JSON.stringify({
-    tools: toolDescriptors(requestTools(request)),
-    effort: resolveEffort(request),
-    instructions: request.instructions,
-    anchors,
-  });
-}
-
-/** Everything a fresh CLI is launched with. Only an identical launch may stand in for another. */
-function workerLaunchKey(request: ResponsesRequest, account: ClaudeAccount): string {
-  return JSON.stringify([account.binary(), account.cwd(), request.model, buildClaudeArgs(request)]);
-}
-
-async function startClaudeWorker(request: ResponsesRequest, account: ClaudeAccount, signal?: AbortSignal): Promise<ClaudeWorker> {
-  const started = performance.now();
-  const key = workerLaunchKey(request, account);
-  const { worker: standby, newer, miss } = account.takeStandby(key);
-  // The CLI starts (or is already warm) while the identity is checked. Nothing is written to it until
-  // the check passes, and a failed or cancelled check ends it unused, so no prompt reaches a wrong login.
-  const worker = standby ?? new ClaudeWorker(request, account, key);
-  let identity: { cached: boolean };
-  try {
-    identity = await account.verifyIdentity(signal);
-    signal?.throwIfAborted();
-  } catch (error) {
-    worker.discard();
-    throw error;
-  }
-  worker.adopt(request);
-  account.keepStandby(request, key);
-  logSafe('claude-worker-start', { standby: !!standby, ...(standby ? { standby_newer: newer } : { standby_miss: miss }), identity_cached: identity.cached, ms: Math.round(performance.now() - started) });
-  return worker;
-}
-
-/** Which launch arguments kept every parked standby from matching: model, effort, tools or other. */
-function standbyMiss(key: string, parked: readonly string[]): string {
-  const parse = (launch: string) => {
-    const [binary, cwd, model, args] = JSON.parse(launch) as [string, string, string, string[]];
-    const flag = (name: string) => args[args.indexOf(name) + 1];
-    return { model, effort: flag('--effort'), tools: flag('--json-schema'), rest: JSON.stringify([binary, cwd, args.filter((_, index) => !['--effort', '--json-schema', '--model'].includes(args[index - 1] ?? ''))]) };
+export function claudeMessages(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ThinkingReplay): Turn[] {
+  const turns: Turn[] = [];
+  const add = (role: Turn['role'], content: JsonRecord[]) => {
+    if (!content.length) return;
+    const last = turns.at(-1);
+    if (last?.role === role) last.content.push(...content);
+    else turns.push({ role, content: [...content] });
   };
-  const want = parse(key);
-  const reasons = new Set<string>();
-  for (const launch of parked) {
-    const have = parse(launch);
-    reasons.add(have.model !== want.model ? 'model' : have.effort !== want.effort ? 'effort' : have.tools !== want.tools ? 'tools' : 'other');
+  for (const item of typeof request.input === 'string' ? [{ role: 'user', content: request.input }] : request.input) {
+    const type = item.type ?? 'message';
+    if (HISTORY_CALL_TYPES.has(type)) {
+      let input: unknown;
+      try { input = JSON.parse(historyCallArguments(item)); } catch { input = {}; }
+      add('assistant', [{ type: 'tool_use', id: toolId(item.call_id), name: keyFor(historyToolName(item)), input: isRecord(input) ? input : { value: input } }]);
+    } else if (HISTORY_OUTPUT_TYPES.has(type)) {
+      const content = type === 'tool_search_output' ? text(JSON.stringify(item.tools ?? [])) : blocks(item.output, type === 'computer_call_output');
+      add('user', [{ type: 'tool_result', tool_use_id: toolId(item.call_id), content: content.length ? content : text('(no output)') }]);
+    } else if (type === 'agent_message') {
+      const body = blocks(item.content).map(block => block.text ?? '').join('\n');
+      add('user', text(`<agent_message author=${JSON.stringify(item.author ?? 'unknown')} recipient=${JSON.stringify(item.recipient ?? 'unknown')}>\n${body}\n</agent_message>`));
+    } else if (type === 'message') {
+      if (item.role === 'assistant') add('assistant', blocks(item.content).filter(block => block.type === 'text'));
+      else if (item.role === 'developer' || item.role === 'system') {
+        const body = blocks(item.content).map(block => block.text ?? '').join('\n');
+        add('user', text(body && `<${item.role}>\n${body}\n</${item.role}>`));
+      } else add('user', blocks(item.content));
+    } else if (type !== 'reasoning' && !item.encrypted_content) {
+      // Reasoning and other encrypted items belong to another provider; anything else readable stays as text.
+      add('user', text(JSON.stringify(item)));
+    }
   }
-  // Space-separated: logSafe strips commas.
-  return [...reasons].sort().join(' ');
+
+  // Every call is answered in the turn right after it.
+  for (let index = 0; index < turns.length; index++) {
+    const turn = turns[index]!;
+    if (turn.role !== 'assistant') continue;
+    const calls = turn.content.filter(block => block.type === 'tool_use').map(block => block.id);
+    if (!calls.length) continue;
+    if (turns[index + 1]?.role !== 'user') turns.splice(index + 1, 0, { role: 'user', content: [] });
+    const next = turns[index + 1]!;
+    const answered = new Set(next.content.filter(block => block.type === 'tool_result').map(block => block.tool_use_id));
+    for (const id of calls) if (!answered.has(id)) next.content.push({ type: 'tool_result', tool_use_id: id, content: text('(no result: this call did not finish)') });
+    const thinking = calls.map(id => replay?.get(id)).find(Boolean);
+    if (thinking) turn.content.unshift(...thinking);
+  }
+  // Results lead their turn, answer only the previous turn's calls, and answer each call once.
+  for (let index = 0; index < turns.length; index++) {
+    const turn = turns[index]!;
+    if (turn.role !== 'user') continue;
+    const previous = turns[index - 1];
+    const open = new Set(previous?.role === 'assistant' ? previous.content.filter(block => block.type === 'tool_use').map(block => block.id) : []);
+    const results: JsonRecord[] = [], rest: JsonRecord[] = [];
+    for (const block of turn.content) {
+      if (block.type !== 'tool_result') rest.push(block);
+      else if (open.delete(block.tool_use_id)) results.push(block);
+      else rest.push(...text(`<tool_result call_id=${JSON.stringify(block.tool_use_id)}>`), ...(block.content as JsonRecord[]), ...text('</tool_result>'));
+    }
+    turn.content = [...results, ...rest];
+  }
+  if (turns[0]?.role === 'assistant') turns.unshift({ role: 'user', content: text('(earlier conversation)') });
+  if (!turns.length || turns.at(-1)!.role === 'assistant') turns.push({ role: 'user', content: text('Continue.') });
+  return turns;
 }
 
-/** The live session from this account that issued the newest tool call, if it can continue. */
-function continuationWorker(request: ResponsesRequest, account: ClaudeAccount): ClaudeWorker | undefined {
-  if (typeof request.input === 'string') return undefined;
-  for (let index = request.input.length - 1; index >= 0; index--) {
-    const callId = request.input[index]?.call_id;
-    const worker = callId ? account.workers.get(callId) : undefined;
-    if (worker?.model !== request.model) continue;
-    if (worker.signature === sessionSignature(request)) return worker;
-    worker.close();
-    return undefined;
-  }
+function toolChoice(choice: unknown, keyFor: (name: string) => string): JsonRecord | undefined {
+  if (choice === 'required') return { type: 'any' };
+  if (choice === 'none') return { type: 'none' };
+  if (isRecord(choice) && typeof choice.name === 'string') return { type: 'tool', name: keyFor(choice.namespace ? `${String(choice.namespace)}.${choice.name}` : choice.name) };
   return undefined;
 }
 
-async function runTurn(request: ResponsesRequest, signal: AbortSignal | undefined, account: ClaudeAccount): Promise<{ worker: ClaudeWorker; result: ClaudeResult }> {
-  const continuing = continuationWorker(request, account);
-  const delta = continuing ? continuationRequest(request, continuing.callIds) : undefined;
-  if (continuing && delta) {
-    const prepared = preparePrompt(delta);
-    try {
-      return { worker: continuing, result: await continuing.run(prepared.prompt, prepared.images, signal) };
-    } catch (error) {
-      continuing.close();
-      // A failed continuation is replayed in full, unless replaying cannot help.
-      if (signal?.aborted || error instanceof ClaudeUsageLimitError || transportError(error)) {
-        throw transportError(error) ?? error;
-      }
-    }
-  } else {
-    continuing?.close();
-  }
+const cached = (block: JsonRecord | undefined) => { if (block && block.type !== 'thinking' && block.type !== 'redacted_thinking') block.cache_control = { type: 'ephemeral' }; };
 
-  const prepared = preparePrompt(request);
-  const worker = await startClaudeWorker(request, account, signal);
-  try {
-    return { worker, result: await worker.run(prepared.prompt, prepared.images, signal) };
-  } catch (error) {
-    worker.close();
-    throw transportError(error) ?? error;
-  }
+export function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay): { body: JsonRecord; byKey: Map<string, ToolDescriptor> } {
+  const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
+  const keyFor = keyLookup(byKey);
+  const tools: JsonRecord[] = Object.entries(definitions).map(([name, tool]) => ({ name, description: tool.description, input_schema: tool.inputSchema }));
+  const raw = rawInputTools(byKey);
+  const note = `You are running inside a Codex agent loop. The provided tools are Codex's tools: Codex executes each call on the user's machine and returns its result. Call them directly.${raw.length ? ` ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} the whole raw input as the string field "input".` : ''}`;
+  const system: JsonRecord[] = [{ type: 'text', text: IDENTITY }, { type: 'text', text: request.instructions ? `${note}\n\n${request.instructions}` : note }];
+  const messages = claudeMessages(request, keyFor, replay);
+  // Cache breakpoints at the end of the tools, the system prompt and the newest turn: each turn reads the
+  // conversation the previous one wrote.
+  cached(tools.at(-1)); cached(system.at(-1)); cached(messages.at(-1)?.content.at(-1));
+  const choice = tools.length ? toolChoice(request.tool_choice, keyFor) : undefined;
+  return {
+    byKey,
+    body: {
+      model: resolveModel(request.model),
+      max_tokens: request.max_output_tokens ?? MAX_OUTPUT_TOKENS,
+      stream: true,
+      system,
+      messages,
+      ...(tools.length ? { tools } : {}),
+      ...(choice ? { tool_choice: choice } : {}),
+      // Anthropic refuses thinking when the tool choice forces a call.
+      ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive' } }),
+      output_config: { effort: resolveEffort(request) },
+    },
+  };
 }
 
-function parseStructured(result: ClaudeResult): StructuredOutput {
-  let value: unknown = result.structured_output;
-  if (value === undefined) {
-    try {
-      value = JSON.parse(result.result ?? '{}');
-    } catch {
-      value = undefined;
-    }
-  }
-  if (!isRecord(value) || typeof value.text !== 'string' || !Array.isArray(value.tool_calls)) {
-    throw new Error('Claude CLI returned invalid structured output');
-  }
-  return value as StructuredOutput;
+const signedOut = (configDir: string | undefined) =>
+  new ClaudeError(`Claude account is not logged in for this configuration, or its credential store is inaccessible; sign in again with \`${configDir ? `CLAUDE_CONFIG_DIR=${JSON.stringify(configDir)} ` : ''}claude auth login\``);
+
+/** Anthropic's own error text, short; it never contains the request. */
+async function errorDetail(response: Response): Promise<string> {
+  const body: unknown = await response.json().catch(() => undefined);
+  const error = isRecord(body) && isRecord(body.error) ? body.error : body;
+  return (isRecord(error) && typeof error.message === 'string' ? error.message : '').replace(/\s+/g, ' ').slice(0, 300);
 }
 
-export async function runClaude(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
-  return primaryClaudeAccount.run(request, signal);
-}
+/** Each login owns its token, identity check, thinking replay, quota snapshot and usage sink. */
+export class ClaudeAccount {
+  rateLimitSink?: (info: unknown) => void;
+  readonly options: Readonly<ClaudeAccountOptions>;
+  private readonly store: LoginStore;
+  private readonly replay = new ThinkingReplay();
+  private refreshing?: Promise<string>;
+  private verified?: { token: string; check: Promise<void> };
 
-async function runClaudeOnce(request: ResponsesRequest, signal: AbortSignal | undefined, account: ClaudeAccount): Promise<ProxyOutput> {
-  signal?.throwIfAborted();
-  account.limits.assertAvailable(request.model);
-  const { worker, result } = await runTurn(request, signal, account);
+  constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) {
+    this.options = Object.freeze({ ...options });
+    const configDir = options.configDir;
+    this.store = options.credentialsFile ? fileStore(options.credentialsFile)
+      : process.platform === 'darwin' ? keychainStore(configDir)
+      : fileStore(join(configDir ?? join(homedir(), '.claude'), '.credentials.json'));
+  }
+  onRateLimit(sink: (info: unknown) => void): void { this.rateLimitSink = sink; }
+  private get api(): string { return this.options.apiUrl ?? 'https://api.anthropic.com'; }
 
-  try {
-    if (result.is_error) {
-      if (USAGE_LIMIT_TEXT.test(result.result ?? '')) {
-        throw account.limits.blocked(request.model) ?? new ClaudeUsageLimitError();
-      }
-      // Retrying the same oversized prompt can never succeed; give Codex its native overflow code.
-      if (CONTEXT_OVERFLOW_TEXT.test(result.result ?? '')) throw contextOverflowError('Claude');
-      if (OVERLOADED_TEXT.test(result.result ?? '')) throw overloadedError('Claude');
-      const error = new Error(result.result || 'Claude CLI returned an error');
-      throw transportError(error) ?? error;
-    }
-    const structured = parseStructured(result);
-    const descriptors = new Map(toolDescriptors(requestTools(request)).map((tool) => [tool.proxyName, tool.type]));
-    for (const call of structured.tool_calls) {
-      if (!descriptors.has(call.name)) throw new Error(`Claude CLI requested unavailable tool: ${call.name}`);
-    }
-    const toolCalls = structured.tool_calls.map((call) => ({ ...call, callId: randomId('call') }));
-
-    // Tool search results change the tool list, so that session cannot continue.
-    const canContinue = toolCalls.length > 0 && toolCalls.every((call) => descriptors.get(call.name) !== 'tool_search');
-    if (canContinue) worker.retainFor(toolCalls.map((call) => call.callId));
-    else worker.close();
-
-    // Codex decides when to compact from this number, so it must be what Claude actually held: the
-    // CLI's own count of the last call (cache reads included). The byte estimate of the visible
-    // conversation undercounts JSON-heavy tool output and images by up to half, which let a thread
-    // grow past the real window before Codex thought it was near the limit; it is now only a floor
-    // for a CLI result that carries no usage. With every native tool disabled the CLI's hidden
-    // overhead is about 2K tokens, immaterial against the advertised window.
-    const reported = reportedUsage(result.usage);
-    const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request)), reported?.promptTokens ?? 0);
-    const outputTokens = Math.max(estimateVisibleTokens(structured.text + JSON.stringify(toolCalls)), reported?.outputTokens ?? 0);
+  private headers(token: string, extra: Record<string, string> = {}): Record<string, string> {
     return {
-      text: structured.text,
-      toolCalls,
-      usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      authorization: `Bearer ${token}`, 'anthropic-version': '2023-06-01', 'anthropic-beta': BETAS,
+      'user-agent': `claude-cli/${CLIENT_VERSION} (external, sdk-cli)`, 'x-app': 'cli', ...extra,
     };
-  } catch (error) {
-    worker.close();
-    throw error;
   }
+
+  private async login(): Promise<{ all: JsonRecord; oauth: JsonRecord }> {
+    const all = await this.store.read();
+    const oauth = all && isRecord(all.claudeAiOauth) ? all.claudeAiOauth : undefined;
+    if (!all || !oauth || typeof oauth.accessToken !== 'string' || typeof oauth.refreshToken !== 'string') throw signedOut(this.options.configDir);
+    return { all, oauth };
+  }
+
+  /**
+   * A token valid for at least the refresh lead. Refreshing rotates the refresh token, so this router is
+   * the only thing that refreshes the profile's login: concurrent turns share one refresh, written back
+   * where Claude Code keeps it. `stale` forces a refresh unless the stored token was already replaced.
+   */
+  private async token(signal?: AbortSignal, stale?: string): Promise<string> {
+    const { oauth } = await this.login();
+    const token = oauth.accessToken as string;
+    if (token !== stale && typeof oauth.expiresAt === 'number' && oauth.expiresAt - Date.now() > REFRESH_LEAD_MS) return token;
+    // Shared and not tied to one turn's signal: a cancelled turn must not abandon a rotation mid-flight.
+    this.refreshing ??= this.refresh().finally(() => { this.refreshing = undefined; });
+    return abortable(this.refreshing, signal);
+  }
+
+  private async refresh(): Promise<string> {
+    const started = performance.now();
+    const { all, oauth } = await this.login();
+    const response = await fetch(this.options.tokenUrl ?? 'https://platform.claude.com/v1/oauth/token', {
+      method: 'POST', signal: AbortSignal.timeout(30_000), headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: CLIENT_ID }),
+    });
+    const body: unknown = await response.json().catch(() => undefined);
+    if (!response.ok || !isRecord(body) || typeof body.access_token !== 'string') {
+      logSafe('claude-refresh-failed', { status: response.status, error: isRecord(body) ? String(body.error ?? '') : '' });
+      if (response.status >= 500) throw new ClaudeError(`Claude login refresh failed (HTTP ${response.status}); retry the turn`, true);
+      throw signedOut(this.options.configDir);
+    }
+    oauth.accessToken = body.access_token;
+    if (typeof body.refresh_token === 'string') oauth.refreshToken = body.refresh_token;
+    oauth.expiresAt = Date.now() + (typeof body.expires_in === 'number' ? body.expires_in : 3600) * 1000;
+    await this.store.write(all);
+    logSafe('claude-login-refreshed', { ms: Math.round(performance.now() - started), expires_in: typeof body.expires_in === 'number' ? body.expires_in : 0 });
+    return body.access_token;
+  }
+
+  /** Confirms once per token that the login is the pinned account and organization. */
+  private verify(token: string): Promise<void> {
+    const { expectedEmail, expectedOrg } = this.options;
+    if (!expectedEmail && !expectedOrg) return Promise.resolve();
+    if (this.verified?.token === token) return this.verified.check;
+    const check = (async () => {
+      const response = await fetch(`${this.api}/api/oauth/profile`, { headers: this.headers(token), signal: AbortSignal.timeout(30_000) });
+      if (response.status === 401) throw signedOut(this.options.configDir);
+      if (!response.ok) throw new ClaudeError(`Claude identity check failed (HTTP ${response.status}); retry the turn`, true);
+      const profile: unknown = await response.json().catch(() => undefined);
+      const email = isRecord(profile) && isRecord(profile.account) ? profile.account.email : undefined;
+      const org = isRecord(profile) && isRecord(profile.organization) ? profile.organization.uuid : undefined;
+      if ((expectedEmail && email !== expectedEmail) || (expectedOrg && org !== expectedOrg)) {
+        logSafe('claude-identity-mismatch', { email_match: !expectedEmail || email === expectedEmail, org_match: !expectedOrg || org === expectedOrg });
+        throw new ClaudeError('Claude account identity does not match its configured login');
+      }
+    })();
+    this.verified = { token, check };
+    check.catch(() => { if (this.verified?.check === check) this.verified = undefined; });
+    return check;
+  }
+
+  /** A verified token. A token the profile endpoint rejects is refreshed once. */
+  private async authorize(signal?: AbortSignal, stale?: string): Promise<string> {
+    const token = await this.token(signal, stale);
+    await abortable(this.verify(token), signal);
+    return token;
+  }
+
+  /** A chat opening refreshes and verifies the login ahead of its first turn. Never throws. */
+  prewarm(): void { void this.authorize().catch(() => {}); }
+
+  private track(headers: Headers): void {
+    const info = rateLimitInfo(headers);
+    if (!info) return;
+    this.limits.update(info);
+    try { this.rateLimitSink?.(info); } catch {}
+  }
+
+  /** Opens the stream. Nothing has reached Codex yet, so each retry here is safe. */
+  private async open(model: string, body: string, signal: AbortSignal): Promise<Response> {
+    let token = await this.authorize(signal);
+    let refreshed = false;
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream' }), body, signal });
+      this.track(response.headers);
+      if (response.ok) return response;
+      const detail = await errorDetail(response);
+      logSafe('claude-http-refused', { status: response.status, attempt });
+      if (response.status === 401 && !refreshed) { refreshed = true; token = await this.authorize(signal, token); continue; }
+      if (response.status === 429) throw this.limits.blocked(model) ?? new ClaudeUsageLimitError();
+      if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');
+      if (response.status >= 500 && attempt < SERVER_RETRIES) { await sleep(200 * 2 ** attempt, signal); continue; }
+      if (response.status === 529 || OVERLOADED_TEXT.test(detail)) throw overloadedError('Claude');
+      if (response.status === 401 || response.status === 403) throw signedOut(this.options.configDir);
+      // A server error that outlasted native Codex's retries stays a server error, which Codex retries itself.
+      if (response.status >= 500) throw new Error(`Claude API HTTP ${response.status}`);
+      throw new ClaudeError(`Claude request refused (HTTP ${response.status}${detail ? `: ${detail}` : ''})`);
+    }
+  }
+
+  run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
+    return retryOnce('Claude', signal, () => this.once(request, signal, sink), sink);
+  }
+
+  private async once(request: ResponsesRequest, signal: AbortSignal | undefined, sink: TextSink | undefined): Promise<ProxyOutput> {
+    signal?.throwIfAborted();
+    this.limits.assertAvailable(request.model);
+    const started = performance.now();
+    const { body, byKey } = claudeRequest(request, this.replay);
+    // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
+    const idleMs = positiveInt('CLAUDE_TIMEOUT_MS', 300_000);
+    const idle = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const touch = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new DOMException('Claude stream idle', 'TimeoutError')), idleMs); };
+    const combined = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
+    touch();
+    const content: JsonRecord[] = [];
+    const usage: JsonRecord = {};
+    let stop = '', ended = false, firstTextMs = 0, failure: JsonRecord | undefined;
+    try {
+      const response = await this.open(String(body.model), JSON.stringify(body), combined);
+      if (!response.body) throw new ProxyTransportError();
+      const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
+      await sseEvents(watched, event => {
+        const block = typeof event.index === 'number' ? content[event.index] : undefined;
+        const delta = isRecord(event.delta) ? event.delta : {};
+        if (event.type === 'message_start' && isRecord(event.message) && isRecord(event.message.usage)) Object.assign(usage, event.message.usage);
+        else if (event.type === 'content_block_start' && typeof event.index === 'number' && isRecord(event.content_block)) content[event.index] = { ...event.content_block, partial: '' };
+        else if (event.type === 'content_block_delta' && block) {
+          if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+            firstTextMs ||= performance.now() - started;
+            block.text = String(block.text ?? '') + delta.text;
+            sink?.text(delta.text);
+          } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') block.partial += delta.partial_json;
+          else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') block.thinking = String(block.thinking ?? '') + delta.thinking;
+          else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') block.signature = delta.signature;
+        } else if (event.type === 'message_delta') {
+          if (isRecord(event.delta) && typeof event.delta.stop_reason === 'string') stop = event.delta.stop_reason;
+          if (isRecord(event.usage)) Object.assign(usage, event.usage);
+        } else if (event.type === 'message_stop') ended = true;
+        else if (event.type === 'error') failure = isRecord(event.error) ? event.error : {};
+      }, new Set(['message_stop', 'error']));
+    } finally { clearTimeout(timer); }
+    if (failure) {
+      const detail = String(failure.message ?? failure.type ?? '').slice(0, 300);
+      if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');
+      if (failure.type === 'overloaded_error' && sink?.started) throw overloadedError('Claude');
+      // A provider failure after the stream opened: one fresh attempt is safe while nothing reached Codex.
+      throw new ClaudeError(`Claude stream failed${detail ? `: ${detail}` : ''}`, true);
+    }
+    if (!ended) throw new ProxyTransportError();
+
+    let textOut = '';
+    const toolCalls: ToolCall[] = [];
+    const thinking: JsonRecord[] = [];
+    for (const block of content) {
+      if (!block) continue;
+      if (block.type === 'text') textOut += String(block.text ?? '');
+      else if (block.type === 'thinking') thinking.push({ type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
+      else if (block.type === 'redacted_thinking') thinking.push({ type: 'redacted_thinking', data: block.data });
+      else if (block.type === 'tool_use' && typeof block.name === 'string') {
+        // A call cut off by the output limit is not runnable.
+        if (stop === 'max_tokens') throw new ClaudeError('Claude reached its output limit in the middle of a tool call; nothing was executed', true);
+        toolCalls.push(codexToolCall(byKey, block.name, String(block.partial || '{}'), typeof block.id === 'string' ? block.id : undefined));
+      }
+    }
+    if (thinking.length && toolCalls[0]?.callId) this.replay.remember(toolCalls[0].callId, thinking);
+    const count = (key: string) => (typeof usage[key] === 'number' ? usage[key] as number : 0);
+    // The prompt the model held is uncached input plus cache writes and reads; Codex compacts on this number.
+    const inputTokens = count('input_tokens') + count('cache_creation_input_tokens') + count('cache_read_input_tokens');
+    const outputTokens = count('output_tokens');
+    logSafe('claude-turn', { model: String(body.model), ms: Math.round(performance.now() - started), first_text_ms: Math.round(firstTextMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: count('cache_read_input_tokens'), stop });
+    return { text: textOut, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+  }
+
+
 }
+
+const primaryClaudeAccount = new ClaudeAccount({ configDir: process.env.CLAUDE_CONFIG_DIR, expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG }, claudeLimits);
+export function onClaudeRateLimit(sink: (info: unknown) => void): void { primaryClaudeAccount.onRateLimit(sink); }
 
 const claudeModel = (slug: string, displayName: string) => ({
   slug,
@@ -800,25 +465,17 @@ const claudeModel = (slug: string, displayName: string) => ({
   efforts: EFFORTS,
   defaultEffort: 'high',
   inputModalities: ['text', 'image'] as const,
-  // The pinned Claude CLI reports contextWindow 1000000 for Opus 5.5 and Fable 5.1; advertise it so
-  // Codex compacts at the real limit instead of the 200K default.
   contextWindow: 1_000_000,
 });
 
 export const claudeBackend: SubscriptionBackend = {
   name: 'Claude',
-  models: {
-    'claude-opus-5-5': 'claude-opus-5-5',
-    'claude-fable-5-1': 'claude-fable-5-1',
-    opus: 'claude-opus-5-5',
-    sonnet: 'sonnet',
-    haiku: 'haiku',
-  },
+  models: { 'claude-opus-5-5': 'claude-opus-5-5', 'claude-fable-5-1': 'claude-fable-5-1', ...MODEL_ALIASES },
   reservedPrefix: 'claude-',
   catalog: [claudeModel('claude-opus-5-5', 'Opus 5.5'), claudeModel('claude-fable-5-1', 'Fable 5.1')],
   assertAvailable: (model) => claudeLimits.assertAvailable(model),
-  run: runClaude,
-  prewarm: (request) => primaryClaudeAccount.prewarm(request),
+  run: (request, signal, sink) => primaryClaudeAccount.run(request, signal, sink),
+  prewarm: () => primaryClaudeAccount.prewarm(),
 };
 
 export type SecondaryClaudeOptions = ClaudeAccountOptions & { configDir: string; prefix: string; label: string; models?: readonly string[] };
@@ -840,8 +497,8 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
     name: `Claude (${options.label})`, models, reservedPrefix: `${options.prefix}-claude-`,
     catalog: selected.map(model => claudeModel(`${options.prefix}-${model}`, `${model === 'claude-opus-5-5' ? 'Opus 5.5' : 'Fable 5.1'} (${options.label})`)),
     assertAvailable: model => account.limits.assertAvailable(model),
-    run: (request, signal) => account.run(request, signal),
-    prewarm: request => account.prewarm(request),
+    run: (request, signal, sink) => account.run(request, signal, sink),
+    prewarm: () => account.prewarm(),
   };
   return { account, backend };
 }
@@ -850,8 +507,7 @@ export function configuredClaudeAccount(env: Readonly<Record<string, string | un
   if (!env.CLAUDE_ACCOUNT_CONFIG_DIR) return undefined;
   return createClaudeAccountBackend({
     configDir: env.CLAUDE_ACCOUNT_CONFIG_DIR, prefix: env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary',
-    label: env.CLAUDE_ACCOUNT_LABEL || 'Secondary', binary: env.CLAUDE_ACCOUNT_BIN || env.CLAUDE_BIN,
-    cwd: env.CLAUDE_ACCOUNT_CWD, expectedEmail: env.CLAUDE_ACCOUNT_EXPECTED_EMAIL,
+    label: env.CLAUDE_ACCOUNT_LABEL || 'Secondary', expectedEmail: env.CLAUDE_ACCOUNT_EXPECTED_EMAIL,
     expectedOrg: env.CLAUDE_ACCOUNT_EXPECTED_ORG,
     models: env.CLAUDE_ACCOUNT_MODELS?.split(',').map(model => model.trim()).filter(Boolean),
   });

@@ -46,7 +46,6 @@ export function transportError(error: unknown): ProxyTransportError | undefined 
     if (current.name === 'TimeoutError') return new ProxyTransportError(true);
     if (TIMEOUT_CODES.has(code)) return new ProxyTransportError(true, true);
     if (NETWORK_CODES.has(code) || NETWORK_MESSAGE.test(message)) return new ProxyTransportError();
-    if (message.startsWith('Claude CLI timed out after')) return new ProxyTransportError(true);
     current = current.cause;
   }
   return undefined;

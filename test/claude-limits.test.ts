@@ -3,7 +3,6 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { ClaudeUsageLimits, ClaudeUsageLimitError, claudeUsageSnapshot, claudeLimits } from '../src/backends/claude-limits';
 import { startRouter } from '../src/router/server';
-import { runClaude } from '../src/backends/claude';
 
 const now = Date.now();
 const reset = Math.floor(now / 1000) + 3600;
@@ -38,30 +37,6 @@ test('model-specific weekly limits do not block other families; multiple exhaust
   expect(limits.blocked('claude-opus-5-5',now)!.resetsAt).toBe(reset+3600);
   limits.update(rejected({five_hour:{utilization:1}}));
   expect(limits.blocked('claude-opus-5-5',now)).toBeUndefined();
-});
-
-test('real worker recognizes CLI rate_limit before structured output and does not replay a limited continuation', async () => {
-  const dir = await mkdtemp(tmpdir()+'/claude-limit-worker-');
-  const binary = dir+'/mock-cli';
-  const oldBinary = process.env.CLAUDE_BIN;
-  claudeLimits.restore(claudeUsageSnapshot({}));
-  // A real subprocess exercises stdout parsing and continuation fallback, without model usage.
-  // Prompts are counted on receipt: a prewarmed standby CLI may launch, but must never be sent a replay.
-  await Bun.write(binary,`#!/bin/sh\nread initial\nprintf p >> '${dir}/prompts'\nprintf '%s\\n' '${JSON.stringify({type:'result',is_error:false,structured_output:{text:'',tool_calls:[{name:'step',arguments:'{}'}]}})}'\nread ignored\nprintf p >> '${dir}/prompts'\nprintf '%s\\n' '${JSON.stringify({type:'rate_limit_event',rate_limit_info:rejected({five_hour:exhausted})})}' '${JSON.stringify({type:'assistant',error:'rate_limit'})}'\n`);
-  const { chmod } = await import('node:fs/promises');
-  await chmod(binary,0o700);
-  process.env.CLAUDE_BIN=binary;
-  try {
-    const tools=[{type:'function',name:'step',parameters:{type:'object',properties:{}}}];
-    const first=await runClaude({model:'claude-opus-5-5',input:'Test',tools});
-    await expect(runClaude({model:'claude-opus-5-5',input:[{type:'function_call_output',call_id:first.toolCalls[0]!.callId,output:'OK'}],tools})).rejects.toThrow(ClaudeUsageLimitError);
-    // The first prompt and its continuation only; replaying the limited turn would add a third.
-    expect(await Bun.file(dir+'/prompts').text()).toBe('pp');
-  } finally {
-    if(oldBinary===undefined)delete process.env.CLAUDE_BIN;else process.env.CLAUDE_BIN=oldBinary;
-    claudeLimits.restore(claudeUsageSnapshot({}));
-    await rm(dir,{recursive:true});
-  }
 });
 
 test('installed transport shape returns useful HTTP and WebSocket errors from persisted quota with warmups unaffected', async () => {

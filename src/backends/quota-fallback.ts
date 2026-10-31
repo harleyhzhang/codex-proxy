@@ -11,13 +11,15 @@ export function withOpusQuotaFallback(primary: SubscriptionBackend, fallback: Su
       try { primary.assertAvailable?.(nativeModel); }
       catch (error) { if (nativeModel !== model || !(error instanceof ClaudeUsageLimitError)) throw error; }
     },
-    async run(request, signal) {
+    async run(request, signal, sink) {
       signal?.throwIfAborted();
-      try { return await primary.run(request, signal); }
+      try { return await primary.run(request, signal, sink); }
       catch (error) {
-        if (request.model !== model || !(error instanceof ClaudeUsageLimitError) || signal?.aborted) throw error;
-        const output = await fallback.run(request, signal);
-        return { ...output, text: `[${primary.name}: using Cursor Opus 5.5 because the direct Claude subscription reached its usage limit.]\n\n${output.text}` };
+        if (request.model !== model || !(error instanceof ClaudeUsageLimitError) || signal?.aborted || sink?.started) throw error;
+        const notice = `[${primary.name}: using Cursor Opus 5.5 because the direct Claude subscription reached its usage limit.]\n\n`;
+        sink?.text(notice);
+        const output = await fallback.run(request, signal, sink);
+        return { ...output, text: notice + output.text };
       }
     },
   };

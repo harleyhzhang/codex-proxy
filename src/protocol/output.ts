@@ -110,38 +110,42 @@ export function responseObject(request: RequestShape, output: ProxyOutput): Resp
   };
 }
 
+/** The events that stream one finished output item, without sequence numbers. */
+export function* itemEvents(item: OutputItem, output_index: number): Generator<StreamEvent> {
+  const added: OutputItem = { ...item, status: 'in_progress' };
+  if (item.type === 'message') added.content = [];
+  if (item.type === 'function_call') added.arguments = '';
+  if (item.type === 'custom_tool_call') added.input = '';
+  yield { type: 'response.output_item.added', output_index, item: added };
+
+  const at = { item_id: item.id, output_index };
+  if (item.type === 'message') {
+    const part = (item.content as Array<{ text: string }>)[0] ?? { text: '' };
+    const content = { ...at, content_index: 0 };
+    yield { type: 'response.content_part.added', ...content, part: { ...part, text: '' } };
+    yield { type: 'response.output_text.delta', ...content, delta: part.text };
+    yield { type: 'response.output_text.done', ...content, text: part.text };
+    yield { type: 'response.content_part.done', ...content, part };
+  } else if (item.type === 'function_call') {
+    yield { type: 'response.function_call_arguments.delta', ...at, delta: item.arguments };
+    yield { type: 'response.function_call_arguments.done', ...at, arguments: item.arguments };
+  } else if (item.type === 'custom_tool_call') {
+    yield { type: 'response.custom_tool_call_input.delta', ...at, call_id: item.call_id, delta: item.input };
+    yield { type: 'response.custom_tool_call_input.done', ...at, call_id: item.call_id, input: item.input };
+  }
+  yield { type: 'response.output_item.done', output_index, item };
+}
+
 /** Replays a finished response as the event sequence a streaming upstream would have sent. */
 export function* responseEvents(response: ResponseObject): Generator<StreamEvent> {
   let sequence = 0;
-  const event = (type: string, data: Record<string, unknown>): StreamEvent =>
-    ({ type, sequence_number: sequence++, ...data });
+  const numbered = (event: StreamEvent): StreamEvent => ({ ...event, sequence_number: sequence++ });
 
-  yield event('response.created', { response: { ...response, status: 'in_progress', output: [], usage: null } });
+  yield numbered({ type: 'response.created', response: { ...response, status: 'in_progress', output: [], usage: null } });
   for (const [output_index, item] of response.output.entries()) {
-    const added: OutputItem = { ...item, status: 'in_progress' };
-    if (item.type === 'message') added.content = [];
-    if (item.type === 'function_call') added.arguments = '';
-    if (item.type === 'custom_tool_call') added.input = '';
-    yield event('response.output_item.added', { output_index, item: added });
-
-    const at = { item_id: item.id, output_index };
-    if (item.type === 'message') {
-      const part = (item.content as Array<{ text: string }>)[0] ?? { text: '' };
-      const content = { ...at, content_index: 0 };
-      yield event('response.content_part.added', { ...content, part: { ...part, text: '' } });
-      yield event('response.output_text.delta', { ...content, delta: part.text });
-      yield event('response.output_text.done', { ...content, text: part.text });
-      yield event('response.content_part.done', { ...content, part });
-    } else if (item.type === 'function_call') {
-      yield event('response.function_call_arguments.delta', { ...at, delta: item.arguments });
-      yield event('response.function_call_arguments.done', { ...at, arguments: item.arguments });
-    } else if (item.type === 'custom_tool_call') {
-      yield event('response.custom_tool_call_input.delta', { ...at, call_id: item.call_id, delta: item.input });
-      yield event('response.custom_tool_call_input.done', { ...at, call_id: item.call_id, input: item.input });
-    }
-    yield event('response.output_item.done', { output_index, item });
+    for (const event of itemEvents(item, output_index)) yield numbered(event);
   }
-  yield event(response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', { response });
+  yield numbered({ type: response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
 }
 
 /** Encodes the shared Responses event sequence for an HTTP client. */

@@ -1,6 +1,6 @@
-// Tracks the Claude plan allowance the CLI reports after each turn, so a known-exhausted model is
+// Tracks the Claude plan allowance Anthropic reports on every response, so a known-exhausted model is
 // refused up front with its reset time instead of spending a turn to discover it.
-import { isRecord } from '../json';
+import { isRecord, type JsonRecord } from '../json';
 import { BackendError } from './contract';
 
 type UsageWindow = { used_percent: number; window_minutes: number; resets_at: number | null };
@@ -26,7 +26,24 @@ function usageWindow(value: unknown, minutes: number): UsageWindow | null {
   };
 }
 
-/** Normalises the CLI's `rate_limit_info` payload into a stable snapshot. */
+/**
+ * Anthropic's `anthropic-ratelimit-unified-*` response headers in the `rate_limit_info` shape the Claude
+ * CLI reports (status, overage status, and per-window utilization and reset), or undefined without them.
+ */
+export function rateLimitInfo(headers: Headers): JsonRecord | undefined {
+  const status = headers.get('anthropic-ratelimit-unified-status');
+  if (!status) return undefined;
+  const unifiedWindows: Record<string, JsonRecord> = {};
+  headers.forEach((value, key) => {
+    const match = /^anthropic-ratelimit-unified-(5h|7d(?:[_-][a-z]+)?)-(utilization|reset)$/.exec(key);
+    if (!match || !Number.isFinite(Number(value))) return;
+    const name = match[1] === '5h' ? 'five_hour' : `seven_day${match[1]!.length > 2 ? `_${match[1]!.slice(3)}` : ''}`;
+    (unifiedWindows[name] ??= {})[match[2] === 'reset' ? 'resetsAt' : 'utilization'] = Number(value);
+  });
+  return { status, overageStatus: headers.get('anthropic-ratelimit-unified-overage-status') ?? undefined, unifiedWindows };
+}
+
+/** Normalises a `rate_limit_info` payload into a stable snapshot. */
 export function claudeUsageSnapshot(info: unknown, now = Date.now()): ClaudeUsage {
   const record = isRecord(info) ? info : {};
   const windows = isRecord(record.unifiedWindows) ? record.unifiedWindows : {};

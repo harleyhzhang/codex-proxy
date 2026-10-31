@@ -7,12 +7,12 @@ import { join } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, type JsonRecord } from '../json';
 import { logSafe } from '../log';
-import { functionTools, rawInput } from '../protocol/native-tools';
-import { COMPUTER_TOOL_NAME, imageUrl, isImagePart, requestTools, TOOL_SEARCH_NAME, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup } from '../protocol/native-tools';
+import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
 import { sseEvents } from '../protocol/stream';
-import type { ProxyOutput, ResponseInputItem, ResponsesRequest, StreamEvent, ToolCall } from '../protocol/types';
+import type { ProxyOutput, ResponsesRequest, StreamEvent, TextSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
-import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, type SubscriptionBackend } from './contract';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
@@ -120,8 +120,6 @@ class ReasoningReplay {
 }
 
 const TEXT_PARTS = new Set(['input_text', 'output_text', 'text']);
-const CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'computer_call']);
-const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
 
 /** An image part xAI can read (inline data or a web URL); anything else becomes a short note. */
 function imagePart(value: JsonRecord, legacy: boolean): JsonRecord {
@@ -140,30 +138,16 @@ function parts(value: unknown, textType: 'input_text' | 'output_text', legacy = 
   return [{ type: textType, text: JSON.stringify(value) }];
 }
 
-/** A history call's Codex tool name, as `toolDescriptors` names it. */
-function codexName(item: ResponseInputItem): string {
-  if (item.type === 'tool_search_call') return TOOL_SEARCH_NAME;
-  if (item.type === 'computer_call') return COMPUTER_TOOL_NAME;
-  const name = String(item.name ?? '');
-  return item.namespace && !name.startsWith(`${item.namespace}.`) ? `${item.namespace}.${name}` : name;
-}
-
-function callArguments(item: ResponseInputItem): string {
-  if (item.type === 'custom_tool_call') return JSON.stringify({ input: item.input ?? '' });
-  if (item.type === 'computer_call') return JSON.stringify(item.actions ? { actions: item.actions } : item.action ?? {});
-  return typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
-}
-
 /** Codex's history as xAI input items. Calls use the flattened tool names the request declares. */
 export function grokInput(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ReasoningReplay): unknown[] {
   if (typeof request.input === 'string') return [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: request.input }] }];
   const input: unknown[] = [];
   for (const item of request.input) {
     const type = item.type ?? 'message';
-    if (CALL_TYPES.has(type)) {
+    if (HISTORY_CALL_TYPES.has(type)) {
       input.push(...(replay?.before(item.call_id) ?? []));
-      input.push({ type: 'function_call', call_id: item.call_id, name: keyFor(codexName(item)), arguments: callArguments(item) });
-    } else if (OUTPUT_TYPES.has(type)) {
+      input.push({ type: 'function_call', call_id: item.call_id, name: keyFor(historyToolName(item)), arguments: historyCallArguments(item) });
+    } else if (HISTORY_OUTPUT_TYPES.has(type)) {
       const output = type === 'tool_search_output' ? [{ type: 'input_text', text: JSON.stringify(item.tools ?? []) }] : parts(item.output, 'input_text', type === 'computer_call_output');
       // Plain text stays a string; text with images stays a part list, which xAI shows the model as an image.
       input.push({ type: 'function_call_output', call_id: item.call_id, output: output.every(part => part.type === 'input_text') ? output.map(part => part.text).join('\n') : output });
@@ -192,8 +176,7 @@ type Prepared = { body: JsonRecord; byKey: Map<string, ToolDescriptor> };
 
 export function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepared {
   const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
-  const keys = new Map([...byKey].map(([key, descriptor]) => [descriptor.proxyName, key]));
-  const keyFor = (name: string) => keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
+  const keyFor = keyLookup(byKey);
   const tools = Object.entries(definitions).map(([name, tool]) => ({ type: 'function', name, description: tool.description, parameters: tool.inputSchema }));
   const extra = request as ResponsesRequest & JsonRecord;
   return {
@@ -225,15 +208,7 @@ export function grokOutput(output: unknown[], byKey: Map<string, ToolDescriptor>
       for (const part of item.content) if (isRecord(part) && typeof part.text === 'string') text += part.text;
     }
     if (item.type !== 'function_call' || typeof item.name !== 'string') continue;
-    const raw = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
-    const callId = typeof item.call_id === 'string' ? item.call_id : undefined;
-    const descriptor = byKey.get(item.name);
-    if (descriptor?.type === 'custom') {
-      let args: unknown;
-      try { args = JSON.parse(raw); } catch {}
-      // Malformed raw input still reaches Codex as written, which reports it to the model like any tool error.
-      toolCalls.push({ name: descriptor.proxyName, arguments: (isRecord(args) ? rawInput(args) : undefined) ?? raw, callId });
-    } else toolCalls.push({ name: descriptor?.proxyName ?? item.name, arguments: raw, callId });
+    toolCalls.push(codexToolCall(byKey, item.name, typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {}), typeof item.call_id === 'string' ? item.call_id : undefined));
   }
   return { text, toolCalls, reasoning };
 }
@@ -294,7 +269,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
     }
   }
 
-  async function run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+  async function run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
     signal?.throwIfAborted();
     if (request.model !== MODEL) throw new GrokError('Unsupported Grok model');
     if (!(EFFORTS as readonly string[]).includes(request.reasoning?.effort ?? 'high')) throw new GrokError('Unsupported Grok reasoning effort');
@@ -314,6 +289,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
       const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
       await sseEvents(watched, event => {
         firstEventMs ||= performance.now() - started;
+        if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') sink?.text(event.delta);
         if ((event.type === 'response.completed' || event.type === 'response.incomplete') && isRecord(event.response)) completed = event.response;
         if (event.type === 'response.failed' || event.type === 'error') failed = event;
       });
@@ -345,12 +321,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
       slug: MODEL, displayName: 'Grok 4.7', description: 'Grok 4.7 through your SuperGrok subscription',
       efforts: EFFORTS, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: 500_000,
     }],
-    // One fresh attempt for a provider failure mid-stream; the turn has no other retry.
-    run: (request, signal) => run(request, signal).catch((error: unknown) => {
-      if (!(error instanceof GrokError) || !error.retryable || signal?.aborted) throw error;
-      logSafe('backend-retry', { backend: 'grok', reason: error.message, attempt: 1, budget: 1 });
-      return run(request, signal);
-    }),
+    run: (request, signal, sink) => retryOnce('Grok', signal, () => run(request, signal, sink), sink),
     // A chat opening refreshes the login ahead of its first turn.
     prewarm: () => { void login.token().catch(() => {}); },
   };

@@ -9,7 +9,7 @@ import { dirname, isAbsolute, join } from 'node:path';
 import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
 import { isRecord, pinnedFileHash, randomId, sha256, type JsonRecord } from '../json';
 import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
-import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
+import type { ProxyOutput, ResponsesRequest, TextSink } from '../protocol/types';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { logSafe } from '../log';
 import { abortable, ProxyTransportError, sleep, transportError } from '../transport';
@@ -435,7 +435,7 @@ class CursorRuntime {
    * holding continues that run; anything else starts a fresh agent with the full history. The turn
    * ends when the model has issued its calls (they go to Codex) or the run finishes.
    */
-  async run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+  async run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
     const started = performance.now(), requestId = randomId('cursor');
     const sanitized = sanitizeCursorInput(request.input);
     if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
@@ -460,9 +460,10 @@ class CursorRuntime {
         session = await this.startRun(request, selection, signature, combined);
       }
       setupMs = performance.now() - started;
+      session.run.attach(sink);
       const step = await session.run.next(combined);
       calls = step.calls.length;
-      const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request, { tools: false })), usageTokens(step.usage)?.input ?? 0);
+      const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request)), usageTokens(step.usage)?.input ?? 0);
       const outputTokens = Math.max(estimateVisibleTokens(step.text + JSON.stringify(step.calls)), usageTokens(step.usage)?.output ?? 0);
       const output: ProxyOutput = { text: step.text, toolCalls: step.calls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
       if (step.calls.length && Array.isArray(request.input)) this.holdRun(session, request, output, signature);
@@ -534,7 +535,7 @@ class CursorRuntime {
       const run = new NativeRun(tools.byKey, nonNegativeInt('CURSOR_TOOL_SETTLE_MS', 350));
       const session: RunSession = { run, lease, bridge, key, agentId, runId: '', signature, historyHash: '', historyLength: 0, lastEvent: performance.now(), done: false, events: [], stream: new AbortController() };
       this.callbacks.register(agentId, run);
-      const prepared = preparePrompt(request, { tools: false });
+      const prepared = preparePrompt(request);
       const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
       if (images.length) logSafe('cursor-images-attached', { count: images.length });
       const text = [nativeRules(rawInputTools(tools.byKey)), nativeToolList(tools.definitions), prepared.prompt].filter(Boolean).join('\n\n');
@@ -649,7 +650,7 @@ export function createCursorBackend(options: CursorOptions): CursorBackend {
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
     catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
     // Transient provider failures (an errored run, a dropped stream, a slow startup) get one fresh attempt.
-    run: (request, signal) => retryOnce('Cursor', signal, () => runtime.run(request, signal)),
+    run: (request, signal, sink) => retryOnce('Cursor', signal, () => runtime.run(request, signal, sink), sink),
     prewarm: () => runtime.prewarm(),
     close: () => runtime.close(),
   };

@@ -315,7 +315,7 @@ export function startRouter(options: RouterOptions) {
       }
       if (isLocalModel(body.model)) {
         if (path !== '/v1/responses') return invalidRequest('Use Codex local compaction for subscription models');
-        if (body.stream) return pendingStream(body, signal => localResponse(body, signal), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
+        if (body.stream) return pendingStream(body, (signal, sink) => localResponse(body, signal, { sink }), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
         // Plain JSON has no channel for progress frames, so it fails like a native request would.
         const response = await localResponse(body, req.signal, { reconnect: false });
         if (body.generate !== false) history.remember(body, response);
@@ -457,9 +457,9 @@ export function startRouter(options: RouterOptions) {
           } finally { stop?.(); }
         }
       } else if (isLocalModel(body.model)) {
-        await pendingResponse(body, async (signal) => {
-          // Output is buffered until the backend finishes, so an interrupt discards the turn whole.
-          try { return await localResponse(body, AbortSignal.any([signal, interrupt.signal])); }
+        await pendingResponse(body, async (signal, sink) => {
+          // An interrupt ends the turn: streamed text is closed as interrupted and no tool call is exposed.
+          try { return await localResponse(body, AbortSignal.any([signal, interrupt.signal]), { sink }); }
           catch (error) {
             if (!interrupt.signal.aborted || signal.aborted) throw error;
             return interruptedResponse(responseObject(body, EMPTY_OUTPUT), []);

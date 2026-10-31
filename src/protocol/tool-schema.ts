@@ -10,8 +10,6 @@ function equalJson(left: unknown, right: unknown, depth = 0): boolean {
   const keys = Object.keys(left);
   return keys.length === Object.keys(right).length && keys.every(key => Object.hasOwn(right, key) && equalJson(left[key], right[key], depth + 1));
 }
-/** Parameter-object equality ignores JSON member order while preserving exact string values. */
-export function sameToolArguments(left: unknown, right: unknown): boolean { return equalJson(left, right); }
 /** A field name safe to put in a diagnostic: model-written names that look like content are masked. */
 export const fieldName = (name: string) => /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? name : '(field)';
 const field = fieldName;

@@ -2,8 +2,8 @@
 // SDK custom tools, xAI Responses). Custom (raw-input) tools take their whole input as the string field
 // `input`; namespaced names are flattened to identifier-safe keys and mapped back on the way out.
 import { isRecord, type JsonRecord } from '../json';
-import type { ToolDescriptor } from './prompt';
-import type { ToolCall } from './types';
+import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, type ToolDescriptor } from './prompt';
+import type { ResponseInputItem, ToolCall } from './types';
 
 export type FunctionTool = { description: string; inputSchema: JsonRecord };
 
@@ -62,4 +62,40 @@ export function codexCall(descriptor: ToolDescriptor, args: unknown, callId: str
     return raw === undefined ? { error: `${descriptor.proxyName} takes raw input. ${RAW_INPUT_NOTE}` } : { name: descriptor.proxyName, arguments: raw, callId };
   }
   return { name: descriptor.proxyName, arguments: JSON.stringify(record), callId };
+}
+
+/** A model's function call as the Codex call it stands for; raw-input tools get their string back. */
+export function codexToolCall(byKey: Map<string, ToolDescriptor>, name: string, raw: string, callId: string | undefined): ToolCall {
+  const descriptor = byKey.get(name);
+  if (descriptor?.type === 'custom') {
+    let args: unknown;
+    try { args = JSON.parse(raw); } catch {}
+    // Malformed raw input still reaches Codex as written, which reports it to the model like any tool error.
+    return { name: descriptor.proxyName, arguments: (isRecord(args) ? rawInput(args) : undefined) ?? raw, callId };
+  }
+  return { name: descriptor?.proxyName ?? name, arguments: raw, callId };
+}
+
+export const HISTORY_CALL_TYPES: ReadonlySet<string> = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'computer_call']);
+export const HISTORY_OUTPUT_TYPES: ReadonlySet<string> = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
+
+/** A history call's Codex tool name, as `toolDescriptors` names it. */
+export function historyToolName(item: ResponseInputItem): string {
+  if (item.type === 'tool_search_call') return TOOL_SEARCH_NAME;
+  if (item.type === 'computer_call') return COMPUTER_TOOL_NAME;
+  const name = String(item.name ?? '');
+  return item.namespace && !name.startsWith(`${item.namespace}.`) ? `${item.namespace}.${name}` : name;
+}
+
+/** A history call's arguments as the JSON object string the function tool takes. */
+export function historyCallArguments(item: ResponseInputItem): string {
+  if (item.type === 'custom_tool_call') return JSON.stringify({ input: item.input ?? '' });
+  if (item.type === 'computer_call') return JSON.stringify(item.actions ? { actions: item.actions } : item.action ?? {});
+  return typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
+}
+
+/** The function key a request declares for a Codex tool name; unknown names are made key-safe. */
+export function keyLookup(byKey: Map<string, ToolDescriptor>): (name: string) => string {
+  const keys = new Map([...byKey].map(([key, descriptor]) => [descriptor.proxyName, key]));
+  return name => keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
 }

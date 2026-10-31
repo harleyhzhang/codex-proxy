@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { COMPUTER_TOOL_NAME, continuationRequest, outputSchema, preparePrompt, requestToPrompt, toolDescriptors, validateRequest } from '../src/protocol/prompt';
+import { COMPUTER_TOOL_NAME, preparePrompt, requestToPrompt, toolDescriptors, validateRequest } from '../src/protocol/prompt';
 
 describe("Responses request adapter", () => {
   test("preserves conversation items and tool results", () => {
@@ -11,24 +11,10 @@ describe("Responses request adapter", () => {
         { type: "function_call", name: "shell", call_id: "call_1", arguments: "{\"cmd\":\"ls\"}" },
         { type: "function_call_output", call_id: "call_1", output: "README.md" },
       ],
-      tools: [{ type: "function", name: "shell", description: "Run a command", parameters: { type: "object" } }],
     });
     expect(prompt).toContain("<instructions>\nBe concise");
     expect(prompt).toContain("<assistant_tool_call name=\"shell\" call_id=\"call_1\">");
     expect(prompt).toContain("<tool_result call_id=\"call_1\">\nREADME.md");
-    expect(prompt).toContain("Return Codex-provided tool requests in tool_calls");
-  });
-
-  test("constrains structured output to supplied tools", () => {
-    const schema = outputSchema([{ type: "custom", name: "apply_patch" }]);
-    expect(JSON.stringify(schema)).toContain('"enum":["apply_patch"]');
-  });
-  test("keeps vendor names in literal user code while describing the execution boundary neutrally", () => {
-    const phrase = "Claude Code's native tools";
-    const prepared = preparePrompt({ model: "grok-4.7", input: `Return exactly ${phrase}`, tools: [{ type: "function", name: "echo", parameters: { type: "object" } }] });
-    expect(prepared.prompt).toContain(`Return exactly ${phrase}`);
-    expect(prepared.prompt).toContain("The backend's native tools are disabled");
-    expect(prepared.prompt.split(phrase)).toHaveLength(2);
   });
 
   test("keeps plaintext inter-agent payloads and flags OpenAI-encrypted ones", () => {
@@ -41,7 +27,7 @@ describe("Responses request adapter", () => {
     });
     expect(prompt).toContain("Payload:\n\nReply SUBAGENT-OK");
     expect(prompt).not.toContain("gAAAAsecret");
-    expect(prompt).toContain("unreadable by Claude");
+    expect(prompt).toContain("unreadable here");
   });
 
   test("normalizes computer and namespaced tools", () => {
@@ -53,8 +39,6 @@ describe("Responses request adapter", () => {
       expect.objectContaining({ proxyName: COMPUTER_TOOL_NAME, type: "computer" }),
       expect.objectContaining({ proxyName: "browser.open", name: "open", namespace: "browser" }),
     ]);
-    expect(JSON.stringify(outputSchema(tools))).toContain(`"${COMPUTER_TOOL_NAME}"`);
-    expect(requestToPrompt({ model: "sonnet", input: "open a page", tools })).not.toContain("undefined");
   });
 
   test("normalizes deferred Codex tool search", () => {
@@ -62,7 +46,6 @@ describe("Responses request adapter", () => {
     expect(toolDescriptors(tools)).toEqual([
       expect.objectContaining({ proxyName: "__codex_tool_search", type: "tool_search" }),
     ]);
-    expect(JSON.stringify(outputSchema(tools))).toContain('"__codex_tool_search"');
   });
 
   test("forwards screenshots as native image blocks without file tools", async () => {
@@ -105,24 +88,5 @@ describe("Responses request adapter", () => {
 
   test("rejects malformed requests", () => {
     expect(() => validateRequest({ input: "hello" })).toThrow("model is required");
-  });
-
-  test("reduces a tool continuation to new results and following input", () => {
-    const request = {
-      model: "sonnet",
-      instructions: "original instructions",
-      input: [
-        { role: "user", content: "run it" },
-        { type: "function_call", call_id: "call_1", name: "shell", arguments: "{}" },
-        { type: "function_call_output", call_id: "call_1", output: "done" },
-        { role: "user", content: "summarize" },
-      ],
-    };
-    expect(continuationRequest(request, new Set(["call_1"]))).toEqual({
-      ...request,
-      instructions: undefined,
-      tools: undefined,
-      input: request.input.slice(2),
-    });
   });
 });

@@ -1,29 +1,45 @@
-// Secondary Claude account and the Opus quota fallback into Cursor, end to end: a scripted Claude
-// CLI (real `claude auth status` identity check, real stream-json turns) and a scripted Cursor bridge
-// (real local Connect handshake) composed exactly as the registry composes them for the live
-// `poly-` rows, driven through the router on HTTP, SSE and WebSocket.
-import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+// Secondary Claude account and the Opus quota fallback into Cursor, end to end: a scripted Anthropic
+// (identity check, Messages stream, quota headers) and a scripted Cursor bridge (real local Connect
+// handshake) composed exactly as the registry composes them for the live `poly-` rows, driven through
+// the router on HTTP, SSE and WebSocket.
+import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { configuredClaudeAccount } from '../src/backends/claude';
+import { createClaudeAccountBackend, type ClaudeAccount } from '../src/backends/claude';
+import { claudeUsageSnapshot } from '../src/backends/claude-limits';
 import type { SubscriptionBackend } from '../src/backends/contract';
 import { configuredCursorBackend } from '../src/backends/cursor';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
 import { BACKENDS } from '../src/backends/registry';
+import { anthropicFixture, limitHeaders, say } from './anthropic-fixture';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const EMAIL = 'work@example.com';
 const USER = 'user_work';
+const anthropic = anthropicFixture({ email: EMAIL, org: 'org_work' });
+const defaultProfile = anthropic.state.profile;
 let scratch = '';
+let credentials = '';
+let claude: ClaudeAccount;
 const rows: SubscriptionBackend[] = [];
 const saved: Record<string, string | undefined> = {};
-const ENV = ['CLAUDE_TIMEOUT_MS', 'CURSOR_TIMEOUT_MS'];
+const ENV = ['CLAUDE_TIMEOUT_MS', 'CURSOR_TIMEOUT_MS', 'OFFLINE_RETRY_BASE_MS'];
 
-/** The scripted Claude CLI reads its identity answer and turn behaviour from files in scratch. */
-const setIdentity = (value: string, exit = 0) => Promise.all([writeFile(scratch + '/identity.json', value), writeFile(scratch + '/identity.exit', String(exit))]);
-const setTurn = (mode: 'ok' | 'limit' | 'limit-event' | 'error') => writeFile(scratch + '/turn.mode', mode);
+type Turn = 'ok' | 'limit' | 'limit-bare' | 'error';
+const TURNS: Record<Turn, () => Response> = {
+  ok: () => say('CLAUDE_OK'),
+  limit: () => new Response('{}', { status: 429, headers: limitHeaders(Math.floor(Date.now() / 1000) + 3600) }),
+  'limit-bare': () => new Response('{}', { status: 429 }),
+  error: () => new Response(`event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: 'model backend exploded' } })}\n\n`, { headers: { 'content-type': 'text/event-stream' } }),
+};
+const setTurn = (mode: Turn) => { anthropic.state.reply = TURNS[mode]; };
 const setBridge = (mode: 'ok' | 'quota') => writeFile(scratch + '/bridge.mode', mode);
+/** A new access token in the login store, so the identity pin is checked again on the next turn. */
+let tokens = 0;
+const newToken = () => writeFile(credentials, JSON.stringify({ claudeAiOauth: { accessToken: `access-new-${++tokens}`, refreshToken: 'refresh-0', expiresAt: Date.now() + 3_600_000 } }));
+const turns = () => anthropic.messages().length;
+const profiles = () => anthropic.state.seen.filter(entry => entry.path === '/api/oauth/profile').length;
 const count = async (name: string) => Number(await readFile(scratch + '/' + name + '.count', 'utf8').catch(() => '0'));
 /** Requests the scripted Cursor bridge served, one line each; bridges are pooled, so a launch count says nothing about generation. */
 const hits = async (name: 'agent' | 'send') => (await readFile(scratch + '/' + name + '.log', 'utf8').catch(() => '')).split('\n').filter(Boolean).length;
@@ -31,24 +47,6 @@ const hits = async (name: 'agent' | 'send') => (await readFile(scratch + '/' + n
 beforeAll(async () => {
   scratch = await mkdtemp(tmpdir() + '/secondary-matrix-');
   for (const key of ENV) saved[key] = process.env[key];
-  const claude = scratch + '/claude';
-  await Bun.write(claude, `#!/bin/sh
-if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
-  echo $(( $(cat ${scratch}/auth.count 2>/dev/null || echo 0) + 1 )) > ${scratch}/auth.count
-  cat ${scratch}/identity.json
-  exit $(cat ${scratch}/identity.exit)
-fi
-while IFS= read -r input; do
-  echo $(( $(cat ${scratch}/claude-turn.count 2>/dev/null || echo 0) + 1 )) > ${scratch}/claude-turn.count
-  case "$(cat ${scratch}/turn.mode)" in
-    limit) echo '{"type":"result","subtype":"error","is_error":true,"result":"Claude AI usage limit reached|1760230800"}';;
-    limit-event) echo '{"type":"assistant","error":"rate_limit"}';;
-    error) echo '{"type":"result","subtype":"error","is_error":true,"result":"model backend exploded"}';;
-    *) echo '{"type":"result","subtype":"success","is_error":false,"structured_output":{"text":"CLAUDE_OK","tool_calls":[]}}';;
-  esac
-done
-`);
-  await chmod(claude, 0o755);
   const bridge = scratch + '/bridge';
   await Bun.write(bridge, `#!/usr/bin/env bun
 import { appendFileSync } from 'node:fs';
@@ -80,22 +78,29 @@ await new Promise(() => {});
 `);
   await chmod(bridge, 0o700);
   await writeFile(scratch + '/auth.json', JSON.stringify({ apiKey: 'key-work', email: EMAIL, backendUrl: 'https://api2.cursor.sh' }), { mode: 0o600 });
-  await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
-  await setTurn('ok');
   await setBridge('ok');
   process.env.CLAUDE_TIMEOUT_MS = '2000';
   process.env.CURSOR_TIMEOUT_MS = '2000';
+  process.env.OFFLINE_RETRY_BASE_MS = '10';
+  credentials = anthropic.credentials();
   const hash = createHash('sha256').update(await readFile(bridge)).digest('hex');
   // Composed the way src/backends/registry.ts composes the live `poly-` rows.
-  const account = configuredClaudeAccount({ CLAUDE_ACCOUNT_CONFIG_DIR: scratch + '/claude-config', CLAUDE_ACCOUNT_BIN: claude, CLAUDE_ACCOUNT_MODEL_PREFIX: 'wk', CLAUDE_ACCOUNT_LABEL: 'Work', CLAUDE_ACCOUNT_MODELS: 'claude-opus-5-5,claude-fable-5-1', CLAUDE_ACCOUNT_EXPECTED_EMAIL: EMAIL, CLAUDE_ACCOUNT_EXPECTED_ORG: 'org_work' });
+  const account = createClaudeAccountBackend({ ...anthropic.options(credentials), configDir: scratch + '/claude-config', prefix: 'wk', label: 'Work', models: ['claude-opus-5-5', 'claude-fable-5-1'], expectedEmail: EMAIL, expectedOrg: 'org_work' });
   const cursor = configuredCursorBackend({ CURSOR_BRIDGE_BIN: bridge, CURSOR_BRIDGE_SHA256: hash, CURSOR_AUTH_FILE: scratch + '/auth.json', CURSOR_CWD: scratch, CURSOR_EXPECTED_EMAIL: EMAIL, CURSOR_EXPECTED_USER_ID: USER, CURSOR_MODEL_PREFIX: 'wk-cursor', CURSOR_LABEL: 'Work' });
-  if (!account || !cursor) throw new Error('fixture rows not configured');
+  if (!cursor) throw new Error('fixture rows not configured');
+  claude = account.account;
   rows.push(withOpusQuotaFallback(account.backend, cursor), cursor);
   (BACKENDS as SubscriptionBackend[]).push(...rows);
+});
+afterEach(async () => {
+  setTurn('ok'); await setBridge('ok');
+  anthropic.state.profile = defaultProfile; anthropic.state.replies.length = 0;
+  claude.limits.restore(claudeUsageSnapshot({}));
 });
 afterAll(async () => {
   for (const row of rows) { const at = BACKENDS.indexOf(row); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
   for (const key of ENV) { if (saved[key] === undefined) delete process.env[key]; else process.env[key] = saved[key]; }
+  anthropic.stop();
   await rm(scratch, { recursive: true, force: true });
 });
 
@@ -143,142 +148,143 @@ const expectTerminal = (seen: Seen[], code: string, fragment: string) => {
 const expectText = (seen: Seen[], fragment: string) => { for (const cell of seen) { expect(cell.code, cell.transport).toBe('ok'); expect(cell.message, cell.transport).toContain(fragment); } };
 
 describe('secondary Claude account identity check', () => {
-  test('a matching identity serves both models and the check runs once per worker', async () => {
+  test('a matching identity serves both models and the check runs once per token', async () => {
     const app = await fixtureRouter();
     try {
-      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
+      await newToken();
+      const before = profiles();
       expectText(await everyTransport(app, body(OPUS, 'hello')), 'CLAUDE_OK');
       expectText(await everyTransport(app, body(FABLE, 'hello')), 'CLAUDE_OK');
-      expect(await count('auth')).toBeGreaterThanOrEqual(6);
+      expect(profiles()).toBe(before + 1);
     } finally { await app.close(); }
   });
 
-  test('wrong email, wrong org, logged out, broken JSON and a failing auth command all refuse before any turn', async () => {
+  test('wrong email, wrong org, unreadable profile and a signed-out login all refuse before any turn, then recover', async () => {
     const app = await fixtureRouter();
     try {
-      const turnsBefore = await count('claude-turn');
-      // Each failure names its real cause: a mismatch is only reported for a parsed, logged-in answer with
-      // the wrong email/org. A dead probe or unreadable output must not read as a login problem.
-      const cases: Array<[string, number, string]> = [
-        [JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 0, 'identity does not match'],
-        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_other' }), 0, 'identity does not match'],
-        [JSON.stringify({ loggedIn: false }), 0, 'not logged in'],
-        [JSON.stringify({ loggedIn: false, authMethod: 'none', apiProvider: 'firstParty' }), 1, 'credential store is inaccessible'],
-        ['not json', 0, 'unreadable output'],
-        [JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 2, 'auth status exited 2'],
+      const turnsBefore = turns();
+      const cases: Array<[() => Response, string]> = [
+        [() => Response.json({ account: { email: 'other@example.com' }, organization: { uuid: 'org_work' } }), 'identity does not match'],
+        [() => Response.json({ account: { email: EMAIL }, organization: { uuid: 'org_other' } }), 'identity does not match'],
+        [() => new Response('not json'), 'identity does not match'],
+        [() => new Response('{}', { status: 401 }), 'not logged in'],
       ];
-      for (const [identity, exit, expected] of cases) {
-        await setIdentity(identity, exit);
+      for (const [profile, expected] of cases) {
+        anthropic.state.profile = profile;
         for (const model of [OPUS, FABLE]) {
+          await newToken();
           const seen = await everyTransport(app, body(model, 'x'));
           expectTerminal(seen, 'invalid_request_error', expected);
           for (const cell of seen) expect(cell.message).not.toContain('other@example.com');
         }
       }
-      expect(await count('claude-turn')).toBe(turnsBefore);
+      expect(turns()).toBe(turnsBefore);
       expect(await count('bridge')).toBe(0);
-      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
+      anthropic.state.profile = defaultProfile;
       expectText(await everyTransport(app, body(OPUS, 'recovered')), 'CLAUDE_OK');
     } finally { await app.close(); }
   });
+});
 
-  test('a complete matching answer whose teardown was killed by the probe deadline (exit 143) still serves the turn', async () => {
-    // October 11-15, 2026: `claude auth status` wrote its full answer, then its teardown ran past the spawn
-    // timeout. Bun reports that SIGTERM as exit 143 with no signalCode. The answer is the verdict; the
-    // teardown status is not evidence about the login and must not fail a healthy turn.
+describe('network drops through the router', () => {
+  test('a stream cut before any text is replayed inside the same SSE or WebSocket request; plain JSON and a cut after text fail without a replay', async () => {
     const app = await fixtureRouter();
     try {
-      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }), 143);
-      expectText(await everyTransport(app, body(FABLE, 'slow probe')), 'CLAUDE_OK');
-      // October 17, 2026: a probe that stalled without printing anything, right after this login was
-      // verified, is a machine stall and the recent verification still serves the turn.
-      await setIdentity('', 143);
-      expectText(await everyTransport(app, body(FABLE, 'stalled probe')), 'CLAUDE_OK');
-      // A parsed mismatch clears the verification; after that a stalled probe is refused, named as such,
-      // with no turn launched.
-      const turnsBefore = await count('claude-turn');
-      await setIdentity(JSON.stringify({ loggedIn: true, email: 'other@example.com', orgId: 'org_work' }), 143);
-      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
-      await setIdentity('', 143);
-      expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'invalid_request_error', 'killed before it answered');
-      expect(await count('claude-turn')).toBe(turnsBefore);
-      await setIdentity(JSON.stringify({ loggedIn: true, email: EMAIL, orgId: 'org_work' }));
+      const opened = `event: message_start\ndata: ${JSON.stringify({ type: 'message_start', message: { usage: {} } })}\n\n`;
+      const cut = (text = '') => () => new Response(opened + text, { headers: { 'content-type': 'text/event-stream' } });
+      const before = turns();
+      anthropic.state.replies.push(cut(), () => say('RECOVERED'));
+      expect(terminal(await (await post(app, { ...body(OPUS, 'drop'), stream: true })).text())?.response?.output?.[0]?.content?.[0]?.text).toBe('RECOVERED');
+      anthropic.state.replies.push(cut(), () => say('RECOVERED'));
+      expect((await socketTurn(app, body(OPUS, 'drop'))).response?.output?.[0]?.content?.[0]?.text).toBe('RECOVERED');
+      expect(turns()).toBe(before + 4);
+      // Plain JSON has no channel for progress frames: the drop is a retryable server error, as native.
+      anthropic.state.replies.push(cut());
+      const plain = await post(app, body(OPUS, 'drop'));
+      expect(plain.status).toBeGreaterThanOrEqual(500);
+      expect(turns()).toBe(before + 5);
+
+      anthropic.state.replies.push(cut(`event: content_block_start\ndata: ${JSON.stringify({ type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } })}\n\nevent: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'HALF' } })}\n\n`));
+      const stream = await post(app, { ...body(OPUS, 'drop after text'), stream: true });
+      const events = sse(await stream.text());
+      expect(events.some(event => event.type === 'response.output_text.delta' && event.delta === 'HALF')).toBe(true);
+      expect(events.find(event => ['response.failed', 'response.completed'].includes(event.type))?.type).toBe('response.failed');
+      expect(turns()).toBe(before + 6);
     } finally { await app.close(); }
   });
 });
 
 describe('Opus quota fallback into Cursor, end to end', () => {
-  test('an Opus usage-limit result or rate-limit event falls back to Cursor Opus with the notice prepended', async () => {
+  test('an Opus usage-limit refusal, with or without quota headers, falls back to Cursor Opus with the notice prepended', async () => {
     const app = await fixtureRouter();
     try {
-      for (const mode of ['limit', 'limit-event'] as const) {
-        await setTurn(mode);
+      for (const mode of ['limit', 'limit-bare'] as const) {
+        setTurn(mode);
         const before = await hits('send');
         const seen = await everyTransport(app, body(OPUS, 'needs fallback'));
         expectText(seen, 'CURSOR_OPUS_OK');
         for (const cell of seen) expect(cell.message, cell.transport).toContain('using Cursor Opus 5.5 because the direct Claude subscription reached its usage limit');
         expect(await hits('send')).toBe(before + 3);
+        claude.limits.restore(claudeUsageSnapshot({}));
       }
-    } finally { await app.close(); await setTurn('ok'); }
+    } finally { await app.close(); }
   });
 
   test('Fable at its limit never falls back; the refusal names the limit', async () => {
     const app = await fixtureRouter();
     try {
-      await setTurn('limit');
+      setTurn('limit');
       const before = await hits('agent');
       expectTerminal(await everyTransport(app, body(FABLE, 'x')), 'claude_usage_limit_reached', 'limit');
       expect(await hits('agent')).toBe(before);
-    } finally { await app.close(); await setTurn('ok'); }
+    } finally { await app.close(); }
   });
 
   test('a non-quota Opus failure never falls back', async () => {
     const app = await fixtureRouter();
     try {
-      await setTurn('error');
+      setTurn('error');
       const before = await hits('agent');
-      const seen = await everyTransport(app, body(OPUS, 'x'));
-      for (const cell of seen) { expect(cell.code, cell.transport).toBe('server_error'); expect(cell.message).not.toContain('exploded'); }
+      expectTerminal(await everyTransport(app, body(OPUS, 'x')), 'invalid_request_error', 'model backend exploded');
       expect(await hits('agent')).toBe(before);
-    } finally { await app.close(); await setTurn('ok'); }
+    } finally { await app.close(); }
   });
 
   test('when Cursor is also exhausted the fallback refusal is surfaced with no third supplier', async () => {
     const app = await fixtureRouter();
     try {
-      await setTurn('limit'); await setBridge('quota');
+      setTurn('limit'); await setBridge('quota');
       const [agents, sends] = [await hits('agent'), await hits('send')];
       expectTerminal(await everyTransport(app, body(OPUS, 'x')), 'invalid_request_error', 'HTTP 429, resource_exhausted');
       // Cursor was asked once per transport and refused; nothing was generated there.
       expect(await hits('agent')).toBe(agents + 3);
       expect(await hits('send')).toBe(sends);
-    } finally { await app.close(); await setTurn('ok'); await setBridge('ok'); }
+    } finally { await app.close(); }
   });
 
   test('once the Opus limit is recorded, the quota gate skips Claude and goes straight to Cursor; Fable stays gated', async () => {
     const app = await fixtureRouter();
     try {
-      await setTurn('limit');
-      await everyTransport(app, body(OPUS, 'record the limit'));
-      const turnsBefore = await count('claude-turn');
-      await setTurn('ok');
-      const seen = await everyTransport(app, body(OPUS, 'gated'));
-      // Either the gate short-circuits (no Claude turn) or the limit has already expired in the
-      // limits tracker; both are acceptable, but Claude must never be asked while blocked.
-      if (seen[0]!.message.includes('CURSOR_OPUS_OK')) expect(await count('claude-turn')).toBe(turnsBefore);
-      else expectText(seen, 'CLAUDE_OK');
-    } finally { await app.close(); await setTurn('ok'); }
+      setTurn('limit');
+      await post(app, body(OPUS, 'record the limit'));
+      setTurn('ok');
+      const before = turns();
+      expectText(await everyTransport(app, body(OPUS, 'gated')), 'CURSOR_OPUS_OK');
+      expectTerminal(await everyTransport(app, body(FABLE, 'gated')), 'claude_usage_limit_reached', 'limit');
+      expect(turns()).toBe(before);
+    } finally { await app.close(); }
   });
 
   test('a client cancel during the Claude turn never starts the Cursor bridge', async () => {
     const app = await fixtureRouter();
     try {
-      await setTurn('limit');
+      setTurn('limit');
       const before = await hits('agent');
       const seen = await post(app, body(OPUS, 'x'), { signal: AbortSignal.abort() }).catch(error => error);
       expect(seen).toBeInstanceOf(Error);
       await new Promise(resolve => setTimeout(resolve, 200));
       expect(await hits('agent')).toBe(before);
-    } finally { await app.close(); await setTurn('ok'); }
+    } finally { await app.close(); }
   });
 });
+

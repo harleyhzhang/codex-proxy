@@ -5,7 +5,7 @@ import { items, unwrap } from './support';
 import {mkdtemp,rm} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import { BACKENDS, backendFor, assertRoutable, publicModels } from '../src/backends/registry';
-import { BackendError, adaptRequest, classifyCliFailure, retryOnce, RETRY_MARKER, type SubscriptionBackend } from '../src/backends/contract';
+import { BackendError, adaptRequest, retryOnce, type SubscriptionBackend } from '../src/backends/contract';
 import { logSafe } from '../src/log';
 import { SummaryCodec, portableSummary } from '../src/router/capsule';
 import { HistoryCache } from '../src/router/history';
@@ -16,23 +16,20 @@ const GPT='gpt-6.1-sol';
 const LOCAL=BACKENDS.flatMap(backend=>publicModels(backend).map(model=>({backend,model})));
 const EVERY_MODEL=[GPT,...LOCAL.map(entry=>entry.model)];
 
-// Shared failure policy every backend inherits through retryOnce, logSafe and classifyCliFailure.
+// Shared failure policy every backend inherits through retryOnce and logSafe.
 describe('shared failure policy',()=>{
-  test('a retryable refusal is retried exactly once; a second refusal becomes a chat message, not a failed turn',async()=>{
-    const notes:string[]=[];
+  test('a transient failure gets one fresh attempt, never after streamed text; what follows reaches Codex with its reason',async()=>{
     const ok={text:'ok',toolCalls:[],usage:{inputTokens:0,outputTokens:0,totalTokens:0}};
-    const result=await retryOnce('fixture',undefined,async note=>{notes.push(note);if(notes.length===1)throw new BackendError('bad arguments',{retryable:true});return ok;});
-    expect(result).toBe(ok);expect(notes).toHaveLength(2);expect(notes[0]).toBe('');
-    expect(notes[1]).toContain(RETRY_MARKER);expect(notes[1]).toContain('bad arguments');
     let calls=0;
-    const softened=await retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('still bad',{retryable:true,modelOutput:true});});
+    expect(await retryOnce('fixture',undefined,async()=>{if(++calls===1)throw new BackendError('provider hiccup',{retryable:true});return ok;})).toBe(ok);
     expect(calls).toBe(2);
-    expect(softened.toolCalls).toEqual([]);
-    expect(softened.text).toContain('fixture');expect(softened.text).toContain('still bad');expect(softened.text).toContain('Nothing was executed');
-    // A retryable failure that is not about the model's output (crash, transport) still fails the turn.
-    calls=0;
-    await expect(retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('process crashed',{retryable:true});})).rejects.toThrow('process crashed');
-    expect(calls).toBe(2);
+    for(const started of [false,true]){
+      calls=0;
+      const failure=await retryOnce('fixture',undefined,async()=>{calls++;throw new BackendError('still down',{retryable:true});},{started,text(){}}).catch((error:unknown)=>error);
+      expect(failure).toBeInstanceOf(BackendError);
+      expect((failure as BackendError).message).toBe('still down');
+      expect(calls).toBe(started?1:2);
+    }
   });
   test('refusals, foreign errors and cancelled requests are never retried',async()=>{
     for(const failure of [new BackendError('refused'),new Error('crash')]){
@@ -49,23 +46,6 @@ describe('shared failure policy',()=>{
     const event=JSON.parse(lines[0]!);
     expect(event).toEqual({event:'fixture',n:3,ok:true,none:null,hint:'Error: cannot open  (rm -rf) x'});
     expect(lines[0]).not.toContain('SECRET');
-  });
-  test('exit classification: the account is never retried, transient failures are',()=>{
-    expect(classifyCliFailure('HTTP 429 rate limit')).toEqual({category:'subscription usage limit reached',retryable:false});
-    expect(classifyCliFailure('401 Unauthorized')).toEqual({category:'authentication failed',retryable:false});
-    for (const text of ['Run grok login', 'Please sign in', 'signin required', 'log-in required', 'Refresh rejected: invalid_grant', 'UNAUTHENTICATED', 'token_expired', 'You are signed out']) {
-      expect(classifyCliFailure(text)).toEqual({category:'authentication failed',retryable:false});
-    }
-    expect(classifyCliFailure('binary signing failed')).toEqual({category:'process failed',retryable:true});
-    expect(classifyCliFailure('logging subsystem crashed')).toEqual({category:'process failed',retryable:true});
-    expect(classifyCliFailure('json schema validation failed')).toEqual({category:'structured output failed',retryable:true});
-    expect(classifyCliFailure('connection reset by peer')).toEqual({category:'connection failed',retryable:true});
-    expect(classifyCliFailure('upstream returned 503')).toEqual({category:'connection failed',retryable:true});
-    expect(classifyCliFailure('segfault')).toEqual({category:'process failed',retryable:true});
-    // A bare number inside an identifier must not read as an HTTP status.
-    expect(classifyCliFailure('session a5003f')).toEqual({category:'process failed',retryable:true});
-    expect(classifyCliFailure('request a429001f')).toEqual({category:'process failed',retryable:true});
-    expect(classifyCliFailure('input_tokens 429001')).toEqual({category:'process failed',retryable:true});
   });
 });
 const output={text:'',toolCalls:[],usage:{inputTokens:0,outputTokens:0,totalTokens:0}};

@@ -387,3 +387,15 @@ for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130]] as const) {
     }
   }));
 }
+
+test('each Codex turn streams the run text written for it, including text written while no turn waited', () => fixture(async f => {
+  const first = request('TWO_STEPS');
+  const deltas: string[][] = [[], [], []];
+  const sink = (i: number) => ({ text: (delta: string) => { deltas[i]!.push(delta); }, get started() { return deltas[i]!.length > 0; } });
+  const one = await f.backend.run(first, undefined, sink(0));
+  const second = nextTurn(first, one, ['r1']);
+  const two = await f.backend.run(second, undefined, sink(1));
+  const done = await f.backend.run(nextTurn(second, two, ['r2']), undefined, sink(2));
+  expect(deltas.map(list => list.join(''))).toEqual([one.text, two.text, done.text]);
+  expect(deltas.map(list => list.join(''))).toEqual(['working', 'again', 'got:r1,r2']);
+}));
