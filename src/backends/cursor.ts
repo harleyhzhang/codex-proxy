@@ -3,7 +3,7 @@
 // no subagents and an empty in-memory file tree. Codex's tools are the agent's only tools (SDK custom
 // tools behind the `mcp` group; see cursor-native.ts), so Cursor never owns execution: every call is
 // validated and executed by Codex.
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, rmSync, statSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
@@ -231,6 +231,11 @@ function sessionSignature(request: ResponsesRequest, selection: JsonRecord): str
 const TOOL_RESULTS = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
 /** Cursor's project folder for a working directory, as the SDK names it. */
 const projectDir = (dir: string) => join(homedir(), '.cursor', 'projects', dir.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, ''));
+// A router that exits (a restart, SIGTERM) cannot await cleanup, so live agents' folders go synchronously.
+const liveDirs = new Set<string>();
+process.once('exit', () => {
+  for (const dir of liveDirs) for (const path of [dir, projectDir(dir)]) { try { rmSync(path, { recursive: true, force: true }); } catch {} }
+});
 
 class CursorRuntime {
   private readonly heldRuns = new Map<string, RunSession>();
@@ -264,6 +269,7 @@ class CursorRuntime {
     const sdk = await this.sdk();
     const started = performance.now();
     const dir = await mkdtemp(join(this.options.cwd, 'agent-'));
+    liveDirs.add(dir);
     try {
       const agent = await sdk.Agent.create({
         apiKey: key, model: this.lastSelection,
@@ -274,7 +280,7 @@ class CursorRuntime {
       }).catch((error: unknown) => { throw cursorFailure(error); });
       logSafe('cursor-agent-created', { ms: Math.round(performance.now() - started) });
       return { agent, dir };
-    } catch (error) { await rm(dir, { recursive: true, force: true }); throw error; }
+    } catch (error) { liveDirs.delete(dir); await rm(dir, { recursive: true, force: true }); throw error; }
   }
 
   /** The ready agent for this login, created ahead of its turn. */
@@ -304,6 +310,7 @@ class CursorRuntime {
   private async dispose(spare: Spare): Promise<void> {
     try { spare.agent.close(); } catch {}
     await Promise.all([rm(spare.dir, { recursive: true, force: true }), rm(projectDir(spare.dir), { recursive: true, force: true })]).catch(() => logSafe('cursor-cleanup-failed', { stage: 'directory' }));
+    liveDirs.delete(spare.dir);
   }
 
   /**

@@ -237,3 +237,25 @@ test('every finished or abandoned agent leaves no working directory behind', () 
   await f.backend.close();
   expect((await readdir(f.root)).filter(name => name.startsWith('agent-'))).toEqual([]);
 }));
+
+test('a router that exits (restart, SIGTERM) leaves no agent folder behind', () => fixture(async f => {
+  const script = `
+    import { createCursorBackend } from ${JSON.stringify(import.meta.dir + '/../src/backends/cursor.ts')};
+    import { scriptedSdk } from ${JSON.stringify(import.meta.dir + '/cursor-sdk-fixture.ts')};
+    const scripted = scriptedSdk();
+    const backend = createCursorBackend({ authFile: ${JSON.stringify(f.auth)}, cwd: ${JSON.stringify(f.root)}, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'exitfixture', label: 'Fixture', sdk: async () => scripted.sdk });
+    await backend.run({ model: 'kimi-k3', input: [{ role: 'user', content: 'PLAIN' }], reasoning: { effort: 'high' } });
+    for (let i = 0; i < 100 && scripted.events.filter(e => e.operation === 'create').length < 2; i++) await Bun.sleep(5);
+    process.once('SIGTERM', () => process.exit(143));
+    console.log('ready');
+    await new Promise(() => {});
+  `;
+  const child = Bun.spawn([process.execPath, '-e', script], { stdout: 'pipe', stderr: 'ignore' });
+  const reader = child.stdout.getReader();
+  let out = '';
+  while (!out.includes('ready')) { const { value, done } = await reader.read(); if (done) break; out += new TextDecoder().decode(value); }
+  expect((await readdir(f.root)).filter(name => name.startsWith('agent-'))).toHaveLength(1);
+  child.kill('SIGTERM');
+  expect(await child.exited).toBe(143);
+  expect((await readdir(f.root)).filter(name => name.startsWith('agent-'))).toEqual([]);
+}));
