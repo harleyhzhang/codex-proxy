@@ -271,6 +271,25 @@ Cursor's SDK sandbox helper is unavailable in the tested standalone macOS build;
 this adapter enforces no native actions through the tool list and event guard.
 Codex's own execution sandbox and approvals still apply to returned calls.
 
+**Native tool calls (default).** Codex's client tools are registered with the
+agent as SDK custom tools (`local.customTools`), and the bridge is pointed at a
+loopback callback with `SetToolCallback`. The model calls them as real tool
+calls; each call arrives at the router as `CallCustomTool` and is held while the
+router hands it to Codex as an ordinary `function_call`/`custom_tool_call`. When
+Codex's next request carries the results, the held callbacks are answered and the
+same Cursor run continues: no new agent, no re-prompt and nothing parsed out of
+model text. Calls written within `CURSOR_TOOL_SETTLE_MS` (350 ms) of each other
+are returned together as one parallel step. The agent's allowed tools are only
+the `mcp` group and its only MCP server is the router's, so it has no shell,
+edit, read, web or subagent tool; any other tool event stops the turn. Function
+arguments that miss a required field or break the schema go back to the model to
+fix and never reach Codex. Tool results keep inline images. A run waiting on
+Codex holds its bridge up to `CURSOR_SESSION_IDLE_MS`; when held runs fill the
+pool, the one waiting longest is cancelled and replays if continued later. A
+changed history, a tool search or a user message mid-run also replays in a
+fresh agent. `CURSOR_NATIVE_TOOLS=0` restores the JSON-envelope path with its
+output repairs and retries.
+
 The default pool holds at most eight bridges, bounding local process and memory
 pressure during helper fan-out. `CURSOR_MAX_BRIDGES` tunes that bound. Set
 `CURSOR_SESSION_REUSE=0` to keep bridge pooling but replay each agent in full,
@@ -343,6 +362,8 @@ Everything has a default; set only what you need.
 | `CURSOR_SESSION_IDLE_MS` | `900000` | Maximum age of a retained Cursor tool session |
 | `CURSOR_BRIDGE_REUSE` | `1` | `0` restores one bridge process per request |
 | `CURSOR_SESSION_REUSE` | `1` | `0` disables agent continuation while retaining bridge pooling |
+| `CURSOR_NATIVE_TOOLS` | `1` | `0` returns to the JSON-envelope tool path (prompted tool list, parsed and repaired output) |
+| `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
 | `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |
 | `GROK_CWD` | unset | Empty working directory for Grok |
 | `GROK_HOME` | `~/.grok` | Grok profile directory (use a dedicated one) |

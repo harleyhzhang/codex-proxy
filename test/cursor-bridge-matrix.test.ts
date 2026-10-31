@@ -36,7 +36,15 @@ if (scenario === 'BRIDGE_BADHANDSHAKE') { console.error('cursor-sdk-bridge ready
 if (scenario === 'BRIDGE_SLOW') await new Promise(r => setTimeout(r, 3000));
 if (scenario === 'BRIDGE_SLOW_ONCE') { const marker = '${scratch}/slow-start-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); await new Promise(r => setTimeout(r, 3000)); } }
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
-const frame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
+const rawFrame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
+// A finished run also streams its reply as assistant text, which is what the native path reads;
+// the JSON-envelope path reads the run result. Each scenario therefore serves both paths.
+const frame = (flags, value) => {
+  const result = value?.result?.result?.result;
+  if (typeof result !== 'string') return rawFrame(flags, value);
+  let text = result; try { const parsed = JSON.parse(result); if (typeof parsed?.text === 'string') text = parsed.text; } catch {}
+  return Buffer.concat([rawFrame(0, { sdkMessage: { type: 'assistant', message: { type: 'assistant', run_id: 'run-1', message: { role: 'assistant', content: [{ type: 'text', text }] } } } }), rawFrame(flags, value)]);
+};
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 const catalog = { items: [
   { id: 'kimi-k3', parameters: [{ id: 'reasoning', values: [{ value: 'low' }, { value: 'high' }, { value: 'max' }] }] },
@@ -55,6 +63,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     return json({ user: { userEmail: '${EMAIL}', userId: '${USER}' } });
   }
   if (path.endsWith('/ListModels')) return json(scenario === 'CATALOG_BAD' ? { nope: true } : scenario === 'MODEL_MISSING' ? { items: [] } : catalog);
+  if (path.endsWith('/SetToolCallback')) return json({});
   if (path.endsWith('/CreateAgent')) return json(scenario === 'AGENT_BAD' ? {} : { agentId: 'agent-1' });
   if (path.endsWith('/CancelRun') || path.endsWith('/CloseAgent')) return json({});
   if (path.endsWith('/Send')) {
@@ -174,7 +183,11 @@ const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } c
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const bridgePid = async () => Number(await readFile(scratch + '/bridge.pid', 'utf8'));
 
-describe('Cursor bridge failures through the router', () => {
+// Every failure mode runs on the native tool path (the default) and on the JSON-envelope rollback.
+for (const mode of ['native', 'json'] as const) describe(`Cursor bridge failures through the router (${mode})`, () => {
+  const saved = process.env.CURSOR_NATIVE_TOOLS;
+  beforeAll(() => { process.env.CURSOR_NATIVE_TOOLS = mode === 'native' ? '1' : '0'; });
+  afterAll(() => { if (saved === undefined) delete process.env.CURSOR_NATIVE_TOOLS; else process.env.CURSOR_NATIVE_TOOLS = saved; });
   test('the scripted bridge serves normal turns on every transport and stays available for reuse', async () => {
     const app = await fixtureRouter();
     try {
@@ -371,7 +384,8 @@ describe('Cursor bridge failures through the router', () => {
     }
   });
 
-  test('malformed JSON output is retried once and then delivered as a refusal chat message, not a failed turn', async () => {
+  // Envelope repair exists only on the JSON path; native replies are text and real tool calls.
+  test.skipIf(mode === 'native')('malformed JSON output is retried once and then delivered as a refusal chat message, not a failed turn', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('BAD_JSON');
@@ -384,7 +398,7 @@ describe('Cursor bridge failures through the router', () => {
     } finally { await app.close(); }
   });
 
-  test('narration is corrected inside the same agent, so one attempt yields the wrapped reply', async () => {
+  test.skipIf(mode === 'native')('narration is corrected inside the same agent, so one attempt yields the wrapped reply', async () => {
     const app = await fixtureRouter();
     try {
       await scenario('PROSE_THEN_JSON');

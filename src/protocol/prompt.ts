@@ -189,12 +189,13 @@ function describeTool(tool: ToolDescriptor): string {
 
 const TOOL_RULES = `You are the model inside the Codex agent loop. Return Codex-provided tool requests in tool_calls. The backend's native tools are disabled; Codex owns all action execution. For a function tool, arguments must represent the JSON object in its contract. If the required output schema uses a string, JSON-encode that object once; otherwise write the object directly. For a custom tool, arguments must be the exact raw input string. For ${TOOL_SEARCH_NAME}, arguments must be {"query":"specific tool names and capabilities","limit":8} encoded as JSON; use it before concluding that an instructed MCP, plugin, app, browser, node_repl, or cua_repl tool is unavailable. For ${COMPUTER_TOOL_NAME}, arguments must be one computer action object or {"actions":[...]} encoded as JSON. Use only listed tool names. You may return multiple independent tool calls. Do not claim a Codex tool succeeded until its tool result appears in the conversation. Screenshots and images are attached directly to this message; inspect them visually without requesting a native Read tool.`;
 
-export function requestToPrompt(request: ResponsesRequest): string {
+/** `tools: false` leaves out the tool list and its JSON calling rules, for backends with native tool calls. */
+export function requestToPrompt(request: ResponsesRequest, options: { tools?: boolean } = {}): string {
   const input =
     typeof request.input === 'string'
       ? `<user>\n${request.input}\n</user>`
       : request.input.map(serializeItem).join('\n\n');
-  const tools = toolDescriptors(requestTools(request));
+  const tools = options.tools === false ? [] : toolDescriptors(requestTools(request));
   const toolSection = tools.length
     ? `<available_tools>\n${tools.map(describeTool).join('\n')}\n</available_tools>\n\n${TOOL_RULES}`
     : '';
@@ -304,11 +305,11 @@ function redactImages(value: unknown, legacyComputerOutput = false): string {
 }
 
 /** The prompt text plus every inline image in the conversation, in order. */
-export function preparePrompt(request: ResponsesRequest): PreparedPrompt {
+export function preparePrompt(request: ResponsesRequest, options: { tools?: boolean } = {}): PreparedPrompt {
   const images: ImageBlock[] = [];
   if (typeof request.input !== 'string') collectImages(request.input, images);
   const note = images.length ? `\n\n${images.length} image(s) from the conversation/tool results are attached in order.` : '';
-  return { prompt: requestToPrompt(request) + note, images };
+  return { prompt: requestToPrompt(request, options) + note, images };
 }
 
 /** Checks the shape every backend relies on. Throws a plain Error naming the first problem. */

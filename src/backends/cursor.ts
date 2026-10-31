@@ -1,7 +1,9 @@
 // Optional Cursor transport through the vendor's pinned SDK bridge. The proxy has no runtime
 // package dependency: it speaks sdk.v1 Connect JSON to an exclusively leased loopback process.
-// Every request starts with tools: [], no setting sources, no MCP and no subagents. Cursor never
-// owns execution; validated tool requests return to Codex only after the complete run succeeds.
+// Agents get no setting sources and no subagents. By default Codex's tools are the agent's only tools
+// (SDK custom tools behind the `mcp` group, answered over a router callback; see cursor-native.ts);
+// with CURSOR_NATIVE_TOOLS=0 the agent has no tools and requests calls in a JSON envelope. Either
+// way Cursor never owns execution: every call is validated and executed by Codex.
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { dirname, isAbsolute, join } from 'node:path';
@@ -15,6 +17,8 @@ import { logSafe } from '../log';
 import { ProxyTransportError, transportError } from '../transport';
 import { CursorBridgePool, type CursorLease } from './cursor-pool';
 import { responseObject } from '../protocol/output';
+import { CUSTOM_TOOLS_PROVIDER, NativeCallbackServer, NativeRun, nativeToolList, nativeTools, rawInputTools, toolResult, type ToolResult } from './cursor-native';
+import type { ToolDescriptor } from '../protocol/prompt';
 
 export const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
@@ -435,6 +439,21 @@ export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: 
 
 const OUTPUT_RULES = `You are inside the Codex external tool loop. Return ONLY one JSON object with exactly text (string) and tool_calls (array). Each call has exactly name and arguments. Use the exact Codex tool names below. Function arguments are JSON objects; custom tool arguments are raw strings. All actions are executed externally by Codex AFTER your reply: you have no native tools. Never claim an action succeeded until its tool result appears in history. Do not wrap JSON in Markdown or add text outside it. To narrate progress and keep working, put the sentence in text and the next call in tool_calls of the same object; a reply whose tool_calls is empty ends the turn.`;
 
+// Native tool calls: Codex's tools are the only callable tools, so the prompt only says who runs them.
+const nativeRules = (raw: string[]) => `You are the model inside a Codex agent loop. Your tools are the Codex tools on the "${CUSTOM_TOOLS_PROVIDER}" MCP server; Codex executes every call on the user's machine and returns the result to you. Their input schemas are listed in <tool_schemas>, so call them directly through the MCP tool call without a discovery step, with arguments exactly matching each schema.${raw.length ? ` Only ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} one raw string, in the field "input"; every other tool takes the fields of its own schema.` : ''} You have no other tools. Independent calls may be made in parallel. When the task is done or you need the user, reply with plain text. Never claim an action ran before its result appears.`;
+
+/** Why a native function call's arguments do not fit its schema, in words the model can act on. */
+function argumentProblem(descriptor: ToolDescriptor, args: unknown): string | undefined {
+  const contract = isRecord(descriptor.contract) ? descriptor.contract : undefined;
+  if (!contract || !isRecord(args)) return isRecord(args) ? undefined : `${descriptor.proxyName} takes a JSON object.`;
+  const properties = isRecord(contract.properties) ? Object.keys(contract.properties) : [];
+  const missing = (Array.isArray(contract.required) ? contract.required : []).filter((key: unknown) => typeof key === 'string' && !Object.hasOwn(args, key));
+  if (missing.length) return `${descriptor.proxyName} needs ${missing.map(String).join(', ')}; its parameters are ${properties.join(', ')}. The tool did not run.`;
+  // Extra fields carry no meaning for the tool; drop them as the JSON path does.
+  if (contract.additionalProperties === false) for (const key of Object.keys(args)) if (!properties.includes(key)) delete args[key];
+  return matchesSchema(args, contract) ? undefined : `${descriptor.proxyName} arguments do not match its schema (wrong type or value); its parameters are ${properties.join(', ')}. The tool did not run.`;
+}
+
 export function readCursorKey(options: CursorOptions): string {
   const info = statSync(options.authFile);
   if (!info.isFile() || (info.mode & 0o077) !== 0) throw new CursorError('Cursor SDK credential file must be owner-only');
@@ -561,6 +580,20 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
     if (sdk && containsNative(sdk.message)) throw new CursorError('Cursor attempted a native tool; no Codex actions were returned');
     if ((sdk && /^(tool_call|task|compaction|summary)/.test(String(sdk.type))) || (step && /tool|shell|task|summary|compact/i.test(String(step.type)))) throw new CursorError('Cursor attempted native actions or compaction; no Codex actions were returned');
   }
+  const run = finishedRun(events, selection, captureDir);
+  const output = parseCursorOutput(String(run.result), request, captureDir, acceptProse);
+  if (isRecord(run.usage)) {
+    const input = Number(run.usage.inputTokens ?? 0) + Number(run.usage.cacheReadTokens ?? 0) + Number(run.usage.cacheWriteTokens ?? 0), out = Number(run.usage.outputTokens ?? 0);
+    if ([input,out].every(n => Number.isSafeInteger(n) && n >= 0)) output.usage = { inputTokens: input, outputTokens: out, totalTokens: input + out };
+  }
+  return output;
+}
+
+/**
+ * The run record of a Cursor run that finished cleanly with the requested model and parameters.
+ * Anything else throws a named CursorError, retryable only for provider-side transient failures.
+ */
+export function finishedRun(events: JsonRecord[], selection: JsonRecord, captureDir?: string): JsonRecord {
   const terminal = events.filter(event => isRecord(event.result));
   const result = terminal.length === 1 && isRecord(terminal[0]?.result) ? terminal[0].result : undefined;
   const run = result && isRecord(result.result) ? result.result : undefined;
@@ -589,12 +622,7 @@ export function interpretCursorEvents(events: JsonRecord[], request: ResponsesRe
   }
   const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
   if (!sameModel) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
-  const output = parseCursorOutput(run.result, request, captureDir, acceptProse);
-  if (isRecord(run.usage)) {
-    const input = Number(run.usage.inputTokens ?? 0) + Number(run.usage.cacheReadTokens ?? 0) + Number(run.usage.cacheWriteTokens ?? 0), out = Number(run.usage.outputTokens ?? 0);
-    if ([input,out].every(n => Number.isSafeInteger(n) && n >= 0)) output.usage = { inputTokens: input, outputTokens: out, totalTokens: input + out };
-  }
-  return output;
+  return run;
 }
 
 const PROSE_CORRECTION = 'Your last reply needs a valid tool envelope. No Codex action ran. Reply with ONLY one JSON object beginning with { . Recheck the original user request: if an external action is still needed, put progress in "text" and its next actual Codex call in "tool_calls", rather than promising it with an empty array. If the user requested a quote, draft, translation or plan, or your answer is genuinely complete, confirm that final answer unchanged in "text" with "tool_calls": []. A concrete blocker or user-requested pause may also finish without tools. Never claim an action ran without its tool result.';
@@ -608,6 +636,20 @@ type CursorBridge = {
   process: Bun.Subprocess<'ignore', 'ignore', 'pipe'>; dir: string; url: string; token: string;
   id: string; startupMs: number; dead: boolean; agentDirs: Map<string, string>; session?: CursorSession; dispose(): Promise<void>;
 };
+/** A Cursor run that issued tool calls and holds its bridge until Codex returns their results. */
+type NativeSession = {
+  run: NativeRun; lease: CursorLease<CursorBridge>; bridge: CursorBridge; agentId: string; runId: string;
+  signature: string; historyHash: string; historyLength: number; lastEvent: number; done: boolean;
+  events: JsonRecord[]; stream: AbortController; heldSince?: number; expiry?: ReturnType<typeof setTimeout>; ended?: Promise<void>;
+};
+const nativeEnabled = () => process.env.CURSOR_NATIVE_TOOLS !== '0';
+
+/** Prompt and output tokens of the latest model call a Cursor usage record describes. */
+function usageTokens(usage: JsonRecord | undefined): { input: number; output: number } | undefined {
+  if (!usage) return undefined;
+  const input = Number(usage.inputTokens ?? 0) + Number(usage.cacheReadTokens ?? 0) + Number(usage.cacheWriteTokens ?? 0), output = Number(usage.outputTokens ?? 0);
+  return [input, output].every(n => Number.isSafeInteger(n) && n >= 0) ? { input, output } : undefined;
+}
 export type CursorBackend = SubscriptionBackend & { close(): Promise<void> };
 // A normal process.exit must not orphan parked bridges. Track immediately after spawn, including
 // children still waiting for their handshake; asynchronous directory cleanup is handled in dispose.
@@ -630,6 +672,8 @@ const TOOL_RESULTS = new Set(['function_call_output', 'custom_tool_call_output',
 class CursorRuntime {
   private readonly pool: CursorBridgePool<CursorBridge>;
   private readonly sessions = new Map<string, CursorBridge>();
+  private readonly callbacks = new NativeCallbackServer();
+  private readonly nativeSessions = new Map<string, NativeSession>();
   readonly options: Readonly<CursorOptions>;
   constructor(options: CursorOptions) {
     this.options = Object.freeze({ ...options });
@@ -641,7 +685,11 @@ class CursorRuntime {
       nonNegativeInt('CURSOR_WARM_BRIDGES', 1), positiveInt('CURSOR_WARM_BRIDGE_IDLE_MS', 900_000),
     );
   }
-  close(): Promise<void> { return this.pool.close(); }
+  async close(): Promise<void> {
+    await Promise.all([...new Set(this.nativeSessions.values())].map(session => this.endNative(session, 'Router shutting down', true)));
+    this.callbacks.stop();
+    return this.pool.close();
+  }
   /** Starts a bridge when a chat opens, so its first turn skips the cold start. Never throws. */
   prewarm(): void {
     if (process.env.CURSOR_BRIDGE_REUSE === '0') return;
@@ -710,6 +758,8 @@ class CursorRuntime {
       signal?.throwIfAborted();
       if (info.schemaVersion !== 1 || info.host !== '127.0.0.1' || info.protocol !== 'connect' || info.transport !== 'tcp' || typeof info.port !== 'number' || typeof info.authTokenFile !== 'string' || typeof info.url !== 'string' || info.url !== `http://127.0.0.1:${info.port}`) throw new CursorError('Cursor returned an invalid local handshake');
       bridge.url = info.url; bridge.token = (await readFile(info.authTokenFile, 'utf8')).trim();
+      // Every bridge sends custom tool calls to this login's callback endpoint.
+      if (nativeEnabled()) await this.rpc(bridge, 'SdkBridgeControlService', 'SetToolCallback', { url: this.callbacks.url(), authToken: this.callbacks.token }, signal ?? AbortSignal.timeout(10_000));
       const exited = () => { bridge.dead = true; this.forget(bridge); };
       void process.exited.then(exited, exited);
       bridge.startupMs = performance.now() - started;
@@ -754,6 +804,7 @@ class CursorRuntime {
   }
   async run(request: ResponsesRequest, signal?: AbortSignal, retryNote = '', lastAttempt = false): Promise<ProxyOutput> {
     signal?.throwIfAborted();
+    if (nativeEnabled()) return this.runNative(request, signal);
     const started = performance.now(), requestId = randomId('cursor');
     const sanitized = sanitizeCursorInput(request.input);
     if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
@@ -912,6 +963,211 @@ class CursorRuntime {
     if (!response.ok) throw new CursorError('Cursor agent cleanup failed', true);
     const dir = bridge.agentDirs.get(agentId);
     if (dir) { await rm(dir, { recursive: true, force: true }); bridge.agentDirs.delete(agentId); }
+  }
+
+  /**
+   * One Codex turn on the native path. A request that carries the results of calls a live run is
+   * holding continues that run; anything else starts a fresh agent with the full history. The turn
+   * ends when the model has issued its calls (they go to Codex) or the run finishes.
+   */
+  private async runNative(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+    const started = performance.now(), requestId = randomId('cursor');
+    const sanitized = sanitizeCursorInput(request.input);
+    if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
+    request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
+    const selection = cursorSelection(request.model, request.reasoning?.effort, this.options.fastest);
+    const signature = sessionSignature(request, selection);
+    const controller = new AbortController();
+    const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    const idleMs = positiveInt('CURSOR_TIMEOUT_MS', 300_000);
+    let session: NativeSession | undefined, timedOut = false, setupMs = 0, calls = 0, success = false;
+    const continuation = this.nativeContinuation(request, signature);
+    // Silence is measured from the request start until the run streams, so a hung setup is cut too.
+    const idle = setInterval(() => { if (performance.now() - (session?.lastEvent ?? started) > idleMs) { timedOut = true; controller.abort(); } }, Math.min(1000, idleMs));
+    try {
+      if (continuation) {
+        session = continuation.session;
+        clearTimeout(session.expiry);
+        for (const id of continuation.results.keys()) this.nativeSessions.delete(id);
+        session.lastEvent = performance.now();
+        session.run.answer(continuation.results);
+      } else {
+        session = await this.startNative(request, selection, signature, combined);
+      }
+      setupMs = performance.now() - started;
+      const step = await session.run.next(combined);
+      calls = step.calls.length;
+      const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request, { tools: false })), usageTokens(step.usage)?.input ?? 0);
+      const outputTokens = Math.max(estimateVisibleTokens(step.text + JSON.stringify(step.calls)), usageTokens(step.usage)?.output ?? 0);
+      const output: ProxyOutput = { text: step.text, toolCalls: step.calls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+      if (step.calls.length && Array.isArray(request.input)) this.holdNative(session, request, output, signature);
+      else await this.endNative(session, 'Cursor turn finished', false);
+      success = true;
+      return output;
+    } catch (error) {
+      if (session) await this.endNative(session, 'Cursor turn failed', true);
+      if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic supplier fallback`, true);
+      throw error;
+    } finally {
+      clearInterval(idle);
+      logSafe('cursor-turn', { request_id: requestId, bridge_id: session?.bridge.id, model: request.model, native: true, continued: !!continuation, success, calls, setup_ms: Math.round(setupMs), elapsed_ms: Math.round(performance.now() - started) });
+    }
+  }
+
+  /** The held run this request continues: its history is unchanged and it answers exactly the held calls. */
+  private nativeContinuation(request: ResponsesRequest, signature: string): { session: NativeSession; results: Map<string, ToolResult> } | undefined {
+    if (!Array.isArray(request.input) || process.env.CURSOR_SESSION_REUSE === '0') return undefined;
+    let session: NativeSession | undefined;
+    for (let index = request.input.length - 1; index >= 0 && !session; index--) {
+      const callId = request.input[index]?.call_id;
+      if (callId) session = this.nativeSessions.get(callId);
+    }
+    if (!session) return undefined;
+    const pending = session.run.pending();
+    const suffix = request.input.slice(session.historyLength);
+    const answers = suffix.every(item => TOOL_RESULTS.has(item.type ?? '') && item.type !== 'tool_search_output' && pending.includes(item.call_id ?? ''));
+    const matches = session.signature === signature && suffix.length > 0 && answers && pending.every(id => suffix.some(item => item.call_id === id))
+      && historyHash(request.input.slice(0, session.historyLength)) === session.historyHash;
+    if (!matches) {
+      // A changed history, a tool search (new tools) or a user message mid-run: replay instead.
+      logSafe('cursor-native-replay', { signature: session.signature === signature, answers });
+      void this.endNative(session, 'The conversation changed; this run was replaced', false);
+      return undefined;
+    }
+    return { session, results: new Map(suffix.map(item => [item.call_id!, toolResult(item)])) };
+  }
+
+  private async startNative(request: ResponsesRequest, selection: JsonRecord, signature: string, signal: AbortSignal): Promise<NativeSession> {
+    await this.reclaimHeld();
+    const key = readCursorKey(this.options);
+    const lease = await this.pool.acquire(key, signal);
+    const bridge = lease.value;
+    let agentId = '';
+    try {
+      signal.throwIfAborted();
+      if (lease.reused && sha256(await readFile(this.options.binary)) !== this.options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
+      if (readCursorKey(this.options) !== key) throw new CursorError('Cursor credential changed while queued; retry the turn', true);
+      const rpc = (service: string, method: string, body: JsonRecord) => this.rpc(bridge, service, method, body, signal);
+      const models = await verifyCursorProfile(this.options, key, rpc, signal);
+      const discovered = isRecord(models) && Array.isArray(models.items) ? models.items.find(item => isRecord(item) && item.id === request.model) : undefined;
+      if (!isRecord(discovered) || !Array.isArray(discovered.parameters)) throw new CursorError('Requested model is unavailable on the pinned Cursor account');
+      const definitions = discovered.parameters;
+      if ((selection.params as Array<{ id: string; value: string }>).some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
+      const tools = nativeTools(toolDescriptors(requestTools(request)));
+      const hasTools = tools.byKey.size > 0;
+      const agentDir = await mkdtemp(join(bridge.dir, 'agent-')); await chmod(agentDir, 0o700);
+      // Only the MCP group is allowed, and the only MCP server is the router's: no shell, edit, read,
+      // web or subagent tool exists for this agent. Without Codex tools even that group is off.
+      const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: hasTools ? ['mcp'] : [] }, disallowedTools: ['task'], local: { cwd: [agentDir], settingSources: [], ...(hasTools ? { customTools: tools.definitions } : {}) } } })).json();
+      if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
+      agentId = created.agentId;
+      bridge.agentDirs.set(agentId, agentDir);
+      const run = new NativeRun(tools.byKey, nonNegativeInt('CURSOR_TOOL_SETTLE_MS', 350), argumentProblem);
+      const session: NativeSession = { run, lease, bridge, agentId, runId: '', signature, historyHash: '', historyLength: 0, lastEvent: performance.now(), done: false, events: [], stream: new AbortController() };
+      this.callbacks.register(agentId, run);
+      const prepared = preparePrompt(request, { tools: false });
+      const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
+      if (images.length) logSafe('cursor-images-attached', { count: images.length });
+      const text = [nativeRules(rawInputTools(tools.byKey)), nativeToolList(tools.definitions), prepared.prompt].filter(Boolean).join('\n\n');
+      // The stream outlives this request when the run holds tool calls, so only ending the session
+      // cuts it; this request's cancellation ends the session (and so the stream) in runNative.
+      const cancel = () => session.stream.abort(signal.reason);
+      signal.addEventListener('abort', cancel, { once: true });
+      let response: Response;
+      try { response = await this.rpc(bridge, 'SdkAgentService', 'Send', { agentId, message: images.length ? { text, images } : { text }, options: { enableSteps: true } }, session.stream.signal, true); }
+      finally { signal.removeEventListener('abort', cancel); }
+      if (!response.body) throw new CursorError('Cursor returned an empty stream');
+      void this.readNative(session, response.body, selection);
+      return session;
+    } catch (error) {
+      if (agentId) await this.closeAgent(bridge, agentId).catch(() => {});
+      await lease.discard();
+      throw error;
+    }
+  }
+
+  /** Feeds a run's stream into its NativeRun: text, guarded tool events, usage and the terminal result. */
+  private async readNative(session: NativeSession, body: ReadableStream<Uint8Array>, selection: JsonRecord): Promise<void> {
+    const { run } = session;
+    try {
+      for await (const event of connectFrames(body)) {
+        session.lastEvent = performance.now();
+        const sdk = isRecord(event.sdkMessage) ? event.sdkMessage : undefined;
+        const message = sdk && isRecord(sdk.message) ? sdk.message : undefined;
+        if (message && typeof message.run_id === 'string') session.runId = message.run_id;
+        if (isRecord(event.result) || isRecord(event.done)) session.events.push(event);
+        const step = isRecord(event.step) && isRecord(event.step.step) ? event.step.step : undefined;
+        const stepType = String(step?.type ?? '');
+        // Only calls to the router's own MCP server are allowed; anything else is a native action.
+        const containsNative = (v: unknown): boolean => Array.isArray(v) ? v.some(containsNative) : isRecord(v) ? v.type === 'tool_use' || Object.values(v).some(containsNative) : false;
+        if (sdk && containsNative(sdk.message)) throw new CursorError('Cursor attempted a native tool; it was stopped and no Codex actions were returned');
+        if (message?.type === 'tool_call') {
+          const args = isRecord(message.args) ? message.args : {};
+          if (message.name !== 'mcp' || args.providerIdentifier !== CUSTOM_TOOLS_PROVIDER) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
+        } else if (sdk && /^(task|compaction|summary)/.test(String(sdk.type))) throw new CursorError('Cursor attempted native subagents or compaction; no Codex actions were returned');
+        if (stepType === 'toolCall' ? !(isRecord(step?.message) && step.message.type === 'mcp') : /shell|task|summary|compact/i.test(stepType)) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
+        if (message?.type === 'assistant' && isRecord(message.message) && Array.isArray(message.message.content)) {
+          for (const part of message.message.content) if (isRecord(part) && part.type === 'text' && typeof part.text === 'string') run.appendText(part.text);
+        }
+        if (message?.type === 'usage' && isRecord(message.usage)) run.usage = message.usage;
+      }
+      const record = finishedRun(session.events, selection, join(dirname(this.options.cwd), 'invalid-output'));
+      if (isRecord(record.usage) && !run.usage) run.usage = record.usage;
+      session.done = true;
+      run.finish();
+    } catch (error) {
+      session.done = true;
+      if (error instanceof ProxyTransportError || error instanceof BackendError) run.fail(error);
+      else run.fail(transportError(error) ? new CursorError('Cursor bridge stream dropped; no automatic supplier fallback', true) : error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  /** Keeps the run and its bridge until Codex returns these calls' results, or the session expires. */
+  private holdNative(session: NativeSession, request: ResponsesRequest, output: ProxyOutput, signature: string): void {
+    const prior = [...(request.input as unknown[]), ...responseObject(request, output).output];
+    session.signature = signature;
+    session.historyHash = historyHash(prior);
+    session.historyLength = prior.length;
+    session.heldSince = Date.now();
+    for (const call of output.toolCalls) if (call.callId) this.nativeSessions.set(call.callId, session);
+    session.expiry = setTimeout(() => void this.endNative(session, 'Codex did not return the tool results in time', false), positiveInt('CURSOR_SESSION_IDLE_MS', 900_000));
+    session.expiry.unref?.();
+  }
+
+  /**
+   * Held runs wait on Codex, not on Cursor. When they occupy every bridge the cap allows, the one
+   * waiting longest gives its bridge to new work; if Codex later returns its results, they replay.
+   */
+  private async reclaimHeld(): Promise<void> {
+    const max = Math.min(32, positiveInt('CURSOR_MAX_BRIDGES', 8));
+    const held = [...new Set(this.nativeSessions.values())].filter(session => session.heldSince !== undefined && !session.ended);
+    if (held.length < max) return;
+    const oldest = held.reduce((a, b) => (a.heldSince! <= b.heldSince! ? a : b));
+    logSafe('cursor-native-reclaimed', { held: held.length, held_ms: Date.now() - oldest.heldSince! });
+    await this.endNative(oldest, 'Its bridge was needed for another turn; this run will be replayed if continued', false);
+  }
+
+  /** Ends a run: held callbacks are released, an unfinished run is cancelled, the bridge is returned. */
+  private endNative(session: NativeSession, reason: string, discard: boolean): Promise<void> {
+    if (session.ended) return session.ended;
+    clearTimeout(session.expiry);
+    for (const [callId, owner] of this.nativeSessions) if (owner === session) this.nativeSessions.delete(callId);
+    session.run.close(reason);
+    this.callbacks.unregister(session.agentId, session.run);
+    const { bridge, lease, agentId } = session;
+    session.ended = (async () => {
+      try {
+        if (!session.done && session.runId) await fetch(`${bridge.url}/sdk.v1.SdkAgentService/CancelRun`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${bridge.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId, runId: session.runId }) });
+        session.stream.abort();
+        if (discard || bridge.dead || process.env.CURSOR_BRIDGE_REUSE === '0') { await lease.discard(); return; }
+        await this.closeAgent(bridge, agentId);
+        lease.release();
+      } catch {
+        logSafe('cursor-cleanup-failed', { stage: 'native-end' });
+        await lease.discard();
+      }
+    })();
+    return session.ended;
   }
 }
 

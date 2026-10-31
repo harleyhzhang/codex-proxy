@@ -1,10 +1,16 @@
-import { expect, test } from 'bun:test';
+import { afterAll, beforeAll, expect, test } from 'bun:test';
 import { appendFile, chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createCursorBackend, type CursorBackend } from '../src/backends/cursor';
 import { isRecord, sha256, type JsonRecord } from '../src/json';
 import { responseObject } from '../src/protocol/output';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest } from '../src/protocol/types';
+
+// These cases cover the JSON-envelope path (CURSOR_NATIVE_TOOLS=0): repairs, envelope continuation and
+// its pool behaviour. The native tool path has its own suite in cursor-native.test.ts.
+const savedNative = process.env.CURSOR_NATIVE_TOOLS;
+beforeAll(() => { process.env.CURSOR_NATIVE_TOOLS = '0'; });
+afterAll(() => { if (savedNative === undefined) delete process.env.CURSOR_NATIVE_TOOLS; else process.env.CURSOR_NATIVE_TOOLS = savedNative; });
 
 type Fixture = { backend: CursorBackend; root: string; binary: string; auth: string; source: string; events(): Promise<JsonRecord[]> };
 async function fixture(run: (fixture: Fixture) => Promise<void>, limit = 2): Promise<void> {
@@ -30,6 +36,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
   return json({user:{userEmail:process.env.CURSOR_API_KEY === 'wrong-owner' ? 'other@example.com' : 'test@example.com', userId:'fixture'}});
  }
  if (method === 'ListModels') return json({items:[{id:'kimi-k3',parameters:[{id:'reasoning',values:['low','high','max'].map(value=>({value}))}]},{id:'grok-4.7',parameters:[{id:'reasoning_effort',values:['low','medium','high','xhigh'].map(value=>({value}))},{id:'context',values:[{value:'256k'}]},{id:'fast',values:[{value:'true'},{value:'false'}]}]}]});
+ if (method === 'SetToolCallback') return json({});
  const bytes = Buffer.from(await req.arrayBuffer());
  const body = JSON.parse((method === 'Send' ? bytes.subarray(5) : bytes).toString());
  if (method === 'CreateAgent') { const agentId = process.pid + '-' + (++next); agents.set(agentId,{model:body.options.model,sends:0,marker:''}); event('create',{agentId,cwd:body.options.local.cwd[0],model:body.options.model}); return json({agentId}); }
