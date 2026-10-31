@@ -106,9 +106,9 @@ test('OpenAI compaction is bridged once by GPT into a cached sealed summary for 
  const failing=new CompactionBridge(codec,dir,async()=>new Response('{}',{status:400}));await expect(failing.summary('gAAAA-other')).rejects.toThrow('could not be bridged');
  await rm(dir,{recursive:true});
 });
-test('compaction request retains history but removes the trigger and tools',()=>{
+test('compaction request retains history and tools but removes the trigger and forbids calls',()=>{
  const compact=compactRequest({model:'claude-opus-5-5',previous_response_id:'old',input:[{role:'user',content:'Remember CEDAR'},{type:'compaction_trigger'}],tools:[{type:'function',name:'exec_command'}]});
- expect(compact.tools).toEqual([]);expect(compact.input).toHaveLength(2);expect(firstText(items(compact)[1])).toContain('continuation summary');expect(compact.previous_response_id).toBeUndefined();
+ expect(compact.tools).toEqual([{type:'function',name:'exec_command'}]);expect(compact.tool_choice).toBe('none');expect(compact.input).toHaveLength(2);expect(firstText(items(compact)[1])).toContain('continuation summary');expect(compact.previous_response_id).toBeUndefined();
 });
 test('Claude plan usage snapshot keeps percent used and reset times for both windows',()=>{
  const snap=claudeUsageSnapshot({status:'allowed',overageStatus:'rejected',unifiedWindows:{five_hour:{utilization:0.58,resetsAt:1790833800},seven_day:{utilization:0.1,resetsAt:1790960400}}},1790830000000);

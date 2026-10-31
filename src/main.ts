@@ -6,22 +6,27 @@ import { dirname } from 'node:path';
 import { loadConfig } from './config';
 import { log } from './log';
 import { startRouter } from './router/server';
+import { transportError } from './transport';
 
-// Default signal termination skips normal exit hooks. Let the entrypoint preserve conventional
-// signal exit codes while backend hooks synchronously stop every parked/starting child process.
+// Default signal termination skips normal exit hooks; exit through them with the conventional codes.
 process.once('SIGTERM', () => process.exit(143));
 process.once('SIGINT', () => process.exit(130));
 
-// Last-resort guard. A broken pipe to an exited CLI child must fail only that request; letting it
-// escape kills the router and every open chat. Anything else is a real bug: log its shape (never
+// Last-resort guard. A broken pipe or reset socket must fail only that request; letting it escape
+// kills the router and every open chat. Anything else is a real bug: log its shape (never
 // its message, which may hold content) and exit so the supervisor restarts a clean process.
+// Cursor's SDK runs in this process: a network failure it leaves unawaited in the background fails
+// at most its own request, so it is logged and survived like a broken pipe.
+const SURVIVABLE_REJECTIONS = /^(NetworkError|ConnectError|CursorSdkError|CursorAgentError|AbortError|TimeoutError)$/;
 for (const kind of ['uncaughtException', 'unhandledRejection'] as const) {
   process.on(kind, (error: unknown) => {
     const fields = (error ?? {}) as { code?: unknown; name?: unknown };
     const code = typeof fields.code === 'string' ? fields.code.replace(/[^A-Z_]/g, '').slice(0, 32) : '';
     const name = String(fields.name ?? '').replace(/[^A-Za-z]/g, '').slice(0, 40);
     log.warn(`process-${kind}`, { code, name });
-    if (code !== 'EPIPE' && code !== 'ECONNRESET') process.exit(1);
+    if (code === 'EPIPE' || code === 'ECONNRESET') return;
+    if (kind === 'unhandledRejection' && (SURVIVABLE_REJECTIONS.test(name) || transportError(error))) return;
+    process.exit(1);
   });
 }
 

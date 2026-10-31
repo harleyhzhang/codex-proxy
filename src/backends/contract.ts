@@ -3,7 +3,7 @@
 import { randomId } from '../json';
 import { logSafe } from '../log';
 import { CLIENT_TOOL_TYPES } from '../protocol/prompt';
-import type { ProxyOutput, ResponsesBody, ResponsesRequest, TextSink } from '../protocol/types';
+import type { ProxyOutput, ResponsesBody, ResponsesRequest, OutputSink } from '../protocol/types';
 
 /** One entry in the model picker. */
 export type CatalogModel = {
@@ -29,7 +29,7 @@ export interface SubscriptionBackend {
   /** Pre-generation gate, e.g. a known exhausted quota. Throws a BackendError to refuse. */
   assertAvailable?(model: string): void;
   /** `sink`, when given, receives the turn's assistant text as it arrives. */
-  run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput>;
+  run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput>;
   /**
    * Optional, best effort: readies a process or login check for the turn a `generate: false` warmup
    * announces (Codex sends one when a chat opens). Must never start a generation, send a prompt or throw.
@@ -69,7 +69,7 @@ export class BackendError extends Error {
  * before anything reached Codex, so one fresh attempt is safe; text Codex already shows rules it out.
  * Whatever happens next reaches Codex with its real reason.
  */
-export async function retryOnce(backend: string, signal: AbortSignal | undefined, attempt: () => Promise<ProxyOutput>, sink?: TextSink): Promise<ProxyOutput> {
+export async function retryOnce(backend: string, signal: AbortSignal | undefined, attempt: () => Promise<ProxyOutput>, sink?: OutputSink): Promise<ProxyOutput> {
   try { return await attempt(); } catch (error) {
     if (!(error instanceof BackendError) || !error.retryable || signal?.aborted || sink?.started) throw error;
     logSafe('backend-retry', { backend, reason: error.message });

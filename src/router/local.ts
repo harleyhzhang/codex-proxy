@@ -3,7 +3,7 @@ import { backendFor } from '../backends/registry';
 import { logSafe } from '../log';
 import { responseObject } from '../protocol/output';
 import { validateRequest } from '../protocol/prompt';
-import { EMPTY_OUTPUT, type ResponseObject, type ResponsesBody, type TextSink } from '../protocol/types';
+import { EMPTY_OUTPUT, type ResponseObject, type ResponsesBody, type OutputSink } from '../protocol/types';
 import { ProxyTransportError, reconnectTransport, transportError } from '../transport';
 
 /**
@@ -18,7 +18,7 @@ import { ProxyTransportError, reconnectTransport, transportError } from '../tran
  * `sink` has streamed text, a dropped connection is no longer replayed here: it fails the turn as a
  * retryable server error, as a dropped OpenAI stream does.
  */
-export async function localResponse(body: ResponsesBody, signal?: AbortSignal, options: { reconnect?: boolean; sink?: TextSink } = {}): Promise<ResponseObject> {
+export async function localResponse(body: ResponsesBody, signal?: AbortSignal, options: { reconnect?: boolean; sink?: OutputSink } = {}): Promise<ResponseObject> {
   const backend = backendFor(body.model);
   if (!backend) throw new BackendError('Unsupported model');
   if (body.generate === false) {

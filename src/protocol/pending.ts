@@ -1,7 +1,7 @@
 import { randomId } from '../json';
 import { logSafe } from '../log';
 import { itemEvents, responseObject } from './output';
-import { EMPTY_OUTPUT, type OutputItem, type ResponsesBody, type ResponseObject, type TextSink } from './types';
+import { EMPTY_OUTPUT, type OutputItem, type OutputSink, type ResponsesBody, type ResponseObject, type ToolCall } from './types';
 type Event = Record<string, unknown>;
 
 /** The placeholder envelope progress frames carry before any backend output exists. */
@@ -28,11 +28,14 @@ const textOf = (item: OutputItem | undefined): string => {
   return typeof part === 'object' && part !== null && typeof (part as { text?: unknown }).text === 'string' ? (part as { text: string }).text : '';
 };
 
-// Local backends stream assistant text through the sink as it arrives, as one message item at output
-// index 0, the way OpenAI streams it. Tool calls are only exposed once the backend has validated the
-// whole turn. Native progress events keep the client stream alive during generation/reconnection.
+type Streamed = { index: number; kind: 'message' | 'reasoning' | 'call'; item: OutputItem; text: string };
+
+// Local backends stream the turn into Codex as it is written, the way OpenAI streams it: thinking as a
+// reasoning item, text as message items, and each tool call as soon as it is complete (Codex starts it
+// at once). Whatever the backend did not stream follows when it finishes. Native progress events keep
+// the client stream alive during generation and reconnection.
 export async function pendingResponse(request: ResponsesBody,
-  generate: (signal: AbortSignal, sink: TextSink) => Promise<ResponseObject>, signal: AbortSignal,
+  generate: (signal: AbortSignal, sink: OutputSink) => Promise<ResponseObject>, signal: AbortSignal,
   emit: (event: Event) => void, remember?: (response: ResponseObject) => void,
   heartbeatMs = 10_000): Promise<ResponseObject> {
   const heartbeatAbort = new AbortController();
@@ -54,50 +57,98 @@ export async function pendingResponse(request: ResponsesBody,
   }, heartbeatMs);
   const cancel = () => clearInterval(timer);
   signal.addEventListener('abort', cancel, { once: true });
-  const streamed = { id: randomId('msg'), text: '', open: false };
-  const at = () => ({ item_id: streamed.id, output_index: 0, content_index: 0 });
-  const sink: TextSink = {
-    get started() { return streamed.open; },
-    text(delta) {
-      if (!delta || signal.aborted) return;
-      try {
-        if (!streamed.open) {
-          streamed.open = true;
-          send({ type: 'response.output_item.added', output_index: 0, item: { id: streamed.id, type: 'message', status: 'in_progress', role: 'assistant', content: [] } });
-          send({ type: 'response.content_part.added', ...at(), part: { type: 'output_text', annotations: [], text: '' } });
-        }
-        streamed.text += delta;
-        send({ type: 'response.output_text.delta', ...at(), delta });
-      } catch (error) { heartbeatAbort.abort(error); }
-    },
+
+  const streamed: Streamed[] = [];
+  let open: Streamed | undefined;
+  let reached = false;
+  const at = (entry: Streamed) => ({ item_id: entry.item.id, output_index: entry.index });
+  const close = () => {
+    const entry = open;
+    if (!entry) return;
+    open = undefined;
+    if (entry.kind === 'message') {
+      const part = { type: 'output_text', annotations: [], text: entry.text };
+      entry.item = { ...entry.item, status: 'completed', content: [part] };
+      send({ type: 'response.output_text.done', ...at(entry), content_index: 0, text: entry.text });
+      send({ type: 'response.content_part.done', ...at(entry), content_index: 0, part });
+    } else {
+      const part = { type: 'summary_text', text: entry.text };
+      entry.item = { ...entry.item, summary: [part] };
+      send({ type: 'response.reasoning_summary_text.done', ...at(entry), summary_index: 0, text: entry.text });
+      send({ type: 'response.reasoning_summary_part.done', ...at(entry), summary_index: 0, part });
+    }
+    send({ type: 'response.output_item.done', output_index: entry.index, item: entry.item });
   };
+  const begin = (kind: 'message' | 'reasoning'): Streamed => {
+    close();
+    const entry: Streamed = kind === 'message'
+      ? { index: streamed.length, kind, text: '', item: { id: randomId('msg'), type: 'message', status: 'in_progress', role: 'assistant', content: [] } }
+      : { index: streamed.length, kind, text: '', item: { id: randomId('rs'), type: 'reasoning', summary: [] } };
+    streamed.push(entry);
+    open = entry;
+    send({ type: 'response.output_item.added', output_index: entry.index, item: entry.item });
+    if (kind === 'message') send({ type: 'response.content_part.added', ...at(entry), content_index: 0, part: { type: 'output_text', annotations: [], text: '' } });
+    else send({ type: 'response.reasoning_summary_part.added', ...at(entry), summary_index: 0, part: { type: 'summary_text', text: '' } });
+    return entry;
+  };
+  const appendText = (delta: string) => {
+    const entry = open?.kind === 'message' ? open : begin('message');
+    reached = true;
+    entry.text += delta;
+    send({ type: 'response.output_text.delta', ...at(entry), content_index: 0, delta });
+  };
+  // A closed socket stops the turn; the backend sees it through the signal.
+  const guarded = <T extends unknown[]>(fn: (...args: T) => void) => (...args: T) => {
+    if (signal.aborted) return;
+    try { fn(...args); } catch (error) { heartbeatAbort.abort(error); }
+  };
+  const sink: OutputSink = {
+    get started() { return reached; },
+    text: guarded((delta: string) => { if (delta) appendText(delta); }),
+    reasoning: guarded((delta: string) => {
+      if (!delta) return;
+      const entry = open?.kind === 'reasoning' ? open : begin('reasoning');
+      entry.text += delta;
+      send({ type: 'response.reasoning_summary_text.delta', ...at(entry), summary_index: 0, delta });
+    }),
+    call: guarded((call: ToolCall) => {
+      let item: OutputItem | undefined;
+      // A call the router cannot render (bad computer or search arguments) waits for the final output, which reports it.
+      try { item = responseObject(request, { ...EMPTY_OUTPUT, toolCalls: [call] }).output[0]; } catch { return; }
+      if (!item) return;
+      close();
+      const entry: Streamed = { index: streamed.length, kind: 'call', item, text: '' };
+      streamed.push(entry);
+      reached = true;
+      for (const event of itemEvents(item, entry.index)) send(event);
+    }),
+  };
+
   try {
     const generated = await generate(signal, sink);
     signal.throwIfAborted();
     let output = generated.output;
-    let skip: OutputItem | undefined;
-    if (streamed.open) {
-      const index = output.findIndex(item => item.type === 'message');
-      if (index < 0 && generated.status === 'incomplete') {
+    if (streamed.length) {
+      const final = output.find(item => item.type === 'message');
+      const shown = streamed.filter(entry => entry.kind === 'message').map(entry => entry.text).join('');
+      if (!final && generated.status === 'incomplete' && open?.kind === 'message') {
         // Interrupted mid-text: the partial message is closed as interrupted, like an OpenAI stream.
-        send({ type: 'response.output_item.interrupted', response_id: empty.id, item_id: streamed.id, output_index: 0 });
+        send({ type: 'response.output_item.interrupted', response_id: empty.id, item_id: open.item.id, output_index: open.index });
+        streamed.splice(streamed.indexOf(open), 1);
+        open = undefined;
       } else {
-        const final = index >= 0 ? output[index]! : responseObject(request, { ...EMPTY_OUTPUT, text: streamed.text }).output[0]!;
         const text = textOf(final);
-        if (text.startsWith(streamed.text)) {
-          if (text.length > streamed.text.length) send({ type: 'response.output_text.delta', ...at(), delta: text.slice(streamed.text.length) });
-        } else logSafe('stream-text-diverged', { streamed: streamed.text.length, final: text.length });
-        const part = { type: 'output_text', annotations: [], text };
-        skip = { ...final, id: streamed.id, content: [part] };
-        send({ type: 'response.output_text.done', ...at(), text });
-        send({ type: 'response.content_part.done', ...at(), part });
-        send({ type: 'response.output_item.done', output_index: 0, item: skip });
-        output = [skip, ...output.filter((_, i) => i !== index)];
+        if (text.startsWith(shown)) { if (text.length > shown.length) appendText(text.slice(shown.length)); }
+        else logSafe('stream-text-diverged', { streamed: shown.length, final: text.length });
       }
+      close();
+      const calls = new Set(streamed.filter(entry => entry.kind === 'call').map(entry => entry.item.call_id));
+      const rest = output.filter(item => item.type !== 'message' && !(item.call_id !== undefined && calls.has(item.call_id)));
+      output = [...streamed.map(entry => entry.item), ...rest];
     }
     const response = { ...generated, output, id: empty.id, created_at: empty.created_at };
     remember?.(response);
-    for (const [index, item] of output.entries()) if (item !== skip) for (const event of itemEvents(item, index)) send(event);
+    for (let index = streamed.length; index < output.length; index++) for (const event of itemEvents(output[index]!, index)) send(event);
     send({ type: response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
     return response;
   } finally {
@@ -107,7 +158,7 @@ export async function pendingResponse(request: ResponsesBody,
 }
 
 export function pendingStream(request: ResponsesBody,
-  generate: (signal: AbortSignal, sink: TextSink) => Promise<ResponseObject>, signal: AbortSignal,
+  generate: (signal: AbortSignal, sink: OutputSink) => Promise<ResponseObject>, signal: AbortSignal,
   failure: (error: unknown) => Event, remember?: (response: ResponseObject) => void,
   heartbeatMs = 10_000): Response {
   const controller = new AbortController();

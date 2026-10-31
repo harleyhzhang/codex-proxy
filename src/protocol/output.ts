@@ -137,7 +137,7 @@ export function* itemEvents(item: OutputItem, output_index: number): Generator<S
 }
 
 /** Replays a finished response as the event sequence a streaming upstream would have sent. */
-export function* responseEvents(response: ResponseObject): Generator<StreamEvent> {
+function* responseEvents(response: ResponseObject): Generator<StreamEvent> {
   let sequence = 0;
   const numbered = (event: StreamEvent): StreamEvent => ({ ...event, sequence_number: sequence++ });
 

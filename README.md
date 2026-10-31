@@ -4,16 +4,18 @@ Use Claude, Grok and optional Cursor models inside [OpenAI Codex](https://github
 
 The proxy sits between Codex and `chatgpt.com`. GPT requests pass straight through. Requests for a
 Claude model go to Anthropic's Messages API and Grok requests to xAI's Grok endpoint, each signed in
-with your own subscription's login; no CLI runs per turn. Claude and Grok make real tool calls and their
-text streams into Codex as it is written. Codex keeps running every tool, so approvals, sandboxing and
-history work as usual, and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
+with your own subscription's login; no CLI runs per turn. Claude, Grok and Cursor make real tool calls,
+and their text and each finished tool call stream into Codex as they are written, so Codex starts a
+tool while the model writes the next. Grok's and Cursor models' thinking streams too (Claude's thinking
+text is omitted by Anthropic unless asked for, and asking delayed its first answer text). Codex keeps running every tool, so approvals, sandboxing and
+history work as usual, and you can switch models mid-chat. An optional Cursor login, through Cursor's own SDK, adds Kimi,
 Grok and Claude models from a Cursor subscription without changing the Codex app.
 
 ```
 Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT models)
                            ├──► Anthropic Messages   (claude-*)
                            ├──► xAI Grok endpoint    (grok-*)
-                           └──► Cursor SDK bridge    (cursor-*, optional)
+                           └──► Cursor agent API     (cursor-*, optional, via @cursor/sdk)
 ```
 
 ## Requirements
@@ -205,15 +207,12 @@ the optional second native Codex account and disabled by default.
 
 ## Optional Cursor subscription
 
-Use the official [SDK bridge](https://github.com/cursor/sdk-bridge), pinned to
-**v1.0.37**. Verify the archive against that release's `SHA256SUMS.txt`, unpack it
-outside this repository, and hash `bin/cursor-sdk-bridge`. The proxy itself keeps
-zero runtime package dependencies. The ordinary Cursor CLI remains separate:
-its print mode exposes native tools and is not used for this adapter.
+Cursor turns go through Cursor's own TypeScript SDK (`@cursor/sdk`, pinned in `bun.lock`), run inside
+the router, so each turn calls Cursor's agent API directly with no helper process in between. Install
+dependencies with `bun install`. The ordinary Cursor CLI is not used.
 
 Authenticate with the official [SDK browser login](https://cursor.com/docs/sdk/typescript#cursorauth).
-For this one-time login, install `@cursor/sdk@1.0.37` in a separate setup directory
-and run a script there:
+Run this once from the repository:
 
 ```ts
 import { Cursor, FileCredentialStore } from '@cursor/sdk';
@@ -231,11 +230,9 @@ outside Git. The SDK login is independent of standalone CLI login changes.
 Renew it with the same official flow when it expires.
 
 Set these variables for both the catalog and router, supplying your own account
-pins. `Cursor.me()` / the bridge's `Me` returns the stable user ID:
+pins. `Cursor.me()` returns the stable user ID:
 
 ```sh
-export CURSOR_BRIDGE_BIN=/absolute/path/bin/cursor-sdk-bridge
-export CURSOR_BRIDGE_SHA256="$(shasum -a 256 "$CURSOR_BRIDGE_BIN" | cut -d ' ' -f 1)"
 export CURSOR_AUTH_FILE=/absolute/private/path/cursor-auth.json
 export CURSOR_CWD=/absolute/private/path/empty-requests
 export CURSOR_EXPECTED_EMAIL=account@example.com
@@ -256,44 +253,34 @@ choices. Kimi is text-only with a conservative 200K context cap; Grok supports
 images and 256K, Opus images and 1M, and Muse Wonder images and 300K. Reopen
 Codex after catalog changes.
 
-Each request verifies the pinned executable and authenticated account, uses
-credential-bound account/catalog discovery cached for five minutes, and
-validates the exact model parameters. A bounded pool reuses local bridges;
-each bridge runs one request at a time. Every agent gets its own empty working
-directory, no setting sources and no subagents.
+Each request verifies the authenticated account with credential-bound account/catalog discovery
+cached for five minutes, and validates the exact model parameters. An agent is created ahead of each
+turn (and when a chat opens), so a turn starts by sending; each turn names its model and tools when
+it sends. Every agent has its own working directory, an empty in-memory file tree, no setting
+sources and no subagents; its directory and Cursor's transcript folder for it are deleted when it ends.
 
-Codex's client tools are registered with the agent as SDK custom tools
-(`local.customTools`), and each bridge is pointed at a loopback callback with
-`SetToolCallback`. The model calls them as real tool calls; each call arrives at
-the router as `CallCustomTool` and is held while the router hands it to Codex as
-an ordinary `function_call`/`custom_tool_call`. When Codex's next request carries
-the results, the held callbacks are answered and the same Cursor run continues:
-no new agent, no re-prompt and nothing parsed out of model text. Calls written
-within `CURSOR_TOOL_SETTLE_MS` (350 ms) of each other are returned together as
-one parallel step. The agent's allowed tools are only the `mcp` group and its
-only MCP server is the router's, so it has no shell, edit, read, web or subagent
-tool; any other tool event stops the turn. Function arguments that miss a
-required field or break the schema go back to the model to fix and never reach
-Codex. Tool results keep inline images.
+Codex's client tools are registered as SDK custom tools (`customTools`) whose callbacks run in the
+router. The model calls them as real tool calls; each call is handed to Codex as an ordinary
+`function_call`/`custom_tool_call` the moment the model makes it, so Codex starts running it while
+the model may still be writing the next one, and the callback is held. When Codex's next request
+carries the results, the held callbacks are answered and the same Cursor run continues: no new agent,
+no re-prompt and nothing parsed out of model text. Calls written within `CURSOR_TOOL_SETTLE_MS` (350
+ms) of each other end the turn together as one parallel step. The agent's allowed tools are only the
+`mcp` group and its only tools are Codex's, so it has no shell, edit, read, web or subagent tool; any
+other tool event stops the turn. Function arguments that miss a required field or break the schema
+go back to the model to fix and never reach Codex. Tool results keep inline images. Text and the
+model's thinking stream into Codex as they are written.
 
-A run continues only when its model parameters, instructions, tools, credential
-and complete model-visible history prefix are unchanged and the request answers
-exactly the held calls; anything else (a user message mid-run, a tool search, a
-rotated login) cancels it and replays the history in a fresh agent. A run waiting
-on Codex holds its bridge up to `CURSOR_SESSION_IDLE_MS`; when held runs fill the
-pool, the one waiting longest is cancelled and replays if continued later.
-Unsupported attachments, model substitutions and failed streams are refused.
-Cancellation ends only that request's exclusively leased bridge. A finished turn
-returns at once while its bridge stays leased until `CloseAgent` completes. Idle
-bridges and their stores are removed after two minutes by default. Cursor's SDK
-sandbox helper is unavailable in the tested standalone macOS build; this adapter
-enforces no native actions through the tool list and event guard. Codex's own
-execution sandbox and approvals still apply to returned calls.
-
-The default pool holds at most eight bridges, bounding local process and memory
-pressure during helper fan-out; `CURSOR_MAX_BRIDGES` tunes that bound.
-Content-free `cursor-turn` counters record setup time, continuation and call
-counts.
+A run continues only when its model parameters, instructions, tools, credential and complete
+model-visible history prefix are unchanged and the request answers exactly the held calls; anything
+else (a user message mid-run, a tool search, a rotated login) cancels it and replays the history in a
+fresh agent. A run waiting on Codex is held up to `CURSOR_SESSION_IDLE_MS`; past
+`CURSOR_MAX_HELD_RUNS` (16) waiting runs, the one waiting longest is cancelled and replays if
+continued later. Cursor summarizing its own context is reported as a context overflow so Codex
+compacts instead. Unsupported attachments, model substitutions and failed runs are refused with
+Cursor's own reason; a network failure is an outage like any other. Codex's own execution sandbox
+and approvals still apply to returned calls. Content-free `cursor-turn` counters record setup time,
+continuation and call counts.
 
 To enable **secondary Opus only → Cursor Opus** on a typed Claude quota refusal:
 
@@ -342,11 +329,9 @@ Everything has a default; set only what you need.
 | `CLAUDE_ACCOUNT_MODELS` | both supported Claude models | Optional second-account model subset |
 | `CLAUDE_ACCOUNT_EXPECTED_EMAIL`, `CLAUDE_ACCOUNT_EXPECTED_ORG` | unset | Optional second Claude identity pins |
 | `CLAUDE_TIMEOUT_MS` | `300000` | Claude stream idle timeout, not a total reasoning deadline |
-| `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
-| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges |
-| `CURSOR_WARM_BRIDGES` | `1` | Idle bridges per login kept for `CURSOR_WARM_BRIDGE_IDLE_MS` instead; a chat-open warmup also starts one |
-| `CURSOR_WARM_BRIDGE_IDLE_MS` | `900000` | Idle lifetime of those warm bridges |
-| `CURSOR_SESSION_IDLE_MS` | `900000` | How long a run waiting on Codex tool results holds its bridge |
+| `CURSOR_SPARE_AGENTS` | `1` | Agents kept ready per login for the next turn; `0` creates each at its turn |
+| `CURSOR_MAX_HELD_RUNS` | `16` | Runs kept waiting on Codex tool results before the oldest is replayed instead |
+| `CURSOR_SESSION_IDLE_MS` | `900000` | How long a run waiting on Codex tool results is kept |
 | `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
 | `GROK_HOME` | `~/.grok` | Grok Build profile holding the login the router uses and refreshes (use a dedicated one) |
 | `GROK_TIMEOUT_MS` | `300000` | Grok stream idle timeout, not a total reasoning deadline |
@@ -361,7 +346,8 @@ string field `input`, and namespaced tools are flattened and mapped back. Histor
 structure; every tool call is paired with its result as Anthropic requires. Claude's thinking
 is kept in memory and put back before its own calls on the next turn. Prompt caching marks the
 tools, the system prompt and the newest turn, so each turn reads what the previous one wrote.
-Quota comes from Anthropic's rate-limit headers on every reply.
+Quota comes from Anthropic's rate-limit headers on every reply. A compaction keeps the tools and system prompt
+(with calls forbidden), so it reads the whole conversation from the cache too.
 
 The router owns the login while it runs: it refreshes the access token shortly before expiry
 (one refresh shared by concurrent turns) and writes the rotated tokens back where Claude Code
@@ -400,9 +386,9 @@ Create `~/Library/LaunchAgents/codex-subscription-proxy.plist` with `ProgramArgu
 `bun /path/to/codex-subscription-proxy/src/main.ts`, `RunAtLoad` and `KeepAlive` set to true, then
 `launchctl load` it. The process exits on unexpected errors so launchd restarts it cleanly.
 
-Set `ProcessType` to `Interactive`. Codex waits on every request the router serves, and the Cursor
-bridges it starts inherit its class: under `Background` (CPU and I/O throttled to priority 4) the
-router's share of a cold turn measured 1.0 s median and 3.0 s p90, against 0.29 s and 0.35 s.
+Set `ProcessType` to `Interactive`. Codex waits on every request the router serves: under
+`Background` (CPU and I/O throttled to priority 4) the router's share of a cold turn measured 1.0 s
+median and 3.0 s p90, against 0.29 s and 0.35 s.
 A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k` keeps the loaded one.
 
 ## Security
@@ -428,7 +414,7 @@ See [AGENTS.md](AGENTS.md) for the layout.
 ## Disclaimer
 
 Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It calls Anthropic's and xAI's
-endpoints as their official clients do, and the optional official Cursor SDK bridge, with your own accounts; you are
+endpoints as their official clients do, and Cursor's through its official SDK, with your own accounts; you are
 responsible for following each provider's terms.
 
 ## License

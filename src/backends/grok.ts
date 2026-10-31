@@ -10,7 +10,7 @@ import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup } from '../protocol/native-tools';
 import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
 import { sseEvents } from '../protocol/stream';
-import type { ProxyOutput, ResponsesRequest, StreamEvent, TextSink, ToolCall } from '../protocol/types';
+import type { ProxyOutput, ResponsesRequest, StreamEvent, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
@@ -22,7 +22,7 @@ const REFRESH_LEAD_MS = 5 * 60_000;
 /** Native Codex retries a 5xx four times with a doubling 200 ms backoff. */
 const SERVER_RETRIES = 4;
 
-export type GrokOptions = {
+type GrokOptions = {
   /** The Grok Build home holding auth.json. */
   home: string;
   baseUrl?: string;
@@ -31,7 +31,7 @@ export type GrokOptions = {
   versionUrl?: string;
 };
 
-export class GrokError extends BackendError {
+class GrokError extends BackendError {
   constructor(message: string, retryable = false) {
     super(message, { retryable });
     this.name = 'GrokError';
@@ -139,7 +139,7 @@ function parts(value: unknown, textType: 'input_text' | 'output_text', legacy = 
 }
 
 /** Codex's history as xAI input items. Calls use the flattened tool names the request declares. */
-export function grokInput(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ReasoningReplay): unknown[] {
+function grokInput(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ReasoningReplay): unknown[] {
   if (typeof request.input === 'string') return [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: request.input }] }];
   const input: unknown[] = [];
   for (const item of request.input) {
@@ -174,7 +174,7 @@ function toolChoice(choice: unknown, keyFor: (name: string) => string): unknown 
 
 type Prepared = { body: JsonRecord; byKey: Map<string, ToolDescriptor> };
 
-export function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepared {
+function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepared {
   const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
   const keyFor = keyLookup(byKey);
   const tools = Object.entries(definitions).map(([name, tool]) => ({ type: 'function', name, description: tool.description, parameters: tool.inputSchema }));
@@ -186,7 +186,8 @@ export function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay)
       instructions: request.instructions,
       input: grokInput(request, keyFor, replay),
       ...(tools.length ? { tools, tool_choice: toolChoice(request.tool_choice, keyFor), parallel_tool_calls: true } : {}),
-      reasoning: { effort: request.reasoning?.effort ?? 'high' },
+      // `summary` makes xAI stream a readable summary of Grok's thinking, which Codex shows as it thinks.
+      reasoning: { effort: request.reasoning?.effort ?? 'high', summary: 'auto' },
       max_output_tokens: request.max_output_tokens,
       // Codex's per-thread key; xAI caches the shared prefix under it.
       prompt_cache_key: typeof extra.prompt_cache_key === 'string' ? extra.prompt_cache_key : undefined,
@@ -197,7 +198,7 @@ export function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay)
 }
 
 /** xAI's reply as Codex output: text, and calls named and shaped as the Codex tools they stand for. */
-export function grokOutput(output: unknown[], byKey: Map<string, ToolDescriptor>): { text: string; toolCalls: ToolCall[]; reasoning: unknown[] } {
+function grokOutput(output: unknown[], byKey: Map<string, ToolDescriptor>): { text: string; toolCalls: ToolCall[]; reasoning: unknown[] } {
   let text = '';
   const toolCalls: ToolCall[] = [];
   const reasoning: unknown[] = [];
@@ -269,7 +270,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
     }
   }
 
-  async function run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
+  async function run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
     signal?.throwIfAborted();
     if (request.model !== MODEL) throw new GrokError('Unsupported Grok model');
     if (!(EFFORTS as readonly string[]).includes(request.reasoning?.effort ?? 'high')) throw new GrokError('Unsupported Grok reasoning effort');
@@ -290,6 +291,12 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
       await sseEvents(watched, event => {
         firstEventMs ||= performance.now() - started;
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') sink?.text(event.delta);
+        if (event.type === 'response.reasoning_summary_text.delta' && typeof event.delta === 'string') sink?.reasoning?.(event.delta);
+        // A finished call goes to Codex now, so it starts running while Grok writes the next one.
+        if (event.type === 'response.output_item.done' && isRecord(event.item) && event.item.type === 'function_call') {
+          const call = grokOutput([event.item], byKey).toolCalls[0];
+          if (call) sink?.call?.(call);
+        }
         if ((event.type === 'response.completed' || event.type === 'response.incomplete') && isRecord(event.response)) completed = event.response;
         if (event.type === 'response.failed' || event.type === 'error') failed = event;
       });

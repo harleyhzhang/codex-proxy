@@ -63,11 +63,21 @@ export function normalizeToolSearchIds(body: ResponsesBody): ResponsesBody {
 }
 
 /**
+ * Claude's and Grok's thinking reaches Codex as reasoning items with a readable summary and no
+ * OpenAI ciphertext. OpenAI looks such an item up by id and refuses the request, so GPT never gets them.
+ */
+export function dropForeignReasoning(body: ResponsesBody): ResponsesBody {
+  if (!Array.isArray(body.input)) return body;
+  const input = body.input.filter(item => item?.type !== 'reasoning' || isOpenAICiphertext(item.encrypted_content));
+  return input.length === body.input.length ? body : { ...body, input };
+}
+
+/**
  * Accepts `{"message": string}`, optionally inside a code fence. A short message that only says
  * the payload could not be recovered is a refusal, never a task; long genuine messages may
  * mention such words.
  */
-export function extractAgentMessage(raw: string): string | { reason: string } {
+function extractAgentMessage(raw: string): string | { reason: string } {
   const body = raw
     .trim()
     .replace(/^```(?:json)?\s*/i, '')

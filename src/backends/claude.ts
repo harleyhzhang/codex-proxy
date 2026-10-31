@@ -10,7 +10,7 @@ import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools } from '../protocol/native-tools';
 import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
 import { sseEvents } from '../protocol/stream';
-import type { ProxyOutput, ResponsesRequest, TextSink, ToolCall } from '../protocol/types';
+import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
 import { claudeLimits, ClaudeUsageLimitError, ClaudeUsageLimits, rateLimitInfo } from './claude-limits';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
@@ -27,7 +27,7 @@ const REFRESH_LEAD_MS = 5 * 60_000;
 const SERVER_RETRIES = 4;
 const MAX_OUTPUT_TOKENS = 128_000;
 
-export class ClaudeError extends BackendError {
+class ClaudeError extends BackendError {
   constructor(message: string, retryable = false) {
     super(message, { retryable });
     this.name = 'ClaudeError';
@@ -209,7 +209,7 @@ function toolChoice(choice: unknown, keyFor: (name: string) => string): JsonReco
 
 const cached = (block: JsonRecord | undefined) => { if (block && block.type !== 'thinking' && block.type !== 'redacted_thinking') block.cache_control = { type: 'ephemeral' }; };
 
-export function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay): { body: JsonRecord; byKey: Map<string, ToolDescriptor> } {
+function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay): { body: JsonRecord; byKey: Map<string, ToolDescriptor> } {
   const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
   const keyFor = keyLookup(byKey);
   const tools: JsonRecord[] = Object.entries(definitions).map(([name, tool]) => ({ name, description: tool.description, input_schema: tool.inputSchema }));
@@ -231,7 +231,8 @@ export function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay
       messages,
       ...(tools.length ? { tools } : {}),
       ...(choice ? { tool_choice: choice } : {}),
-      // Anthropic refuses thinking when the tool choice forces a call.
+      // Anthropic refuses thinking when the tool choice forces a call. Its thinking text stays omitted (the
+      // default): asking for a summary delayed the first answer text by about 0.8 s and arrived with it.
       ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive' } }),
       output_config: { effort: resolveEffort(request) },
     },
@@ -254,6 +255,8 @@ export class ClaudeAccount {
   readonly options: Readonly<ClaudeAccountOptions>;
   private readonly store: LoginStore;
   private readonly replay = new ThinkingReplay();
+  /** The login as last read or refreshed; re-read only when it is expiring or refused (16 ms per keychain read). */
+  private cached?: { all: JsonRecord; oauth: JsonRecord };
   private refreshing?: Promise<string>;
   private verified?: { token: string; check: Promise<void> };
 
@@ -274,22 +277,27 @@ export class ClaudeAccount {
     };
   }
 
-  private async login(): Promise<{ all: JsonRecord; oauth: JsonRecord }> {
+  private async login(fresh = false): Promise<{ all: JsonRecord; oauth: JsonRecord }> {
+    if (this.cached && !fresh) return this.cached;
     const all = await this.store.read();
     const oauth = all && isRecord(all.claudeAiOauth) ? all.claudeAiOauth : undefined;
     if (!all || !oauth || typeof oauth.accessToken !== 'string' || typeof oauth.refreshToken !== 'string') throw signedOut(this.options.configDir);
-    return { all, oauth };
+    this.cached = { all, oauth };
+    return this.cached;
   }
 
   /**
    * A token valid for at least the refresh lead. Refreshing rotates the refresh token, so this router is
    * the only thing that refreshes the profile's login: concurrent turns share one refresh, written back
-   * where Claude Code keeps it. `stale` forces a refresh unless the stored token was already replaced.
+   * where Claude Code keeps it. `stale` forces a refresh unless the stored token was already replaced
+   * (a new sign-in), which is why an expiring or refused token re-reads the store first.
    */
   private async token(signal?: AbortSignal, stale?: string): Promise<string> {
-    const { oauth } = await this.login();
+    const usable = (oauth: JsonRecord) => oauth.accessToken !== stale && typeof oauth.expiresAt === 'number' && oauth.expiresAt - Date.now() > REFRESH_LEAD_MS;
+    let { oauth } = await this.login();
+    if (!usable(oauth)) ({ oauth } = await this.login(true));
     const token = oauth.accessToken as string;
-    if (token !== stale && typeof oauth.expiresAt === 'number' && oauth.expiresAt - Date.now() > REFRESH_LEAD_MS) return token;
+    if (usable(oauth)) return token;
     // Shared and not tied to one turn's signal: a cancelled turn must not abandon a rotation mid-flight.
     this.refreshing ??= this.refresh().finally(() => { this.refreshing = undefined; });
     return abortable(this.refreshing, signal);
@@ -297,7 +305,7 @@ export class ClaudeAccount {
 
   private async refresh(): Promise<string> {
     const started = performance.now();
-    const { all, oauth } = await this.login();
+    const { all, oauth } = await this.login(true);
     const response = await fetch(this.options.tokenUrl ?? 'https://platform.claude.com/v1/oauth/token', {
       method: 'POST', signal: AbortSignal.timeout(30_000), headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: JSON.stringify({ grant_type: 'refresh_token', refresh_token: oauth.refreshToken, client_id: CLIENT_ID }),
@@ -377,11 +385,11 @@ export class ClaudeAccount {
     }
   }
 
-  run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
+  run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
     return retryOnce('Claude', signal, () => this.once(request, signal, sink), sink);
   }
 
-  private async once(request: ResponsesRequest, signal: AbortSignal | undefined, sink: TextSink | undefined): Promise<ProxyOutput> {
+  private async once(request: ResponsesRequest, signal: AbortSignal | undefined, sink: OutputSink | undefined): Promise<ProxyOutput> {
     signal?.throwIfAborted();
     this.limits.assertAvailable(request.model);
     const started = performance.now();
@@ -411,8 +419,17 @@ export class ClaudeAccount {
             block.text = String(block.text ?? '') + delta.text;
             sink?.text(delta.text);
           } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') block.partial += delta.partial_json;
-          else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') block.thinking = String(block.thinking ?? '') + delta.thinking;
-          else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') block.signature = delta.signature;
+          else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+            block.thinking = String(block.thinking ?? '') + delta.thinking;
+            sink?.reasoning?.(delta.thinking);
+          } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') block.signature = delta.signature;
+        } else if (event.type === 'content_block_stop' && block) {
+          block.done = true;
+          // A finished call goes to Codex now, so it starts running while Claude writes the next one.
+          if (block.type === 'tool_use' && typeof block.name === 'string') {
+            block.call = codexToolCall(byKey, block.name, String(block.partial || '{}'), typeof block.id === 'string' ? block.id : undefined);
+            sink?.call?.(block.call as ToolCall);
+          }
         } else if (event.type === 'message_delta') {
           if (isRecord(event.delta) && typeof event.delta.stop_reason === 'string') stop = event.delta.stop_reason;
           if (isRecord(event.usage)) Object.assign(usage, event.usage);
@@ -439,8 +456,8 @@ export class ClaudeAccount {
       else if (block.type === 'redacted_thinking') thinking.push({ type: 'redacted_thinking', data: block.data });
       else if (block.type === 'tool_use' && typeof block.name === 'string') {
         // A call cut off by the output limit is not runnable.
-        if (stop === 'max_tokens') throw new ClaudeError('Claude reached its output limit in the middle of a tool call; nothing was executed', true);
-        toolCalls.push(codexToolCall(byKey, block.name, String(block.partial || '{}'), typeof block.id === 'string' ? block.id : undefined));
+        if (!block.done) throw new ClaudeError('Claude reached its output limit in the middle of a tool call; that call was not run', true);
+        toolCalls.push(block.call as ToolCall);
       }
     }
     if (thinking.length && toolCalls[0]?.callId) this.replay.remember(toolCalls[0].callId, thinking);

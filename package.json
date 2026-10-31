@@ -5,9 +5,13 @@
   "license": "MIT",
   "private": true,
   "type": "module",
-  "bin": { "codex-subscription-proxy": "src/main.ts" },
+  "bin": {
+    "codex-subscription-proxy": "src/main.ts"
+  },
   "exports": "./src/index.ts",
-  "engines": { "bun": ">=1.2" },
+  "engines": {
+    "bun": ">=1.2"
+  },
   "scripts": {
     "start": "bun src/main.ts",
     "catalog": "bun src/catalog.ts",
@@ -16,5 +20,11 @@
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun test"
   },
-  "devDependencies": { "@types/bun": "^1.2.0", "typescript": "^5.9.2" }
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "typescript": "^5.9.2"
+  },
+  "dependencies": {
+    "@cursor/sdk": "1.2.0"
+  }
 }

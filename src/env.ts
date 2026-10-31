@@ -17,10 +17,3 @@ export function positiveInt(name: string, fallback: number, env: Env = process.e
 export function nonNegativeInt(name: string, fallback: number, env: Env = process.env): number {
   return integer(name, fallback, 0, env);
 }
-
-/** This process's environment for a child CLI, minus the variables `excluded` rejects. */
-export function childEnvironment(excluded: (key: string) => boolean): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) if (value !== undefined && !excluded(key)) env[key] = value;
-  return env;
-}

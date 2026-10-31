@@ -1,14 +1,15 @@
 // Claude over Anthropic's Messages API against a scripted Anthropic: the request and history mapping,
 // the login refresh and identity pin it owns, streaming, and every refusal Codex can receive.
 import { afterAll, beforeEach, expect, test } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 import { ClaudeAccount, claudeBackend, claudeMessages, resolveModel } from '../src/backends/claude';
 import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { type BackendError, estimateVisibleTokens } from '../src/backends/contract';
 import type { JsonRecord } from '../src/json';
 import type { ResponsesRequest } from '../src/protocol/types';
+import { compactRequest } from '../src/router/capsule';
 import { ProxyTransportError } from '../src/transport';
-import { anthropicFixture, anthropicStream, limitHeaders, say } from './anthropic-fixture';
+import { anthropicFixture, anthropicStream, limitHeaders } from './anthropic-fixture';
 
 const anthropic = anthropicFixture();
 const defaults = { profile: anthropic.state.profile, refresh: anthropic.state.refresh, reply: anthropic.state.reply };
@@ -130,13 +131,44 @@ test('Claude thinking returns in front of its own calls on the next turn', async
   expect(assistant[0]).toEqual({ type: 'thinking', thinking: 'plan the listing', signature: 'sig-1' });
 });
 
-test('text reaches the sink as Claude writes it', async () => {
-  const deltas: string[] = [];
-  const sink = { started: false, text(delta: string) { deltas.push(delta); this.started = true; } };
-  anthropic.state.replies.push(() => say('streamed answer'));
-  const output = await account().account.run(hello(), undefined, sink);
-  expect(deltas).toEqual(['str', 'eamed answer']);
+test('thinking, text and each finished call reach the sink as Claude writes them', async () => {
+  const seen: string[] = [];
+  const sink = {
+    started: false,
+    text(delta: string) { seen.push(`text:${delta}`); this.started = true; },
+    reasoning(delta: string) { seen.push(`thinking:${delta}`); },
+    call(call: { name: string; callId?: string }) { seen.push(`call:${call.name}:${call.callId}`); this.started = true; },
+  };
+  anthropic.state.replies.push(() => anthropicStream([
+    { type: 'thinking', thinking: 'list first', signature: 'sig' },
+    { type: 'text', text: 'streamed answer' },
+    { type: 'tool_use', id: 'toolu_a', name: 'exec_command', input: { cmd: 'ls' } },
+    { type: 'tool_use', id: 'toolu_b', name: 'mcp__docs_search', input: { q: 'x' } },
+  ], 'tool_use'));
+  const output = await account().account.run(hello({ tools: TOOLS }), undefined, sink);
+  expect(seen).toEqual(['thinking:list first', 'text:str', 'text:eamed answer', 'call:exec_command:toolu_a', 'call:mcp__docs.search:toolu_b']);
   expect(output.text).toBe('streamed answer');
+  expect(output.toolCalls.map(call => call.callId)).toEqual(['toolu_a', 'toolu_b']);
+});
+
+test('a compaction keeps the tools, system prompt and history prefix of the turns before it, so it reads them from cache', async () => {
+  const { account: claude } = account();
+  const turn = hello({ tools: TOOLS, instructions: 'Be brief.', input: [
+    { role: 'user', content: 'list files' },
+    { type: 'function_call', call_id: 'c1', name: 'exec_command', arguments: '{"cmd":"ls"}' },
+    { type: 'function_call_output', call_id: 'c1', output: 'a.txt' },
+  ] });
+  await claude.run(turn);
+  await claude.run(compactRequest(turn) as ResponsesRequest);
+  const uncached = (value: unknown) => JSON.parse(JSON.stringify(value, (key, item) => key === 'cache_control' ? undefined : item));
+  const [normal, compaction] = [sent(0), sent(1)];
+  expect(uncached(compaction.tools)).toEqual(uncached(normal.tools));
+  expect(uncached(compaction.system)).toEqual(uncached(normal.system));
+  const before = uncached(normal.messages) as JsonRecord[];
+  const after = uncached(compaction.messages) as JsonRecord[];
+  expect(after.slice(0, -1)).toEqual(before.slice(0, -1));
+  expect((after.at(-1)!.content as JsonRecord[]).slice(0, (before.at(-1)!.content as JsonRecord[]).length)).toEqual(before.at(-1)!.content as JsonRecord[]);
+  expect(compaction).toMatchObject({ tool_choice: { type: 'none' }, thinking: normal.thinking });
 });
 
 test('an expiring login is refreshed once for concurrent turns and the rotated login is written back', async () => {
@@ -231,6 +263,25 @@ test('a stream that fails before text gets one fresh attempt, never after text; 
   anthropic.state.replies.push(() => events({ type: 'message_start', message: { usage: {} } }));
   await expect(claude.run(hello())).rejects.toBeInstanceOf(ProxyTransportError);
 
-  for (let index = 0; index < 2; index++) anthropic.state.replies.push(() => anthropicStream([{ type: 'tool_use', id: 'toolu_x', name: 'exec_command', input: { cmd: 'rm' } }], 'max_tokens'));
+  // The output limit cut the call off: its block never closed.
+  const cutCall = () => events(
+    { type: 'message_start', message: { usage: {} } }, { type: 'content_block_start', index: 0, content_block: { type: 'tool_use', id: 'toolu_x', name: 'exec_command', input: {} } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"cmd":"rm -' } },
+    { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 1 } }, { type: 'message_stop' },
+  );
+  anthropic.state.replies.push(cutCall, cutCall);
   await expect(claude.run(hello({ tools: TOOLS }))).rejects.toThrow('output limit in the middle of a tool call');
+});
+
+test('the login is read once and kept; a refused token re-reads the store and uses a new sign-in without refreshing', async () => {
+  const { file, account: claude } = account();
+  await claude.run(hello());
+  const signIn = (token: string) => writeFileSync(file, JSON.stringify({ claudeAiOauth: { accessToken: token, refreshToken: 'refresh-new', expiresAt: Date.now() + 3_600_000 } }));
+  signIn('access-new');
+  await claude.run(hello());
+  expect(anthropic.messages().map(entry => entry.headers.authorization)).toEqual(['Bearer access-0', 'Bearer access-0']);
+  anthropic.state.replies.push(() => Response.json({ type: 'error', error: { type: 'authentication_error', message: 'expired' } }, { status: 401 }));
+  await claude.run(hello());
+  expect(anthropic.messages().map(entry => entry.headers.authorization).slice(2)).toEqual(['Bearer access-0', 'Bearer access-new']);
+  expect(anthropic.state.refreshes).toBe(0);
 });

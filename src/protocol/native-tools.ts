@@ -7,7 +7,7 @@ import type { ResponseInputItem, ToolCall } from './types';
 
 export type FunctionTool = { description: string; inputSchema: JsonRecord };
 
-export const RAW_INPUT_NOTE = 'Pass the complete raw input as the string field "input".';
+const RAW_INPUT_NOTE = 'Pass the complete raw input as the string field "input".';
 
 /** Each tool under a unique identifier-safe key; `byKey` maps a call back to its Codex tool. */
 export function functionTools(descriptors: ToolDescriptor[]): { definitions: Record<string, FunctionTool>; byKey: Map<string, ToolDescriptor> } {
@@ -48,7 +48,7 @@ function inputSchema(descriptor: ToolDescriptor): JsonRecord {
 }
 
 /** A raw-input tool's string: `input`, or the single string field a model used instead. */
-export function rawInput(args: JsonRecord): string | undefined {
+function rawInput(args: JsonRecord): string | undefined {
   if (typeof args.input === 'string') return args.input;
   const strings = Object.values(args).filter((value): value is string => typeof value === 'string');
   return Object.keys(args).length === 1 && strings.length === 1 ? strings[0] : undefined;

@@ -205,3 +205,19 @@ test('xAI text deltas stream through the sink, and a stream failure after text i
   await expect(grok.run(hello(), undefined, sink)).rejects.toThrow('sampler crashed');
   expect(responses()).toHaveLength(1);
 });
+
+test('Grok asks for a reasoning summary; it streams as thinking and each finished call reaches the sink at once', async () => {
+  const grok = backend(login(3_600_000));
+  const seen: string[] = [];
+  const sink = { started: false, text(delta: string) { seen.push(`text:${delta}`); }, reasoning(delta: string) { seen.push(`thinking:${delta}`); }, call(call: { name: string; arguments: string; callId?: string }) { seen.push(`call:${call.name}:${call.arguments}:${call.callId}`); } };
+  const call = { type: 'function_call', call_id: 'call_g1', name: 'apply_patch', arguments: JSON.stringify({ input: '*** Begin Patch' }) };
+  replies.push(() => sse(
+    { type: 'response.reasoning_summary_text.delta', delta: 'Checking.' },
+    { type: 'response.output_item.done', item: call },
+    { type: 'response.completed', response: { status: 'completed', output: [call], usage: {} } },
+  ));
+  const output = await grok.run(hello({ tools: TOOLS }), undefined, sink);
+  expect(responses()[0]!.body.reasoning).toEqual({ effort: 'high', summary: 'auto' });
+  expect(seen).toEqual(['thinking:Checking.', 'call:apply_patch:*** Begin Patch:call_g1']);
+  expect(output.toolCalls).toEqual([{ name: 'apply_patch', arguments: '*** Begin Patch', callId: 'call_g1' }]);
+});

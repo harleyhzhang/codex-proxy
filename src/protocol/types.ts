@@ -69,11 +69,18 @@ type Usage = { inputTokens: number; outputTokens: number; totalTokens: number };
 export type ProxyOutput = { text: string; toolCalls: ToolCall[]; usage: Usage };
 
 /**
- * Where a backend streams the assistant text of the turn it is running, as it arrives. `started` turns
- * true with the first delta: from then on the text has reached Codex, so the turn must not be retried
- * or replayed (the same text would appear twice). The final output's text must begin with what was streamed.
+ * Where a backend streams the turn it is running into Codex as it is written: assistant text, its
+ * thinking (shown as a reasoning summary), and each tool call once complete, which Codex starts running
+ * at once. `started` turns true with the first text or call: from then on the turn has reached Codex, so
+ * it must not be retried or replayed. Thinking alone does not count. The final output's text must
+ * begin with the text streamed, and its calls must include every call streamed (matched by call id).
  */
-export type TextSink = { text(delta: string): void; readonly started: boolean };
+export type OutputSink = {
+  text(delta: string): void;
+  reasoning?(delta: string): void;
+  call?(call: ToolCall): void;
+  readonly started: boolean;
+};
 
 export type OutputItem = { type: string; id?: string; [key: string]: unknown };
 

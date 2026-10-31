@@ -134,11 +134,15 @@ export function restorePortableSummary(text: string): ResponseInputItem[] {
   ];
 }
 
-/** Asks the current model for a continuation summary instead of running the conversation. */
+/**
+ * Asks the current model for a continuation summary instead of running the conversation. The tools stay
+ * declared, with calls forbidden, so the request keeps the prefix the conversation's turns already put in
+ * the provider's prompt cache; dropping them made every compaction re-read the whole history uncached.
+ */
 export function compactRequest(body: ResponsesBody): ResponsesBody {
   const input = (Array.isArray(body.input) ? body.input : []).filter((item) => item.type !== 'compaction_trigger');
   const { previous_response_id: _previous, context_management: _context, ...rest } = body;
-  return { ...rest, input: [...input, developerText(COMPACT_INSTRUCTION)], tools: [], tool_choice: 'auto', stream: true };
+  return { ...rest, input: [...input, developerText(COMPACT_INSTRUCTION)], tool_choice: 'none', stream: true };
 }
 
 /** Decrypts an OpenAI-encrypted compaction through GPT; see CompactionBridge. */

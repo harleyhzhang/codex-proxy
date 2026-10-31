@@ -1,6 +1,6 @@
-// Subscription text streams to Codex as it is generated, on SSE and WebSocket, as one message item that
-// matches the final output; tool calls follow once the turn is validated. Text that reached Codex is
-// never retried or replayed.
+// Subscription turns stream to Codex as they are written, on SSE and WebSocket: thinking as a reasoning
+// item, text as message items that match the final output, and each finished tool call at once. Output
+// that reached Codex is never retried or replayed.
 import { expect, test } from 'bun:test';
 import type { SubscriptionBackend } from '../src/backends/contract';
 import { backendFor } from '../src/backends/registry';
@@ -127,5 +127,78 @@ test('a connection dropped after text reached Codex fails the turn instead of re
       expect(last.response.error.code).toBe('server_error');
       expect(calls).toBe(1);
     });
+  } finally { await app.close(); }
+});
+
+test('thinking streams as a reasoning item and a finished call reaches Codex before the turn ends, exactly once', async () => {
+  const app = await fixtureRouter();
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  try {
+    await withRun(async (_request, _signal, sink) => {
+      sink?.reasoning?.('Plan: ');
+      sink?.reasoning?.('echo first.');
+      sink?.text('Running it.');
+      sink?.call?.({ name: 'echo', arguments: '{"a":1}', callId: 'call_early' });
+      await gate;
+      return { text: 'Running it. Done.', toolCalls: [{ name: 'echo', arguments: '{"a":1}', callId: 'call_early' }, { name: 'echo', arguments: '{"b":2}', callId: 'call_late' }], usage };
+    }, async () => {
+      const client = socket(app);
+      await client.open;
+      client.ws.send(JSON.stringify({ type: 'response.create', ...body() }));
+      await client.until(() => client.events.some(event => event.type === 'response.output_item.done' && event.item.call_id === 'call_early'));
+      expect(client.events.some(event => event.type === 'response.completed')).toBe(false);
+      release();
+      await client.until(() => client.events.some(event => event.type === 'response.completed'));
+      const events = client.events.filter(event => event.type !== 'response.in_progress');
+      expect(events.filter(event => event.type === 'response.reasoning_summary_text.delta').map(event => event.delta)).toEqual(['Plan: ', 'echo first.']);
+      const done = events.filter(event => event.type === 'response.output_item.done').map(event => [event.output_index, event.item.type, event.item.call_id ?? event.item.summary?.[0]?.text ?? event.item.content?.[0]?.text]);
+      expect(done).toEqual([[0, 'reasoning', 'Plan: echo first.'], [1, 'message', 'Running it.'], [2, 'function_call', 'call_early'], [3, 'message', ' Done.'], [4, 'function_call', 'call_late']]);
+      const output = events.at(-1).response.output;
+      expect(output.map((item: any) => item.call_id ?? item.type)).toEqual(['reasoning', 'message', 'call_early', 'message', 'call_late']);
+      client.ws.close();
+    });
+  } finally { await app.close(); }
+});
+
+test('thinking alone does not stop a fresh attempt; streamed calls do', async () => {
+  const app = await fixtureRouter();
+  let calls = 0;
+  try {
+    await withRun(async (_request, _signal, sink) => {
+      calls++;
+      sink?.reasoning?.('thinking');
+      if (calls === 1) throw new ProxyTransportError();
+      return { text: 'ok', toolCalls: [], usage };
+    }, async () => {
+      const text = await (await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(body()) })).text();
+      expect(JSON.parse(text.split('\n').filter(line => line.startsWith('data: {')).at(-1)!.slice(6)).type).toBe('response.completed');
+      expect(calls).toBe(2);
+    });
+    calls = 0;
+    await withRun(async (_request, _signal, sink) => { calls++; sink?.call?.({ name: 'echo', arguments: '{}', callId: 'call_x' }); throw new ProxyTransportError(); }, async () => {
+      const text = await (await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(body()) })).text();
+      expect(JSON.parse(text.split('\n').filter(line => line.startsWith('data: {')).at(-1)!.slice(6)).type).toBe('response.failed');
+      expect(calls).toBe(1);
+    });
+  } finally { await app.close(); }
+});
+
+test('a chat switched to GPT keeps OpenAI reasoning but never sends another model\'s thinking to OpenAI', async () => {
+  const observed: any[] = [];
+  const app = await fixtureRouter({ upstreamFetch: async (_url, init) => {
+    observed.push(JSON.parse(String(init?.body)));
+    const response = { id: 'r1', status: 'completed', output: [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'ok' }] }] };
+    return new Response(`data: ${JSON.stringify({ type: 'response.completed', response })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  } });
+  try {
+    const input = [
+      { role: 'user', content: 'hi' },
+      { type: 'reasoning', id: 'rs_claude', summary: [{ type: 'summary_text', text: 'Claude thinking' }] },
+      { type: 'reasoning', id: 'rs_gpt', summary: [], encrypted_content: 'gAAAA-openai' },
+      { role: 'user', content: 'continue' },
+    ];
+    await (await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify({ model: 'gpt-6.1-sol', stream: true, input }) })).text();
+    expect(observed[0].input.filter((item: any) => item.type === 'reasoning').map((item: any) => item.id)).toEqual(['rs_gpt']);
   } finally { await app.close(); }
 });

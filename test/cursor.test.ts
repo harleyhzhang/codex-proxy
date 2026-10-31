@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { connectFrames, cursorEnvironment, cursorSelection, finishedRun, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
+import { cursorFailure, cursorSelection, finishedRun, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
+import { ProxyTransportError } from '../src/transport';
 
 test('Cursor sanitizer drops encrypted reasoning and compaction items, keeps inline images and replaces other media instead of refusing the turn',()=>{
  type R=Record<string,unknown>;
@@ -17,7 +18,7 @@ test('Cursor sanitizer drops encrypted reasoning and compaction items, keeps inl
  const items=result.input as R[];
  expect(items.map(i=>i.type)).toEqual(['message','message','function_call_output','message']);
  expect((items[0]!.content as R[])[1]).toEqual({type:'input_image',image_url:'data:image/png;base64,AAAA'});
- expect((items[0]!.content as R[])[2]).toEqual({type:'input_text',text:'[attachment omitted: the Cursor bridge accepts text and inline images only]'});
+ expect((items[0]!.content as R[])[2]).toEqual({type:'input_text',text:'[attachment omitted: Cursor accepts text and inline images only]'});
  expect((items[2]!.output as R[])[1]).toEqual({type:'input_text',text:'done'});
  expect(JSON.stringify(result.input)).not.toContain('gAAAA');
  expect(history[1]!.encrypted_content).toBe('gAAAAopaque');
@@ -66,41 +67,27 @@ test('Cursor model parameters are family specific and unsupported effort is refu
  expect(()=>cursorSelection('gpt-5.6-sol','none')).toThrow();
  expect(()=>cursorSelection('kimi-k3','medium')).toThrow();expect(()=>cursorSelection('auto','high')).toThrow();
 });
-test('Cursor scrubs host credential and endpoint overrides',()=>{
- const prior=process.env.CURSOR_API_ENDPOINT;process.env.CURSOR_API_ENDPOINT='https://invalid';
- try{const env=cursorEnvironment('fixture-key');expect(env.CURSOR_API_ENDPOINT).toBeUndefined();expect(env.CURSOR_API_KEY).toBe('fixture-key');expect(env.OPENAI_API_KEY).toBeUndefined();}finally{if(prior===undefined)delete process.env.CURSOR_API_ENDPOINT;else process.env.CURSOR_API_ENDPOINT=prior}
-});
 test('Cursor verifies both email and stable user id before inference',()=>{
  const pins={expectedEmail:'work@example.com',expectedUserId:'1'};
- expect(()=>assertCursorIdentity({user:{userEmail:'work@example.com',userId:'1'}},pins)).not.toThrow();
- expect(()=>assertCursorIdentity({user:{userEmail:'work@example.com',userId:'2'}},pins)).toThrow();
- expect(()=>assertCursorIdentity({user:{userEmail:'personal@example.com',userId:'1'}},pins)).toThrow();
+ expect(()=>assertCursorIdentity({userEmail:'work@example.com',userId:'1'},pins)).not.toThrow();
+ expect(()=>assertCursorIdentity({userEmail:'work@example.com',userId:'2'},pins)).toThrow();
+ expect(()=>assertCursorIdentity({userEmail:'personal@example.com',userId:'1'},pins)).toThrow();
 });
 const selection=cursorSelection('kimi-k3','low');
-const events:JsonRecord[]=[{result:{status:'RUN_LIFECYCLE_STATUS_FINISHED',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_FINISHED',result:'{"text":"ok","tool_calls":[]}',model:selection}}},{done:{runId:'r'}}];
-test('Cursor requires matching terminal success, done and exact model',()=>{
- expect(finishedRun(events,selection).result).toBe('{"text":"ok","tool_calls":[]}');
- expect(()=>finishedRun(events.slice(0,1),selection)).toThrow();
- expect(()=>finishedRun(events,cursorSelection('kimi-k3','high'))).toThrow();
- expect(()=>finishedRun([...events,events[0]!],selection)).toThrow();
+test('Cursor requires a finished run with the exact model and parameters',()=>{
+ const finished={status:'finished',result:'ok',model:selection};
+ expect(finishedRun(finished,selection).result).toBe('ok');
+ expect(()=>finishedRun({...finished,model:cursorSelection('kimi-k3','high')},selection)).toThrow('different model');
+ expect(()=>finishedRun({...finished,model:undefined},selection)).toThrow('different model');
+ expect(()=>finishedRun(undefined,selection)).toThrow('did not finish');
 });
 test('an errored run is retryable only when Cursor gives no reason or a transient one',()=>{
- const errored=(run:JsonRecord):JsonRecord[]=>[{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',...run}}},{done:{runId:'r'}}];
- const caught=(run:JsonRecord)=>{try{finishedRun(errored(run),selection);}catch(error){return error as CursorError;}throw new Error('expected a refusal');};
- const opaque=caught({});
- expect(opaque.retryable).toBe(true); expect(opaque.message).toContain('run status ERROR with no reason from Cursor');
- expect(caught({error:'upstream provider rate limit exceeded'}).retryable).toBe(true);
- const policy=caught({error:'model refused the request policy'});
- expect(policy.retryable).toBe(false); expect(policy.message).toContain('run status ERROR: model refused the request policy');
-});
-function frame(value:unknown,flag=0){const data=Buffer.from(JSON.stringify(value));const h=Buffer.alloc(5);h[0]=flag;h.writeUInt32BE(data.length,1);return Buffer.concat([h,data]);}
-const stream=(chunks:Uint8Array[])=>new ReadableStream<Uint8Array>({start(c){chunks.forEach(x=>c.enqueue(x));c.close()}});
-test('Connect decoder handles split headers, multiple records and end frames',async()=>{
- const data=Buffer.concat([frame({}),frame({done:{runId:'r'}}),frame({},2)]);const chunks=[data.subarray(0,2),data.subarray(2,7),data.subarray(7)];const values=[];for await(const v of connectFrames(stream(chunks)))values.push(v);expect(values).toEqual([{}, {done:{runId:'r'}}]);
-});
-test('Connect refuses truncation and terminal transport errors',async()=>{
- const collect=async(bytes:Uint8Array)=>{for await(const _ of connectFrames(stream([bytes]))){} };
- await expect(collect(frame({done:{}}).subarray(0,6))).rejects.toThrow();await expect(collect(frame({error:{code:'unavailable'}},2))).rejects.toThrow();
+ const caught=(error?:JsonRecord)=>{try{finishedRun({status:'error',...(error?{error}:{})},selection);}catch(failure){return failure as CursorError;}throw new Error('expected a refusal');};
+ const opaque=caught();
+ expect(opaque.retryable).toBe(true); expect(opaque.message).toContain('run status error with no reason from Cursor');
+ expect(caught({message:'upstream provider rate limit exceeded'}).retryable).toBe(true);
+ const policy=caught({message:'model refused the request policy'});
+ expect(policy.retryable).toBe(false); expect(policy.message).toContain('run status error: model refused the request policy');
 });
 const result={text:'ok',toolCalls:[],usage:{inputTokens:1,outputTokens:1,totalTokens:2}};
 function backend(run:SubscriptionBackend['run'],gate?:()=>void):SubscriptionBackend {return {name:'Claude (Work)',models:{'work-claude-opus-5-5':'claude-opus-5-5','work-claude-fable-5-1':'claude-fable-5-1'},reservedPrefix:'work-claude-',catalog:[],run,assertAvailable:gate};}
@@ -119,21 +106,26 @@ describe('secondary Opus quota-only fallback',()=>{
  test('fallback refusal surfaces without another supplier',async()=>{const refusal=new BackendError('Cursor exhausted');const wrapped=withOpusQuotaFallback(backend(async()=>{throw new ClaudeUsageLimitError()}),backend(async()=>{throw refusal}));await expect(wrapped.run({...request,model:'claude-opus-5-5'})).rejects.toBe(refusal)});
 });
 
+/** The bridge-era RPC fixtures as SDK lookups: `Me` answers identity, `ListModels` the catalog. */
+const lookupsFrom=(rpc:(service:string,method:string)=>Promise<Response>)=>({
+ me:async()=>{const value=await (await rpc('', 'Me')).json() as JsonRecord;return value.user??value;},
+ models:async()=>{const value=await (await rpc('', 'ListModels')).json() as JsonRecord;return Array.isArray(value.items)?value.items:value;},
+});
 test('Cursor shares concurrent account discovery and invalidates it for changed credentials or pins',async()=>{
- const pins={expectedEmail:'cache-work@example.com',expectedUserId:'11',binaryHash:'cache-fixture'};let lookups=0;
+ const pins={expectedEmail:'cache-work@example.com',expectedUserId:'11'};let lookups=0;
  const rpc=async(_service:string,method:string)=>{lookups++;await new Promise(r=>setTimeout(r,10));return Response.json(method==='Me'?{user:{userEmail:pins.expectedEmail,userId:'11'}}:{items:[]})};
- await Promise.all(Array.from({length:8},()=>verifyCursorProfile(pins,'cache-key-one',rpc)));expect(lookups).toBe(2);
- await verifyCursorProfile(pins,'cache-key-one',rpc);expect(lookups).toBe(2);
- await verifyCursorProfile(pins,'cache-key-two',rpc);expect(lookups).toBe(4);
- await expect(verifyCursorProfile({...pins,expectedEmail:'different@example.com'},'cache-key-one',rpc)).rejects.toThrow();expect(lookups).toBe(5);
+ await Promise.all(Array.from({length:8},()=>verifyCursorProfile(pins,'cache-key-one',lookupsFrom(rpc))));expect(lookups).toBe(2);
+ await verifyCursorProfile(pins,'cache-key-one',lookupsFrom(rpc));expect(lookups).toBe(2);
+ await verifyCursorProfile(pins,'cache-key-two',lookupsFrom(rpc));expect(lookups).toBe(4);
+ await expect(verifyCursorProfile({...pins,expectedEmail:'different@example.com'},'cache-key-one',lookupsFrom(rpc))).rejects.toThrow();expect(lookups).toBe(5);
 });
 test('Cursor never caches failed identity checks',async()=>{
- const pins={expectedEmail:'fail-cache@example.com',expectedUserId:'12',binaryHash:'failure-fixture'};let count=0;
+ const pins={expectedEmail:'fail-cache@example.com',expectedUserId:'12'};let count=0;
  const rpc=async()=>{count++;return Response.json({user:{userEmail:'other@example.com',userId:'12'}})};
- for(let i=0;i<2;i++)await expect(verifyCursorProfile(pins,'bad-key',rpc)).rejects.toThrow();expect(count).toBe(2);
+ for(let i=0;i<2;i++)await expect(verifyCursorProfile(pins,'bad-key',lookupsFrom(rpc))).rejects.toThrow();expect(count).toBe(2);
 });
 test('Cursor uncancelled profile waiters re-prove identity on their own bridge after the lookup owner aborts',async()=>{
- const pins={expectedEmail:'cancel-profile@example.com',expectedUserId:'12',binaryHash:'cancel-profile-fixture'};
+ const pins={expectedEmail:'cancel-profile@example.com',expectedUserId:'12'};
  const controller=new AbortController();
  let began!:()=>void; const started=new Promise<void>(resolve=>{began=resolve});
  const ownerRpc=async()=>{
@@ -146,37 +138,37 @@ test('Cursor uncancelled profile waiters re-prove identity on their own bridge a
   independent++;
   return Response.json(method==='Me'?{user:{userEmail:pins.expectedEmail,userId:pins.expectedUserId}}:{items:[]});
  };
- const owner=verifyCursorProfile(pins,'cancel-profile-key',ownerRpc,controller.signal).catch((error:unknown)=>error);
+ const owner=verifyCursorProfile(pins,'cancel-profile-key',lookupsFrom(ownerRpc),controller.signal).catch((error:unknown)=>error);
  await started;
- const waiter=verifyCursorProfile(pins,'cancel-profile-key',ownRpc);
+ const waiter=verifyCursorProfile(pins,'cancel-profile-key',lookupsFrom(ownRpc));
  controller.abort();
  expect(await owner).toBeInstanceOf(Error);
- expect(await waiter).toEqual({items:[]});
+ expect(await waiter).toEqual([]);
  expect(independent).toBe(2);
 });
 test('Cursor cancelling a profile waiter leaves the lookup owner and its cached proof alive',async()=>{
- const pins={expectedEmail:'waiter-profile@example.com',expectedUserId:'12',binaryHash:'waiter-profile-fixture'};
+ const pins={expectedEmail:'waiter-profile@example.com',expectedUserId:'12'};
  let release!:()=>void; const gate=new Promise<void>(resolve=>{release=resolve});
  let calls=0;
  const rpc=async(_service:string,method:string)=>{
   calls++; if(method==='Me')await gate;
   return Response.json(method==='Me'?{user:{userEmail:pins.expectedEmail,userId:pins.expectedUserId}}:{items:[]});
  };
- const owner=verifyCursorProfile(pins,'waiter-profile-key',rpc);
+ const owner=verifyCursorProfile(pins,'waiter-profile-key',lookupsFrom(rpc));
  const controller=new AbortController();
  let waiterCalls=0;
  const ownRpc=async()=>{waiterCalls++;return Response.json({})};
- const waiter=verifyCursorProfile(pins,'waiter-profile-key',ownRpc,controller.signal).catch((error:unknown)=>error);
+ const waiter=verifyCursorProfile(pins,'waiter-profile-key',lookupsFrom(ownRpc),controller.signal).catch((error:unknown)=>error);
  controller.abort(new Error('cancel waiter'));
  expect(await waiter).toEqual(new Error('cancel waiter'));
  release();
- expect(await owner).toEqual({items:[]});
- expect(await verifyCursorProfile(pins,'waiter-profile-key',ownRpc)).toEqual({items:[]});
+ expect(await owner).toEqual([]);
+ expect(await verifyCursorProfile(pins,'waiter-profile-key',lookupsFrom(ownRpc))).toEqual([]);
  expect(calls).toBe(2);expect(waiterCalls).toBe(0);
 });
 for(const refusal of ['identity','authentication','quota']as const){
  test('Cursor shared profile '+refusal+' refusals are never retried by a waiter when the owner also cancels',async()=>{
-  const pins={expectedEmail:'refusal-profile@example.com',expectedUserId:'12',binaryHash:'refusal-profile-'+refusal};
+  const pins={expectedEmail:'refusal-profile@example.com',expectedUserId:'12'};
   let release!:()=>void;const gate=new Promise<void>(resolve=>{release=resolve});
   const rpc=async()=>{
    await gate;
@@ -184,9 +176,9 @@ for(const refusal of ['identity','authentication','quota']as const){
    throw new CursorError('terminal '+refusal+' refusal');
   };
   const controller=new AbortController();
-  const owner=verifyCursorProfile(pins,'refusal-profile-'+refusal,rpc,controller.signal).catch((error:unknown)=>error);
+  const owner=verifyCursorProfile(pins,'refusal-profile-'+refusal,lookupsFrom(rpc),controller.signal).catch((error:unknown)=>error);
   let independent=0;
-  const waiter=verifyCursorProfile(pins,'refusal-profile-'+refusal,async()=>{independent++;return Response.json({})}).catch((error:unknown)=>error);
+  const waiter=verifyCursorProfile(pins,'refusal-profile-'+refusal,lookupsFrom(async()=>{independent++;return Response.json({})})).catch((error:unknown)=>error);
   controller.abort();release();
   expect(await owner).toBeInstanceOf(Error);
   const error=await waiter;
@@ -196,18 +188,19 @@ for(const refusal of ['identity','authentication','quota']as const){
  });
 }
 
-test('Cursor lifecycle cancellation is terminal and provider context overflow uses the native context code',()=>{
- for(const status of['CANCELLED','CANCELED']){
-  try{finishedRun([{result:{status:'RUN_LIFECYCLE_STATUS_'+status,runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_'+status}}},{done:{runId:'r'}}],selection);throw new Error('expected failure');}
-  catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(false)}
- }
- try{finishedRun([{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',error:'prompt is too long for this model'}}},{done:{runId:'r'}}],selection);throw new Error('expected failure');}
+test('Cursor cancellation is terminal and provider context overflow uses the native context code',()=>{
+ try{finishedRun({status:'cancelled'},selection);throw new Error('expected failure');}
+ catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(false)}
+ try{finishedRun({status:'error',error:{message:'prompt is too long for this model'}},selection);throw new Error('expected failure');}
  catch(error){expect((error as BackendError).code).toBe('context_length_exceeded');expect((error as BackendError).retryable).toBe(false)}
 });
 
-test('Cursor Connect internal failures retry safely while auth, bad arguments and quota remain terminal',async()=>{
- for(const [code,retryable]of[['internal',true],['unknown',true],['invalid_argument',false],['unauthenticated',false],['resource_exhausted',false]]as const){
-  try{for await(const _ of connectFrames(stream([frame({error:{code}},2)]))){}throw new Error('expected failure');}
-  catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(retryable)}
+test('SDK failures: network is an outage, retryable and server errors get one attempt, auth, quota and refusals are terminal',()=>{
+ const named=(name:string,fields:JsonRecord={})=>Object.assign(new Error(name+' message'),{name,...fields});
+ expect(cursorFailure(named('NetworkError'))).toBeInstanceOf(ProxyTransportError);
+ expect(cursorFailure(new Error('fetch failed'))).toBeInstanceOf(ProxyTransportError);
+ for(const [error,retryable] of [[named('CursorAgentError',{status:500}),true],[named('CursorAgentError',{isRetryable:true}),true],[named('ConfigurationError'),false],[named('AuthenticationError',{status:401}),false],[named('RateLimitError',{status:429}),false]] as const){
+  const mapped=cursorFailure(error);expect(mapped).toBeInstanceOf(CursorError);expect((mapped as CursorError).retryable).toBe(retryable);
  }
+ expect((cursorFailure(new Error('prompt is too long for this model')) as BackendError).code).toBe('context_length_exceeded');
 });

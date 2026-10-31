@@ -1,22 +1,22 @@
-// Optional Cursor transport through the vendor's pinned SDK bridge. The proxy has no runtime
-// package dependency: it speaks sdk.v1 Connect JSON to an exclusively leased loopback process.
-// Agents get no setting sources and no subagents. Codex's tools are the agent's only tools (SDK custom
-// tools behind the `mcp` group, answered over a router callback; see cursor-native.ts), so Cursor
-// never owns execution: every call is validated and executed by Codex.
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { chmod, mkdtemp, readFile, rm } from 'node:fs/promises';
-import { dirname, isAbsolute, join } from 'node:path';
-import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
-import { isRecord, pinnedFileHash, randomId, sha256, type JsonRecord } from '../json';
-import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
-import type { ProxyOutput, ResponsesRequest, TextSink } from '../protocol/types';
-import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+// Optional Cursor backend through Cursor's own SDK (`@cursor/sdk`), run inside the router: agents
+// call Cursor's agent API directly, with no bridge process in between. Agents get no setting sources,
+// no subagents and an empty in-memory file tree. Codex's tools are the agent's only tools (SDK custom
+// tools behind the `mcp` group; see cursor-native.ts), so Cursor never owns execution: every call is
+// validated and executed by Codex.
+import { readFileSync, statSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
+import { nonNegativeInt, positiveInt } from '../env';
+import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
-import { abortable, ProxyTransportError, sleep, transportError } from '../transport';
-import { CursorBridgePool, type CursorLease } from './cursor-pool';
-import { responseObject } from '../protocol/output';
-import { CUSTOM_TOOLS_PROVIDER, NativeCallbackServer, NativeRun, nativeToolList, toolResult, type ToolResult } from './cursor-native';
 import { functionTools, rawInputTools } from '../protocol/native-tools';
+import { responseObject } from '../protocol/output';
+import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
+import type { OutputSink, ProxyOutput, ResponsesRequest } from '../protocol/types';
+import { abortable, ProxyTransportError, transportError } from '../transport';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { CUSTOM_TOOLS_PROVIDER, NativeRun, nativeToolList, toolResult, type ToolResult } from './cursor-native';
 
 const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
@@ -26,40 +26,36 @@ const CURSOR_MODELS = {
   'kimi-k3': { name: 'Kimi K3', efforts: ['low', 'high', 'max'], parameter: 'reasoning', context: '', window: 200_000, vision: false, fast: false },
   // Grok 4.7: Cursor discovery lists a 500k context, but a run requested at 500k never reaches
   // RUN_LIFECYCLE_STATUS_FINISHED (probed 2026-10-13, text-only prompt); 256k is the largest that works.
-  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000 , vision: true, fast: true },
-  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000 , vision: true, fast: true },
+  'grok-4.7': { name: 'Grok 4.7', efforts: ['low', 'medium', 'high', 'xhigh'], parameter: 'reasoning_effort', context: '256k', window: 256_000, vision: true, fast: true },
+  'claude-opus-5-5': { name: 'Opus 5.5 via Cursor', efforts: ['low', 'medium', 'high', 'xhigh', 'max'], parameter: 'effort', context: '1m', window: 1_000_000, vision: true, fast: true },
   // Cursor advertises 1m, but currently rejects that selection as invalid parameters; 300k is verified.
   'muse-wonder-1.0': { name: 'Muse Wonder', efforts: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'], parameter: 'reasoning_effort', context: '300k', window: 300_000, vision: true, fast: false },
 } as const;
 type CursorModel = keyof typeof CURSOR_MODELS;
+
+/** The part of `@cursor/sdk` the router uses; tests supply a scripted one. */
+export type SdkRun = { readonly id: string; stream(): AsyncIterable<unknown>; wait(): Promise<unknown>; cancel(): Promise<void> };
+export type SdkAgent = { readonly agentId: string; send(message: unknown, options?: JsonRecord): Promise<SdkRun>; close(): void };
+export type CursorSdk = {
+  Agent: { create(options: JsonRecord): Promise<SdkAgent> };
+  Cursor: { me(options: { apiKey: string }): Promise<unknown>; models: { list(options: { apiKey: string }): Promise<unknown> } };
+  JsonlLocalAgentStore: new (rootDir: string) => unknown;
+  emptyFs(): unknown;
+};
+
 export type CursorOptions = {
-  binary: string; binaryHash: string; authFile: string; cwd: string;
-  expectedEmail: string; expectedUserId: string; prefix: string; label: string; fastest?: boolean;
+  authFile: string; cwd: string; expectedEmail: string; expectedUserId: string; prefix: string; label: string; fastest?: boolean;
+  /** Loads the SDK; tests pass a scripted one. */
+  sdk?: () => Promise<CursorSdk>;
 };
 export class CursorError extends BackendError {
   constructor(message: string, retryable = false) { super(message, { retryable }); this.name = 'CursorError'; }
 }
 
-const MAX_BYTES = 32 * 1024 * 1024;
-const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 // Provider-side failures that native Codex would retry with backoff (429/5xx/overload). Matched
 // against the short reason Cursor attaches to an errored run, never against model output.
 const TRANSIENT_RUN_ERROR = /rate.?limit|too many requests|\b429\b|\b50[234]\b|overload|capacity|temporar|unavailable|internal error|try again|timed? ?out|upstream|gateway/i;
-
-/** Cursor's own reason for an unfinished run: a short provider string, or undefined when absent. */
-function cursorRunReason(result: JsonRecord | undefined, run: JsonRecord | undefined, done: unknown): string | undefined {
-  const candidates: unknown[] = [run?.error, run?.errorMessage, run?.message, result?.error, result?.errorMessage, isRecord(done) ? done.error : undefined];
-  if (run && run.status !== FINISHED && typeof run.result === 'string') candidates.push(run.result);
-  for (const value of candidates) {
-    const text = typeof value === 'string' ? value : isRecord(value) && typeof value.message === 'string' ? value.message : undefined;
-    if (text && text.trim()) return text.replace(/\s+/g, ' ').trim().slice(0, 160);
-  }
-  return undefined;
-}
-const PRIVATE_ENV = /^(CURSOR_|AGENT_|OPENAI_|ANTHROPIC_|CLAUDE_CODE_|XAI_|GROK_|PROXY_|NODE_OPTIONS$|BUN_OPTIONS$)/;
-export function cursorEnvironment(apiKey: string): Record<string, string> {
-  return { ...childEnvironment((key) => PRIVATE_ENV.test(key)), CURSOR_API_KEY: apiKey, CURSOR_SDK_CLIENT_LANGUAGE: 'typescript' };
-}
+const short = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 160);
 
 export function cursorSelection(model: string, effort = 'high', fastest = false): JsonRecord {
   if (!Object.hasOwn(CURSOR_MODELS, model)) throw new CursorError('Unsupported Cursor model');
@@ -68,24 +64,13 @@ export function cursorSelection(model: string, effort = 'high', fastest = false)
   return { id: model, params: [{ id: spec.parameter, value: effort }, ...(spec.context ? [{ id: 'context', value: spec.context }] : []), ...(spec.fast ? [{ id: 'fast', value: fastest ? 'true' : 'false' }] : [])] };
 }
 
-// An unfinished run's raw terminal frames are kept privately (owner-only file in the runtime state) so
-// the failure can be read afterwards instead of guessed from a category. The log never carries the body.
-function captureInvalidOutput(dir: string | undefined, category: string, text: string): string | undefined {
-  if (!dir) return undefined;
-  try {
-    mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const file = join(dir, `${new Date().toISOString().replace(/[:.]/g, '-')}-${category}.txt`);
-    writeFileSync(file, text, { mode: 0o600 });
-    return file;
-  } catch { return undefined; }
-}
-
 const OPAQUE_ITEM_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction', 'encrypted_content', 'reasoning']);
 const MEDIA_PART_TYPES = new Set(['input_audio', 'audio', 'input_file', 'file']);
+const OMITTED_MEDIA = { type: 'input_text', text: '[attachment omitted: Cursor accepts text and inline images only]' };
 const isOpaque = (value: JsonRecord): boolean => OPAQUE_ITEM_TYPES.has(String(value.type)) || typeof value.encrypted_content === 'string';
-// Inline PNG/JPEG/GIF/WebP data URLs are forwarded to the bridge as SelectedImages (the same path the
-// Cursor app uses for pasted screenshots). Share the prompt's typed/MCP/legacy-computer recognition;
-// ordinary tool metadata containing image_url or file_id is text, not an attachment.
+// Inline PNG/JPEG/GIF/WebP data URLs are sent to Cursor as message images (the same path the Cursor app
+// uses for pasted screenshots). Share the prompt's typed/MCP/legacy-computer recognition; ordinary tool
+// metadata containing image_url or file_id is text, not an attachment.
 const isInlineImage = (value: JsonRecord, legacyComputerOutput: boolean): boolean => !value.file_id && /^data:image\/(?:png|jpeg|gif|webp);base64,[A-Za-z0-9+/=\s]+$/.test(imageUrl(value, legacyComputerOutput) ?? '');
 
 /**
@@ -102,9 +87,9 @@ export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: 
     if (!isRecord(value)) return value;
     if (isImagePart(value, legacyComputerOutput)) {
       if (isInlineImage(value, legacyComputerOutput)) return value;
-      stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' };
+      stats.replaced++; return OMITTED_MEDIA;
     }
-    if (MEDIA_PART_TYPES.has(String(value.type))) { stats.replaced++; return { type: 'input_text', text: '[attachment omitted: the Cursor bridge accepts text and inline images only]' }; }
+    if (MEDIA_PART_TYPES.has(String(value.type))) { stats.replaced++; return OMITTED_MEDIA; }
     if (isOpaque(value)) { stats.replaced++; return { type: 'input_text', text: '[encrypted or compacted content from a previous model; unreadable here]' }; }
     const out: JsonRecord = {};
     for (const [key, child] of Object.entries(value)) out[key] = walk(child, value.type === 'computer_call_output' && key === 'output');
@@ -125,87 +110,57 @@ const nativeRules = (raw: string[]) => `You are the model inside a Codex agent l
 function readCursorKey(options: CursorOptions): string {
   const info = statSync(options.authFile);
   if (!info.isFile() || (info.mode & 0o077) !== 0) throw new CursorError('Cursor SDK credential file must be owner-only');
-  let value:unknown;
-  try {value=JSON.parse(readFileSync(options.authFile,'utf8'));} catch {throw new CursorError('Cursor SDK credential file is unreadable or invalid');}
+  let value: unknown;
+  try { value = JSON.parse(readFileSync(options.authFile, 'utf8')); } catch { throw new CursorError('Cursor SDK credential file is unreadable or invalid'); }
   if (!isRecord(value) || typeof value.apiKey !== 'string' || !value.apiKey || value.email !== options.expectedEmail || value.backendUrl !== 'https://api2.cursor.sh' || (typeof value.apiKeyExpiresAtMs === 'number' && value.apiKeyExpiresAtMs <= Date.now())) throw new CursorError('Cursor SDK login is missing, expired or belongs to another account');
   return value.apiKey;
 }
 
-/** Decode Connect server frames incrementally; partial frames and keepalives are valid. */
-export async function* connectFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<JsonRecord> {
-  let pending = new Uint8Array(0), total = 0;
-  for await (const chunk of body) {
-    total += chunk.length;
-    if (total > MAX_BYTES) throw new CursorError('Cursor output exceeded safety limit');
-    const joined = new Uint8Array(pending.length + chunk.length); joined.set(pending); joined.set(chunk, pending.length); pending = joined;
-    while (pending.length >= 5) {
-      const flags = pending[0]!; const length = new DataView(pending.buffer, pending.byteOffset + 1, 4).getUint32(0);
-      if (length > MAX_BYTES || (flags !== 0 && flags !== 2)) throw new CursorError('Cursor returned an invalid Connect frame');
-      if (pending.length < 5 + length) break;
-      let value: unknown;
-      try { value = JSON.parse(new TextDecoder().decode(pending.subarray(5, 5 + length))); } catch { throw new CursorError('Cursor returned invalid stream JSON'); }
-      pending = pending.slice(5 + length);
-      if (!isRecord(value)) throw new CursorError('Cursor returned an invalid stream record');
-      if (flags === 2) {
-        if (value.error) {
-          if (CONTEXT_OVERFLOW_TEXT.test(JSON.stringify(value.error))) throw contextOverflowError('Cursor');
-          // Connect `unavailable` (or a network message) means the bridge could not reach Cursor's
-          // servers: the router's shared offline policy keeps the request pending and retries it.
-          if (connectUnavailable(value.error)) throw new ProxyTransportError();
-          const code = isRecord(value.error) && typeof value.error.code === 'string' ? value.error.code : 'unknown';
-          const transient = ['internal', 'unknown', 'aborted', 'deadline_exceeded'].includes(code);
-          logSafe('cursor-stream-refused', { code, transient });
-          throw new CursorError('Cursor stream failed; no automatic supplier fallback', transient);
-        }
-      } else yield value;
-    }
-  }
-  if (pending.length) throw new CursorError('Cursor stream ended with a partial frame');
-}
-
-/** A Connect error whose code or message says the upstream service could not be reached. */
-function connectUnavailable(error: unknown): boolean {
-  const code = isRecord(error) && typeof error.code === 'string' ? error.code : '';
-  const message = isRecord(error) && typeof error.message === 'string' ? error.message : '';
-  return code === 'unavailable' || transportError(new Error(message))?.reconnectable === true;
-}
-
 /**
- * Whether Cursor's API answers at all from this machine. The bridge reports its own failure to reach
- * Cursor as a bare 500 `internal` (2026-10-19: `Me` 500 while every OpenAI request was also failing
- * with status 0), so a persistent 5xx alone cannot tell an outage from a Cursor-side fault. Any HTTP
- * answer means the network is up; only a transport failure counts as unreachable.
+ * An SDK failure as the router's error. A network failure is an outage (the shared offline policy
+ * keeps the request pending); Cursor's own refusal keeps its short message, which never contains the
+ * request or the key; only what Cursor marks retryable gets the one fresh attempt.
  */
-async function cursorUnreachable(): Promise<boolean> {
-  try { await fetch(process.env.CURSOR_REACHABILITY_URL || 'https://api2.cursor.sh', { method: 'HEAD', signal: AbortSignal.timeout(5000) }); return false; }
-  catch (error) { return !!transportError(error); }
+export function cursorFailure(error: unknown): Error {
+  if (error instanceof BackendError || error instanceof ProxyTransportError) return error;
+  const record = isRecord(error) ? error : {};
+  const name = error instanceof Error ? error.name : String(record.name ?? '');
+  const message = short(error instanceof Error ? error.message : String(record.message ?? ''));
+  if (CONTEXT_OVERFLOW_TEXT.test(message)) return contextOverflowError('Cursor');
+  if (name === 'NetworkError' || transportError(error)?.reconnectable) return new ProxyTransportError();
+  const status = typeof record.status === 'number' ? `HTTP ${record.status}` : '';
+  const code = typeof record.code === 'string' ? record.code.replace(/[^a-z_]/gi, '').slice(0, 64) : '';
+  const detail = [status, code].filter(Boolean).join(', ');
+  logSafe('cursor-refused', { name: name.replace(/[^A-Za-z]/g, '').slice(0, 40), status: record.status ?? null, code: code || null, retryable: record.isRetryable === true });
+  if (name === 'AuthenticationError') return new CursorError(`Cursor rejected the SDK login${detail ? ` (${detail})` : ''}; sign in again`);
+  if (name === 'RateLimitError') return new CursorError(`Cursor usage limit reached${detail ? ` (${detail})` : ''}${message ? `: ${message}` : ''}`);
+  return new CursorError(`Cursor refused the request${detail ? ` (${detail})` : ''}${message ? `: ${message}` : ''}`, record.isRetryable === true || (typeof record.status === 'number' && record.status >= 500));
 }
 
 export function assertCursorIdentity(value: unknown, options: Pick<CursorOptions, 'expectedEmail' | 'expectedUserId'>): void {
-  const user = isRecord(value) && isRecord(value.user) ? value.user : undefined;
-  if (!user || user.userEmail !== options.expectedEmail || String(user.userId) !== options.expectedUserId) throw new CursorError('Cursor authenticated account differs from the pinned identity');
+  if (!isRecord(value) || value.userEmail !== options.expectedEmail || String(value.userId) !== options.expectedUserId) throw new CursorError('Cursor authenticated account differs from the pinned identity');
 }
 
 // Account/catalog lookups have a much lower rate limit than agent inference. Validate once per
 // credential and pins, share concurrent lookups, and refresh after five minutes. A rotated key or
 // changed identity pin never reuses another account's proof. Server access policy remains decisive.
-type CursorRpc = (service:string, method:string, body:JsonRecord) => Promise<Response>;
-type CursorProfileProof = { expires:number; value:Promise<JsonRecord>; cancelled:boolean };
+type CursorLookups = { me(): Promise<unknown>; models(): Promise<unknown> };
+type CursorProfileProof = { expires: number; value: Promise<unknown[]>; cancelled: boolean };
 const profileCache = new Map<string, CursorProfileProof>();
-export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEmail'|'expectedUserId'|'binaryHash'>, key:string, rpc:CursorRpc, signal?:AbortSignal):Promise<JsonRecord> {
+export async function verifyCursorProfile(options: Pick<CursorOptions, 'expectedEmail' | 'expectedUserId'>, key: string, lookups: CursorLookups, signal?: AbortSignal): Promise<unknown[]> {
   signal?.throwIfAborted();
-  const cacheKey = sha256(Buffer.from(key))+'|'+options.expectedEmail+'|'+options.expectedUserId+'|'+options.binaryHash;
+  const cacheKey = sha256(Buffer.from(key)) + '|' + options.expectedEmail + '|' + options.expectedUserId;
   const previous = profileCache.get(cacheKey);
   let entry: CursorProfileProof;
   if (previous && previous.expires > Date.now()) entry = previous;
   else {
     const value = (async () => {
-      assertCursorIdentity(await (await rpc('SdkCursorService','Me',{options:{apiKey:key}})).json(),options);
-      const models:unknown = await (await rpc('SdkCursorService','ListModels',{options:{apiKey:key}})).json();
-      if (!isRecord(models) || !Array.isArray(models.items)) throw new CursorError('Cursor returned an invalid model catalog');
+      assertCursorIdentity(await lookups.me(), options);
+      const models = await lookups.models();
+      if (!Array.isArray(models)) throw new CursorError('Cursor returned an invalid model catalog');
       return models;
     })().catch((error: unknown) => {
-      // A cancelled lookup owner's fetch must not poison uncancelled waiters. Only an actual abort
+      // A cancelled lookup owner's request must not poison uncancelled waiters. Only an actual abort
       // qualifies: identity/auth/quota/backend refusals retain their original terminal behaviour,
       // even if the owner also happened to cancel before the rejection was observed.
       entry.cancelled = !!signal?.aborted && !(error instanceof BackendError)
@@ -213,230 +168,151 @@ export async function verifyCursorProfile(options:Pick<CursorOptions,'expectedEm
       if (profileCache.get(cacheKey) === entry) profileCache.delete(cacheKey);
       throw error;
     });
-    entry = {expires:Date.now()+300_000,value,cancelled:false};
+    entry = { expires: Date.now() + 300_000, value, cancelled: false };
     if (profileCache.size >= 32) profileCache.delete(profileCache.keys().next().value!);
-    profileCache.set(cacheKey,entry);
+    profileCache.set(cacheKey, entry);
   }
   try {
     const result = await abortable(entry.value, signal);
     signal?.throwIfAborted();
     return result;
-  } catch(error) {
+  } catch (error) {
     signal?.throwIfAborted();
-    if (entry.cancelled) return verifyCursorProfile(options,key,rpc,signal);
+    if (entry.cancelled) return verifyCursorProfile(options, key, lookups, signal);
     throw error;
   }
 }
 
 /**
- * The run record of a Cursor run that finished cleanly with the requested model and parameters.
- * Anything else throws a named CursorError, retryable only for provider-side transient failures.
+ * A finished run with the requested model and parameters. Anything else throws a named CursorError,
+ * retryable only for a provider-side transient failure or a failure Cursor gave no reason for
+ * (nothing has executed, so one fresh attempt is safe).
  */
-export function finishedRun(events: JsonRecord[], selection: JsonRecord, captureDir?: string): JsonRecord {
-  const terminal = events.filter(event => isRecord(event.result));
-  const result = terminal.length === 1 && isRecord(terminal[0]?.result) ? terminal[0].result : undefined;
-  const run = result && isRecord(result.result) ? result.result : undefined;
-  const done = events.at(-1)?.done;
-  if (!result || result.status !== FINISHED || !run || run.status !== FINISHED || !isRecord(done) || done.runId !== result.runId || typeof run.result !== 'string') {
-    // Name the lifecycle state so a failed run is diagnosable from the router log, and retry once
-    // when Cursor itself reports a transient provider error, which is what native Codex does for
-    // 429/5xx. The reason is Cursor's provider string, not model output, so it is safe to surface.
-    const status = String(result?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
-    const runStatus = String(run?.status ?? 'missing').replace(/^RUN_LIFECYCLE_STATUS_/, '');
-    const reason = cursorRunReason(result, run, done);
-    // An errored run that carries no reason at all (2026-10-15: status ERROR, every reason field
-    // empty) is indistinguishable from a provider hiccup, and nothing has executed, so it gets the
-    // same single fresh attempt. A run that names a non-transient reason is not retried. The raw
-    // terminal frames are kept owner-only so the next opaque failure can be read, not guessed.
-    const errored = runStatus !== 'FINISHED' || status !== 'FINISHED';
-    const opaque = errored && !reason;
-    const cancelled = /CANCELLED|CANCELED/.test(`${status} ${runStatus}`);
-    const transient = !cancelled && (opaque || (!!reason && TRANSIENT_RUN_ERROR.test(reason)));
-    const captured = captureInvalidOutput(captureDir, 'unfinished', JSON.stringify({ result, done, events }, null, 1).slice(0, 262_144));
-    const keysOf = (value: unknown) => isRecord(value) ? Object.keys(value).sort().slice(0, 32) : [];
-    logSafe('cursor-unfinished', { events: events.length, terminal: terminal.length, status, runStatus, hasDone: isRecord(done), doneMatches: isRecord(done) && !!result && done.runId === result.runId, resultType: typeof run?.result, reasonBytes: reason?.length ?? 0, opaque, transient, resultKeys: keysOf(result), runKeys: keysOf(run), doneKeys: keysOf(done), captured: !!captured });
+export function finishedRun(result: unknown, selection: JsonRecord): JsonRecord {
+  const run = isRecord(result) ? result : {};
+  if (run.status !== 'finished') {
+    const error = isRecord(run.error) ? run.error : {};
+    const reason = typeof error.message === 'string' && error.message.trim() ? short(error.message) : undefined;
     if (reason && CONTEXT_OVERFLOW_TEXT.test(reason)) throw contextOverflowError('Cursor');
-    const detail = status === 'FINISHED' && runStatus === 'FINISHED' ? 'the run finished without a result' : `run status ${runStatus}${reason ? `: ${reason}` : opaque ? ' with no reason from Cursor' : ''}`;
-    throw new CursorError(`Cursor did not finish successfully (${detail}); no automatic supplier fallback`, transient);
+    const cancelled = run.status === 'cancelled';
+    const transient = !cancelled && (!reason || TRANSIENT_RUN_ERROR.test(reason));
+    logSafe('cursor-unfinished', { status: String(run.status ?? 'missing').slice(0, 20), code: typeof error.code === 'string' ? error.code.slice(0, 40) : null, reason_bytes: reason?.length ?? 0, transient });
+    throw new CursorError(`Cursor did not finish successfully (run status ${String(run.status ?? 'missing')}${reason ? `: ${reason}` : ' with no reason from Cursor'})`, transient);
   }
-  const sameModel = isRecord(run.model) && run.model.id === selection.id && Array.isArray(run.model.params) && Array.isArray(selection.params) && JSON.stringify([...run.model.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : '')))) === JSON.stringify([...selection.params].sort((a,b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
-  if (!sameModel) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
+  const params = (value: unknown) => JSON.stringify((Array.isArray(value) ? [...value] : []).sort((a, b) => String(isRecord(a) ? a.id : '').localeCompare(String(isRecord(b) ? b.id : ''))));
+  if (!isRecord(run.model) || run.model.id !== selection.id || params(run.model.params) !== params(selection.params)) throw new CursorError('Cursor reported a different model or reasoning setting; request refused');
   return run;
 }
 
-type CursorBridge = {
-  process: Bun.Subprocess<'ignore', 'ignore', 'pipe'>; dir: string; url: string; token: string;
-  id: string; startupMs: number; dead: boolean; agentDirs: Map<string, string>; dispose(): Promise<void>;
-};
-/** A Cursor run that issued tool calls and holds its bridge until Codex returns their results. */
-type RunSession = {
-  run: NativeRun; lease: CursorLease<CursorBridge>; bridge: CursorBridge; key: string; agentId: string; runId: string;
-  signature: string; historyHash: string; historyLength: number; lastEvent: number; done: boolean;
-  events: JsonRecord[]; stream: AbortController; heldSince?: number; expiry?: ReturnType<typeof setTimeout>; ended?: Promise<void>;
-};
-
-/** Prompt and output tokens of the latest model call a Cursor usage record describes. */
+/** Prompt and output tokens a Cursor usage record describes. */
 function usageTokens(usage: JsonRecord | undefined): { input: number; output: number } | undefined {
   if (!usage) return undefined;
   const input = Number(usage.inputTokens ?? 0) + Number(usage.cacheReadTokens ?? 0) + Number(usage.cacheWriteTokens ?? 0), output = Number(usage.outputTokens ?? 0);
   return [input, output].every(n => Number.isSafeInteger(n) && n >= 0) ? { input, output } : undefined;
 }
-export type CursorBackend = SubscriptionBackend & { close(): Promise<void> };
-// A normal process.exit must not orphan parked bridges. Track immediately after spawn, including
-// children still waiting for their handshake; asynchronous directory cleanup is handled in dispose.
-const residentBridges = new Set<CursorBridge['process']>();
-process.once('exit', () => {
-  for (const child of residentBridges) { try { child.kill(); } catch {} }
-});
 
-/** Bind a continuation to the exact text and images the bridge can read. Responses metadata
+/** An agent with its own working directory; the SDK keeps its state and transcripts per directory. */
+type Spare = { agent: SdkAgent; dir: string };
+/** A Cursor run that may span several Codex turns while it waits on their tool results. */
+type RunSession = {
+  run: NativeRun; spare: Spare; key: string; sdkRun?: SdkRun; signature: string; historyHash: string; historyLength: number;
+  lastEvent: number; done: boolean; heldSince?: number; expiry?: ReturnType<typeof setTimeout>; ended?: Promise<void>;
+};
+export type CursorBackend = SubscriptionBackend & { close(): Promise<void> };
+
+/** Bind a continuation to the exact text and images Cursor can read. Responses metadata
  * (IDs, status, annotations, input_text vs output_text) can be reserialized by Codex. */
 function historyHash(items: unknown[]): string {
-  const prepared = preparePrompt({ model: '', input: items as ResponsesRequest['input'] });
-  return sha256(JSON.stringify(prepared));
+  return sha256(JSON.stringify(preparePrompt({ model: '', input: items as ResponsesRequest['input'] })));
 }
 function sessionSignature(request: ResponsesRequest, selection: JsonRecord): string {
   return JSON.stringify({ selection, instructions: request.instructions, tools: requestTools(request), toolChoice: request.tool_choice, outputLimit: request.max_output_tokens });
 }
 const TOOL_RESULTS = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
+/** Cursor's project folder for a working directory, as the SDK names it. */
+const projectDir = (dir: string) => join(homedir(), '.cursor', 'projects', dir.replace(/[^a-zA-Z0-9]/g, '-').replace(/-+/g, '-').replace(/^-+|-+$/g, ''));
 
 class CursorRuntime {
-  private readonly pool: CursorBridgePool<CursorBridge>;
-  private readonly callbacks = new NativeCallbackServer();
   private readonly heldRuns = new Map<string, RunSession>();
+  private readonly sessions = new Set<RunSession>();
+  private readonly spares = new Map<string, Promise<Spare>>();
+  private sdkLoad?: Promise<CursorSdk>;
+  /** The model the next ready agent starts with; each send names its own, so this only spares a switch. */
+  private lastSelection = cursorSelection('kimi-k3');
   readonly options: Readonly<CursorOptions>;
-  constructor(options: CursorOptions) {
-    this.options = Object.freeze({ ...options });
-    this.pool = new CursorBridgePool(
-      Math.min(32, positiveInt('CURSOR_MAX_BRIDGES', 8)), positiveInt('CURSOR_BRIDGE_IDLE_MS', 120_000),
-      (key, signal) => this.startBridge(key, signal), bridge => bridge.dispose(),
-      bridge => !bridge.dead && bridge.process.exitCode === null,
-      // One idle bridge per login outlives the short window, so a pause between messages reuses it.
-      nonNegativeInt('CURSOR_WARM_BRIDGES', 1), positiveInt('CURSOR_WARM_BRIDGE_IDLE_MS', 900_000),
-    );
+  constructor(options: CursorOptions) { this.options = Object.freeze({ ...options }); }
+
+  private sdk(): Promise<CursorSdk> {
+    this.sdkLoad ??= (this.options.sdk ?? (() => import('@cursor/sdk') as unknown as Promise<CursorSdk>))();
+    return this.sdkLoad;
   }
+
   async close(): Promise<void> {
-    await Promise.all([...new Set(this.heldRuns.values())].map(session => this.endRun(session, 'Router shutting down', true)));
-    this.callbacks.stop();
-    return this.pool.close();
+    await Promise.all([...this.sessions].map(session => this.endRun(session, 'Router shutting down')));
+    const spares = [...this.spares.values()];
+    this.spares.clear();
+    await Promise.all(spares.map(spare => spare.then(value => this.dispose(value), () => {})));
   }
-  /** Starts a bridge when a chat opens, so its first turn skips the cold start. Never throws. */
+
+  /** Readies an agent when a chat opens, so its first turn skips agent setup. Never throws. */
   prewarm(): void {
-    try { this.pool.prewarm(readCursorKey(this.options)); } catch {}
+    try { void this.spare(readCursorKey(this.options)).catch(() => {}); } catch {}
   }
-  private async startBridge(key: string, signal?: AbortSignal): Promise<CursorBridge> {
-    const options = this.options;
+
+  /** A new agent with no tools of its own; each turn chooses the model and Codex's tools when it sends. */
+  private async createAgent(key: string): Promise<Spare> {
+    const sdk = await this.sdk();
     const started = performance.now();
-    if (pinnedFileHash(options.binary) !== options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
-    const dir = await mkdtemp(join(options.cwd, 'request-')); await chmod(dir, 0o700);
-    let process: CursorBridge['process'];
+    const dir = await mkdtemp(join(this.options.cwd, 'agent-'));
     try {
-      signal?.throwIfAborted();
-      process = Bun.spawn([options.binary, '--host', '127.0.0.1', '--port', '0', '--workspace', dir, '--state-root', join(dir, 'store'), '--local-store', JSON.stringify({ type: 'jsonl', rootDir: join(dir, 'store') })], { cwd: dir, env: cursorEnvironment(key), stdin: 'ignore', stdout: 'ignore', stderr: 'pipe' });
-      residentBridges.add(process);
-      const remove = () => { residentBridges.delete(process); };
-      void process.exited.then(remove, remove);
+      const agent = await sdk.Agent.create({
+        apiKey: key, model: this.lastSelection,
+        // Only the MCP group is allowed, and its only tools are Codex's: no shell, edit, read, web or
+        // subagent tool exists for this agent, and its file tree is empty and in memory.
+        tools: ['mcp'], disallowedTools: ['task'],
+        local: { cwd: dir, settingSources: [], fs: sdk.emptyFs(), store: new sdk.JsonlLocalAgentStore(join(dir, 'store')) },
+      }).catch((error: unknown) => { throw cursorFailure(error); });
+      logSafe('cursor-agent-created', { ms: Math.round(performance.now() - started) });
+      return { agent, dir };
     } catch (error) { await rm(dir, { recursive: true, force: true }); throw error; }
-    const bridge: CursorBridge = {
-      process, dir, url: '', token: '', id: randomId('bridge'), startupMs: 0, dead: false, agentDirs: new Map(),
-      dispose: () => {
-        if (disposal) return disposal;
-        bridge.dead = true;
-        disposal = (async () => {
-          try { process.kill(); } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'kill' }); }
-          try { await process.exited; } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'exit' }); }
-          try { await rm(dir, { recursive: true, force: true }); } catch { logSafe('cursor-cleanup-failed', { bridge_id: bridge.id, stage: 'directory' }); }
-        })();
-        return disposal;
-      },
-    };
-    let disposal: Promise<void> | undefined;
-    const abort = () => { void bridge.dispose(); };
-    signal?.addEventListener('abort', abort, { once: true });
-    let startup: ReturnType<typeof setTimeout> | undefined;
-    try {
-      const info = await new Promise<JsonRecord>((resolve, reject) => {
-        const startupMs = positiveInt('CURSOR_STARTUP_TIMEOUT_MS', 60_000);
-        startup = setTimeout(() => { logSafe('cursor-startup-timeout', { startupMs }); void bridge.dispose(); reject(new CursorError('Cursor bridge startup timed out', true)); }, startupMs);
-        void (async () => {
-          let line = '', bytes = 0, found = false;
-          try {
-            for await (const chunk of process.stderr) {
-              bytes += chunk.length;
-              if (bytes > MAX_BYTES) throw new CursorError('Cursor diagnostics exceeded safety limit');
-              line += new TextDecoder().decode(chunk);
-              let boundary: number;
-              while ((boundary = line.indexOf('\n')) >= 0) {
-                const current = line.slice(0, boundary); line = line.slice(boundary + 1);
-                if (!found && current.startsWith('cursor-sdk-bridge ready ')) {
-                  const value: unknown = JSON.parse(current.slice(24));
-                  if (!isRecord(value)) throw new Error('invalid handshake');
-                  found = true; clearTimeout(startup); resolve(value);
-                }
-              }
-              if (line.length > 65536) throw new Error('diagnostic line exceeded limit');
-            }
-            if (!found) reject(new CursorError('Cursor bridge exited before ready'));
-          } catch { void bridge.dispose(); reject(new CursorError('Cursor bridge startup or diagnostics failed')); }
-        })();
-      });
-      signal?.throwIfAborted();
-      if (info.schemaVersion !== 1 || info.host !== '127.0.0.1' || info.protocol !== 'connect' || info.transport !== 'tcp' || typeof info.port !== 'number' || typeof info.authTokenFile !== 'string' || typeof info.url !== 'string' || info.url !== `http://127.0.0.1:${info.port}`) throw new CursorError('Cursor returned an invalid local handshake');
-      bridge.url = info.url; bridge.token = (await readFile(info.authTokenFile, 'utf8')).trim();
-      // Every bridge sends custom tool calls to this login's callback endpoint.
-      await this.rpc(bridge, 'SdkBridgeControlService', 'SetToolCallback', { url: this.callbacks.url(), authToken: this.callbacks.token }, signal ?? AbortSignal.timeout(10_000));
-      const exited = () => { bridge.dead = true; };
-      void process.exited.then(exited, exited);
-      bridge.startupMs = performance.now() - started;
-      logSafe('cursor-bridge-started', { bridge_id: bridge.id, startup_ms: Math.round(bridge.startupMs) });
-      return bridge;
-    } catch (error) { await bridge.dispose(); signal?.throwIfAborted(); throw error; }
-    finally { clearTimeout(startup); signal?.removeEventListener('abort', abort); }
   }
-  private async rpc(bridge: CursorBridge, service: string, method: string, body: JsonRecord, signal: AbortSignal, stream = false): Promise<Response> {
-    const json = Buffer.from(JSON.stringify(body));
-    const header = Buffer.alloc(5); header.writeUInt32BE(json.length, 1);
-    const backoff = positiveInt('CURSOR_RPC_RETRY_MS', 1000);
-    for (let tries = 1; ; tries++) {
-      let response: Response;
-      try {
-        response = await fetch(`${bridge.url}/sdk.v1.${service}/${method}`, { method: 'POST', signal, headers: { authorization: `Bearer ${bridge.token}`, 'content-type': stream ? 'application/connect+json' : 'application/json', 'connect-protocol-version': '1' }, body: stream ? Buffer.concat([header, json]) : json });
-      } catch (error) {
-        if (signal.aborted) throw error;
-        throw new CursorError('Cursor bridge connection failed; no automatic supplier fallback', true);
-      }
-      if (response.ok) return response;
-      const detail: unknown = await response.json().catch(() => undefined);
-      const code = isRecord(detail) && typeof detail.code === 'string' ? detail.code.replace(/[^a-z_]/g, '').slice(0, 64) : 'unknown';
-      if (isRecord(detail) && typeof detail.message === 'string' && CONTEXT_OVERFLOW_TEXT.test(detail.message)) throw contextOverflowError('Cursor');
-      if (connectUnavailable(detail)) throw new ProxyTransportError();
-      const transient = response.status >= 500;
-      if (transient && !stream && tries < 3) {
-        logSafe('cursor-rpc-retry', { service, method, status: response.status, code, attempt: tries });
-        await sleep(backoff * 2 ** (tries - 1), signal);
-        continue;
-      }
-      const offline = transient && await cursorUnreachable();
-      logSafe('cursor-rpc-refused', { service, method, status: response.status, code, transient, offline, tries });
-      if (offline) throw new ProxyTransportError();
-      throw new CursorError(`Cursor SDK request refused (HTTP ${response.status}, ${code}); no automatic supplier fallback`, transient);
+
+  /** The ready agent for this login, created ahead of its turn. */
+  private spare(key: string): Promise<Spare> {
+    let spare = this.spares.get(key);
+    if (!spare) {
+      spare = this.createAgent(key);
+      this.spares.set(key, spare);
+      spare.catch(() => { if (this.spares.get(key) === spare) this.spares.delete(key); });
     }
+    return spare;
   }
-  private async closeAgent(bridge: CursorBridge, agentId: string): Promise<void> {
-    if (!agentId) return;
-    const response = await fetch(`${bridge.url}/sdk.v1.SdkAgentService/CloseAgent`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${bridge.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId }) });
-    if (!response.ok) throw new CursorError('Cursor agent cleanup failed', true);
-    const dir = bridge.agentDirs.get(agentId);
-    if (dir) { await rm(dir, { recursive: true, force: true }); bridge.agentDirs.delete(agentId); }
+
+  /** Takes the ready agent and readies the next one. */
+  private async takeAgent(key: string, signal: AbortSignal): Promise<Spare> {
+    for (const stale of this.spares.keys()) if (stale !== key) { const old = this.spares.get(stale)!; this.spares.delete(stale); void old.then(value => this.dispose(value), () => {}); }
+    const spare = this.spare(key);
+    this.spares.delete(key);
+    const taken = await abortable(spare, signal).catch((error: unknown) => {
+      if (signal.aborted) void spare.then(value => this.dispose(value), () => {});
+      throw error;
+    });
+    if (nonNegativeInt('CURSOR_SPARE_AGENTS', 1)) void this.spare(key).catch(() => {});
+    return taken;
+  }
+
+  private async dispose(spare: Spare): Promise<void> {
+    try { spare.agent.close(); } catch {}
+    await Promise.all([rm(spare.dir, { recursive: true, force: true }), rm(projectDir(spare.dir), { recursive: true, force: true })]).catch(() => logSafe('cursor-cleanup-failed', { stage: 'directory' }));
   }
 
   /**
-   * One Codex turn on the native path. A request that carries the results of calls a live run is
-   * holding continues that run; anything else starts a fresh agent with the full history. The turn
-   * ends when the model has issued its calls (they go to Codex) or the run finishes.
+   * One Codex turn. A request that carries the results of calls a live run is holding continues that
+   * run; anything else starts a fresh agent with the full history. The turn ends when the model has
+   * issued its calls (they go to Codex) or the run finishes.
    */
-  async run(request: ResponsesRequest, signal?: AbortSignal, sink?: TextSink): Promise<ProxyOutput> {
-    const started = performance.now(), requestId = randomId('cursor');
+  async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+    const started = performance.now();
     const sanitized = sanitizeCursorInput(request.input);
     if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
     request = { ...request, input: sanitized.input as ResponsesRequest['input'] };
@@ -455,29 +331,28 @@ class CursorRuntime {
         clearTimeout(session.expiry);
         for (const id of continuation.results.keys()) this.heldRuns.delete(id);
         session.lastEvent = performance.now();
+        session.run.attach(sink);
         session.run.answer(continuation.results);
       } else {
-        session = await this.startRun(request, selection, signature, combined);
+        session = await this.startRun(request, selection, signature, combined, sink);
       }
       setupMs = performance.now() - started;
-      session.run.attach(sink);
       const step = await session.run.next(combined);
       calls = step.calls.length;
       const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request)), usageTokens(step.usage)?.input ?? 0);
       const outputTokens = Math.max(estimateVisibleTokens(step.text + JSON.stringify(step.calls)), usageTokens(step.usage)?.output ?? 0);
       const output: ProxyOutput = { text: step.text, toolCalls: step.calls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
       if (step.calls.length && Array.isArray(request.input)) this.holdRun(session, request, output, signature);
-      // Output returns at once; the lease stays held until CloseAgent finishes, so nothing races it.
-      else void this.endRun(session, 'Cursor turn finished', false);
+      else void this.endRun(session, 'Cursor turn finished');
       success = true;
       return output;
     } catch (error) {
-      if (session) await this.endRun(session, 'Cursor turn failed', true);
-      if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic supplier fallback`, true);
+      if (session) await this.endRun(session, 'Cursor turn failed');
+      if (timedOut) throw new CursorError(`Cursor request timed out after ${Math.round(idleMs / 1000)}s without output`, true);
       throw error;
     } finally {
       clearInterval(idle);
-      logSafe('cursor-turn', { request_id: requestId, bridge_id: session?.bridge.id, model: request.model, continued: !!continuation, success, calls, setup_ms: Math.round(setupMs), elapsed_ms: Math.round(performance.now() - started) });
+      logSafe('cursor-turn', { model: request.model, continued: !!continuation, success, calls, setup_ms: Math.round(setupMs), elapsed_ms: Math.round(performance.now() - started) });
     }
   }
 
@@ -492,7 +367,7 @@ class CursorRuntime {
     if (!session) return undefined;
     // A rotated or unreadable credential never continues a run started under another login.
     let key: string | undefined;
-    try { key = readCursorKey(this.options); } catch (error) { void this.endRun(session, 'The Cursor credential changed', false); throw error; }
+    try { key = readCursorKey(this.options); } catch (error) { void this.endRun(session, 'The Cursor credential changed'); throw error; }
     const pending = session.run.pending();
     const suffix = request.input.slice(session.historyLength);
     const answers = suffix.every(item => TOOL_RESULTS.has(item.type ?? '') && item.type !== 'tool_search_output' && pending.includes(item.call_id ?? ''));
@@ -501,98 +376,90 @@ class CursorRuntime {
     if (!matches) {
       // A changed history, a tool search (new tools) or a user message mid-run: replay instead.
       logSafe('cursor-replay', { signature: session.signature === signature, answers });
-      void this.endRun(session, 'The conversation changed; this run was replaced', false);
+      void this.endRun(session, 'The conversation changed; this run was replaced');
       return undefined;
     }
     return { session, results: new Map(suffix.map(item => [item.call_id!, toolResult(item)])) };
   }
 
-  private async startRun(request: ResponsesRequest, selection: JsonRecord, signature: string, signal: AbortSignal): Promise<RunSession> {
+  private async startRun(request: ResponsesRequest, selection: JsonRecord, signature: string, signal: AbortSignal, sink: OutputSink | undefined): Promise<RunSession> {
     await this.reclaimHeld();
     const key = readCursorKey(this.options);
-    const lease = await this.pool.acquire(key, signal);
-    const bridge = lease.value;
-    let agentId = '';
+    const sdk = await this.sdk();
+    const lookups = { me: () => sdk.Cursor.me({ apiKey: key }).catch((error: unknown) => { throw cursorFailure(error); }), models: () => sdk.Cursor.models.list({ apiKey: key }).catch((error: unknown) => { throw cursorFailure(error); }) };
+    this.lastSelection = selection;
+    // The identity check (usually cached) and the agent run side by side; a failed check closes the agent.
+    const [proof, taken] = await Promise.allSettled([verifyCursorProfile(this.options, key, lookups, signal), this.takeAgent(key, signal)]);
+    if (proof.status === 'rejected' || taken.status === 'rejected') {
+      if (taken.status === 'fulfilled') await this.dispose(taken.value);
+      throw proof.status === 'rejected' ? proof.reason : (taken as PromiseRejectedResult).reason;
+    }
+    const [models, spare] = [proof.value, taken.value];
+    let session: RunSession | undefined;
     try {
-      signal.throwIfAborted();
-      if (lease.reused && pinnedFileHash(this.options.binary) !== this.options.binaryHash) throw new CursorError('Cursor pinned bridge changed; backend paused');
-      if (readCursorKey(this.options) !== key) throw new CursorError('Cursor credential changed while queued; retry the turn', true);
-      const rpc = (service: string, method: string, body: JsonRecord) => this.rpc(bridge, service, method, body, signal);
-      const models = await verifyCursorProfile(this.options, key, rpc, signal);
-      const discovered = isRecord(models) && Array.isArray(models.items) ? models.items.find(item => isRecord(item) && item.id === request.model) : undefined;
+      const discovered = models.find(item => isRecord(item) && item.id === request.model);
       if (!isRecord(discovered) || !Array.isArray(discovered.parameters)) throw new CursorError('Requested model is unavailable on the pinned Cursor account');
       const definitions = discovered.parameters;
       if ((selection.params as Array<{ id: string; value: string }>).some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
-      const tools = functionTools(toolDescriptors(requestTools(request)));
-      const hasTools = tools.byKey.size > 0;
-      const agentDir = await mkdtemp(join(bridge.dir, 'agent-')); await chmod(agentDir, 0o700);
-      // Only the MCP group is allowed, and the only MCP server is the router's: no shell, edit, read,
-      // web or subagent tool exists for this agent. Without Codex tools even that group is off.
-      const created: unknown = await (await rpc('SdkAgentService', 'CreateAgent', { options: { apiKey: key, model: selection, tools: { names: hasTools ? ['mcp'] : [] }, disallowedTools: ['task'], local: { cwd: [agentDir], settingSources: [], ...(hasTools ? { customTools: tools.definitions } : {}) } } })).json();
-      if (!isRecord(created) || typeof created.agentId !== 'string') throw new CursorError('Cursor agent creation failed');
-      agentId = created.agentId;
-      bridge.agentDirs.set(agentId, agentDir);
+      // Cursor has no way to forbid calls, so a turn that allows none gets no tools.
+      const tools = functionTools(request.tool_choice === 'none' ? [] : toolDescriptors(requestTools(request)));
       const run = new NativeRun(tools.byKey, nonNegativeInt('CURSOR_TOOL_SETTLE_MS', 350));
-      const session: RunSession = { run, lease, bridge, key, agentId, runId: '', signature, historyHash: '', historyLength: 0, lastEvent: performance.now(), done: false, events: [], stream: new AbortController() };
-      this.callbacks.register(agentId, run);
+      // Attached before the send, so the first thinking reaches Codex too.
+      run.attach(sink);
+      session = { run, spare, key, signature, historyHash: '', historyLength: 0, lastEvent: performance.now(), done: false };
+      this.sessions.add(session);
+      const customTools = Object.fromEntries(Object.entries(tools.definitions).map(([name, tool]) => [name, {
+        description: tool.description, inputSchema: tool.inputSchema, execute: (args: unknown) => run.call(name, args),
+      }]));
       const prepared = preparePrompt(request);
-      const images = prepared.images.map(image => ({ data: { data: image.source.data, mimeType: image.source.media_type } }));
+      const images = prepared.images.map(image => ({ data: image.source.data, mimeType: image.source.media_type }));
       if (images.length) logSafe('cursor-images-attached', { count: images.length });
       const text = [nativeRules(rawInputTools(tools.byKey)), nativeToolList(tools.definitions), prepared.prompt].filter(Boolean).join('\n\n');
-      // The stream outlives this request when the run holds tool calls, so only ending the session
-      // cuts it; this request's cancellation ends the session (and so the stream) in runNative.
-      const cancel = () => session.stream.abort(signal.reason);
-      signal.addEventListener('abort', cancel, { once: true });
-      let response: Response;
-      try { response = await this.rpc(bridge, 'SdkAgentService', 'Send', { agentId, message: images.length ? { text, images } : { text }, options: { enableSteps: true } }, session.stream.signal, true); }
-      finally { signal.removeEventListener('abort', cancel); }
-      if (!response.body) throw new CursorError('Cursor returned an empty stream');
-      void this.readRun(session, response.body, selection);
-      return session;
+      const current = session;
+      const onDelta = ({ update }: { update: unknown }) => {
+        current.lastEvent = performance.now();
+        if (!isRecord(update)) return;
+        if (update.type === 'text-delta' && typeof update.text === 'string') run.appendText(update.text);
+        else if (update.type === 'thinking-delta' && typeof update.text === 'string') run.appendReasoning(update.text);
+        else if (update.type === 'tool-call-started' && !isCodexTool(update.toolCall)) run.fail(new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned'));
+        else if (update.type === 'summary-started') run.fail(contextOverflowError('Cursor'));
+      };
+      signal.throwIfAborted();
+      current.sdkRun = await spare.agent.send(images.length ? { text, images } : text, { model: selection, local: { customTools }, onDelta })
+        .catch((error: unknown) => { throw cursorFailure(error); });
+      void this.readRun(current, selection);
+      return current;
     } catch (error) {
-      if (agentId) await this.closeAgent(bridge, agentId).catch(() => {});
-      await lease.discard();
+      if (session) await this.endRun(session, 'Cursor turn failed');
+      else await this.dispose(spare);
       throw error;
     }
   }
 
-  /** Feeds a run's stream into its NativeRun: text, guarded tool events, usage and the terminal result. */
-  private async readRun(session: RunSession, body: ReadableStream<Uint8Array>, selection: JsonRecord): Promise<void> {
+  /** Watches a run's messages for anything but Codex's tools, records usage, and settles its result. */
+  private async readRun(session: RunSession, selection: JsonRecord): Promise<void> {
     const { run } = session;
     try {
-      for await (const event of connectFrames(body)) {
+      for await (const message of session.sdkRun!.stream()) {
         session.lastEvent = performance.now();
-        const sdk = isRecord(event.sdkMessage) ? event.sdkMessage : undefined;
-        const message = sdk && isRecord(sdk.message) ? sdk.message : undefined;
-        if (message && typeof message.run_id === 'string') session.runId = message.run_id;
-        if (isRecord(event.result) || isRecord(event.done)) session.events.push(event);
-        const step = isRecord(event.step) && isRecord(event.step.step) ? event.step.step : undefined;
-        const stepType = String(step?.type ?? '');
-        // Only calls to the router's own MCP server are allowed; anything else is a native action.
-        const containsNative = (v: unknown): boolean => Array.isArray(v) ? v.some(containsNative) : isRecord(v) ? v.type === 'tool_use' || Object.values(v).some(containsNative) : false;
-        if (sdk && containsNative(sdk.message)) throw new CursorError('Cursor attempted a native tool; it was stopped and no Codex actions were returned');
-        if (message?.type === 'tool_call') {
-          const args = isRecord(message.args) ? message.args : {};
-          if (message.name !== 'mcp' || args.providerIdentifier !== CUSTOM_TOOLS_PROVIDER) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
-        } else if (sdk && /^(task|compaction|summary)/.test(String(sdk.type))) throw new CursorError('Cursor attempted native subagents or compaction; no Codex actions were returned');
-        if (stepType === 'toolCall' ? !(isRecord(step?.message) && step.message.type === 'mcp') : /shell|task|summary|compact/i.test(stepType)) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
-        if (message?.type === 'assistant' && isRecord(message.message) && Array.isArray(message.message.content)) {
-          for (const part of message.message.content) if (isRecord(part) && part.type === 'text' && typeof part.text === 'string') run.appendText(part.text);
-        }
-        if (message?.type === 'usage' && isRecord(message.usage)) run.usage = message.usage;
+        if (!isRecord(message)) continue;
+        if (message.type === 'tool_call' && !(message.name === 'mcp' && isRecord(message.args) && message.args.providerIdentifier === CUSTOM_TOOLS_PROVIDER)) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
+        // Cursor summarizes its own context only near the model's limit: Codex compacts instead.
+        if (message.type === 'summary') throw contextOverflowError('Cursor');
+        if (message.type === 'task') throw new CursorError('Cursor attempted a subagent; it was stopped and no Codex actions were returned');
+        if (message.type === 'usage' && isRecord(message.usage)) run.usage = message.usage;
       }
-      const record = finishedRun(session.events, selection, join(dirname(this.options.cwd), 'invalid-output'));
-      if (isRecord(record.usage) && !run.usage) run.usage = record.usage;
+      const result = finishedRun(await session.sdkRun!.wait(), selection);
+      if (isRecord(result.usage) && !run.usage) run.usage = result.usage;
       session.done = true;
       run.finish();
     } catch (error) {
       session.done = true;
-      if (error instanceof ProxyTransportError || error instanceof BackendError) run.fail(error);
-      else run.fail(transportError(error) ? new CursorError('Cursor bridge stream dropped; no automatic supplier fallback', true) : error instanceof Error ? error : new Error(String(error)));
+      run.fail(cursorFailure(error));
     }
   }
 
-  /** Keeps the run and its bridge until Codex returns these calls' results, or the session expires. */
+  /** Keeps the run until Codex returns these calls' results, or the session expires. */
   private holdRun(session: RunSession, request: ResponsesRequest, output: ProxyOutput, signature: string): void {
     const prior = [...(request.input as unknown[]), ...responseObject(request, output).output];
     session.signature = signature;
@@ -600,62 +467,55 @@ class CursorRuntime {
     session.historyLength = prior.length;
     session.heldSince = Date.now();
     for (const call of output.toolCalls) if (call.callId) this.heldRuns.set(call.callId, session);
-    session.expiry = setTimeout(() => void this.endRun(session, 'Codex did not return the tool results in time', false), positiveInt('CURSOR_SESSION_IDLE_MS', 900_000));
+    session.expiry = setTimeout(() => void this.endRun(session, 'Codex did not return the tool results in time'), positiveInt('CURSOR_SESSION_IDLE_MS', 900_000));
     session.expiry.unref?.();
   }
 
-  /**
-   * Held runs wait on Codex, not on Cursor. When they occupy every bridge the cap allows, the one
-   * waiting longest gives its bridge to new work; if Codex later returns its results, they replay.
-   */
+  /** Held runs wait on Codex; past the cap, the one waiting longest is ended and replays if continued. */
   private async reclaimHeld(): Promise<void> {
-    const max = Math.min(32, positiveInt('CURSOR_MAX_BRIDGES', 8));
     const held = [...new Set(this.heldRuns.values())].filter(session => session.heldSince !== undefined && !session.ended);
-    if (held.length < max) return;
+    if (held.length < positiveInt('CURSOR_MAX_HELD_RUNS', 16)) return;
     const oldest = held.reduce((a, b) => (a.heldSince! <= b.heldSince! ? a : b));
     logSafe('cursor-reclaimed', { held: held.length, held_ms: Date.now() - oldest.heldSince! });
-    await this.endRun(oldest, 'Its bridge was needed for another turn; this run will be replayed if continued', false);
+    await this.endRun(oldest, 'Too many Cursor runs were waiting on Codex; this run will be replayed if continued');
   }
 
-  /** Ends a run: held callbacks are released, an unfinished run is cancelled, the bridge is returned. */
-  private endRun(session: RunSession, reason: string, discard: boolean): Promise<void> {
+  /** Ends a run: held callbacks are released, an unfinished run is cancelled, the agent is closed. */
+  private endRun(session: RunSession, reason: string): Promise<void> {
     if (session.ended) return session.ended;
     clearTimeout(session.expiry);
     for (const [callId, owner] of this.heldRuns) if (owner === session) this.heldRuns.delete(callId);
     session.run.close(reason);
-    this.callbacks.unregister(session.agentId, session.run);
-    const { bridge, lease, agentId } = session;
     session.ended = (async () => {
-      try {
-        if (!session.done && session.runId) await fetch(`${bridge.url}/sdk.v1.SdkAgentService/CancelRun`, { method: 'POST', signal: AbortSignal.timeout(2000), headers: { authorization: `Bearer ${bridge.token}`, 'content-type': 'application/json' }, body: JSON.stringify({ agentId, runId: session.runId }) });
-        session.stream.abort();
-        if (discard || bridge.dead) { await lease.discard(); return; }
-        await this.closeAgent(bridge, agentId);
-        lease.release();
-      } catch {
-        logSafe('cursor-cleanup-failed', { stage: 'native-end' });
-        await lease.discard();
-      }
+      if (!session.done && session.sdkRun) await session.sdkRun.cancel().catch(() => logSafe('cursor-cleanup-failed', { stage: 'cancel' }));
+      await this.dispose(session.spare);
+      this.sessions.delete(session);
     })();
     return session.ended;
   }
 }
 
+/** A tool call aimed at Codex's tools: the SDK's custom-tools MCP provider, and nothing else. */
+function isCodexTool(call: unknown): boolean {
+  return isRecord(call) && call.type === 'mcp' && isRecord(call.args) && call.args.providerIdentifier === CUSTOM_TOOLS_PROVIDER;
+}
+
 export function createCursorBackend(options: CursorOptions): CursorBackend {
-  if (![options.binary, options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt','grok','claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId || !/^[a-f0-9]{64}$/.test(options.binaryHash)) throw new Error('Cursor requires absolute paths, a pinned bridge, account identity and a model namespace');
+  if (![options.authFile, options.cwd].every(isAbsolute) || !/^[a-z][a-z0-9-]*$/.test(options.prefix) || ['gpt', 'grok', 'claude'].includes(options.prefix) || !options.expectedEmail || !options.expectedUserId) throw new Error('Cursor requires absolute paths, account identity and a model namespace');
   const exposed: CursorModel[] = ['kimi-k3', 'grok-4.7', 'claude-opus-5-5', 'muse-wonder-1.0'];
   const runtime = new CursorRuntime(options);
   return {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
-    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: `Your subscription through Cursor; Codex executes tools.`, efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
-    // Transient provider failures (an errored run, a dropped stream, a slow startup) get one fresh attempt.
+    catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: 'Your subscription through Cursor; Codex executes tools.', efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
+    // Transient provider failures (an errored run, a dropped stream) get one fresh attempt.
     run: (request, signal, sink) => retryOnce('Cursor', signal, () => runtime.run(request, signal, sink), sink),
     prewarm: () => runtime.prewarm(),
     close: () => runtime.close(),
   };
 }
+
 export function configuredCursorBackend(env: Readonly<Record<string, string | undefined>> = process.env): CursorBackend | undefined {
-  if (!env.CURSOR_BRIDGE_BIN) return undefined;
-  return createCursorBackend({ binary: env.CURSOR_BRIDGE_BIN, binaryHash: env.CURSOR_BRIDGE_SHA256 ?? '', authFile: env.CURSOR_AUTH_FILE ?? '', cwd: env.CURSOR_CWD ?? '', expectedEmail: env.CURSOR_EXPECTED_EMAIL ?? '', expectedUserId: env.CURSOR_EXPECTED_USER_ID ?? '', prefix: env.CURSOR_MODEL_PREFIX || 'cursor', label: env.CURSOR_LABEL || 'Cursor', fastest: env.CURSOR_SPEED_POLICY === 'fastest' });
+  if (!env.CURSOR_AUTH_FILE) return undefined;
+  return createCursorBackend({ authFile: env.CURSOR_AUTH_FILE, cwd: env.CURSOR_CWD ?? '', expectedEmail: env.CURSOR_EXPECTED_EMAIL ?? '', expectedUserId: env.CURSOR_EXPECTED_USER_ID ?? '', prefix: env.CURSOR_MODEL_PREFIX || 'cursor', label: env.CURSOR_LABEL || 'Cursor', fastest: env.CURSOR_SPEED_POLICY === 'fastest' });
 }

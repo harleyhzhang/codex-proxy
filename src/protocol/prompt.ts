@@ -26,7 +26,7 @@ export type ToolDescriptor = {
   contract?: unknown;
 };
 
-export type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
+type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
 
 type PreparedPrompt = { prompt: string; images: ImageBlock[] };
 
@@ -153,7 +153,8 @@ export function requestToPrompt(request: ResponsesRequest): string {
   const input =
     typeof request.input === 'string'
       ? `<user>\n${request.input}\n</user>`
-      : request.input.map(serializeItem).join('\n\n');
+      // Reasoning belongs to the model that wrote it (OpenAI ciphertext, or another model's thinking).
+      : request.input.filter(item => item.type !== 'reasoning').map(serializeItem).join('\n\n');
   return [request.instructions ? `<instructions>\n${request.instructions}\n</instructions>` : '', input]
     .filter(Boolean)
     .join('\n\n');

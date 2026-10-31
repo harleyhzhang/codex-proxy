@@ -1,6 +1,6 @@
 // Every model row × every failure mode × every transport (plain HTTP, SSE stream, WebSocket).
 // Rows: GPT (OpenAI relay), every registered subscription backend, plus the optional secondary
-// Claude account and Cursor bridge registered here under the production `poly-` prefixes so the
+// Claude account and Cursor backend registered here under the production `poly-` prefixes so the
 // router is exercised with the exact slugs the live catalog serves.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -28,12 +28,11 @@ beforeAll(async () => {
   process.env.UPSTREAM_RETRY_BASE_MS = '1';
   process.env.OFFLINE_RETRY_BASE_MS = '5';
   scratch = await mkdtemp(tmpdir() + '/failure-matrix-');
-  await Bun.write(scratch + '/bridge', '#!/bin/sh\nexit 1\n');
   // The same constructors the live launcher uses, with the production prefixes.
   const polyClaude = configuredClaudeAccount({ CLAUDE_ACCOUNT_CONFIG_DIR: scratch, CLAUDE_ACCOUNT_MODEL_PREFIX: 'poly', CLAUDE_ACCOUNT_LABEL: 'Polymarket', CLAUDE_ACCOUNT_MODELS: 'claude-opus-5-5,claude-fable-5-1' })?.backend;
   await Bun.write(scratch + '/cursor-auth.json', '{}');
   const polyCursor = configuredCursorBackend({
-    CURSOR_BRIDGE_BIN: scratch + '/bridge', CURSOR_BRIDGE_SHA256: 'a'.repeat(64), CURSOR_AUTH_FILE: scratch + '/cursor-auth.json', CURSOR_CWD: scratch,
+    CURSOR_AUTH_FILE: scratch + '/cursor-auth.json', CURSOR_CWD: scratch,
     CURSOR_EXPECTED_EMAIL: 'fixture@example.com', CURSOR_EXPECTED_USER_ID: 'user_fixture', CURSOR_MODEL_PREFIX: 'poly-cursor', CURSOR_LABEL: 'Cursor',
   });
   for (const row of [polyClaude, polyCursor]) if (row) extraRows.push(row);
