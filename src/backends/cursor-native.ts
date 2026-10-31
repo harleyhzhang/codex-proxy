@@ -3,10 +3,10 @@
 // The router hands those calls to Codex as the turn's output and answers the held callbacks with
 // Codex's results when the next request carries them: the same Cursor run continues instead of being
 // re-prompted, and nothing is parsed out of model text.
-import { timingSafeEqual } from 'node:crypto';
-import { isRecord, randomId, type JsonRecord } from '../json';
+import { equalSecret, isRecord, randomId, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { imageUrl, isImagePart, type ToolDescriptor } from '../protocol/prompt';
+import { checkToolArguments, fieldName } from '../protocol/tool-schema';
 import type { ResponseInputItem, ToolCall } from '../protocol/types';
 
 /** The SDK's MCP provider for host-defined tools; every allowed tool call must target it. */
@@ -14,7 +14,7 @@ export const CUSTOM_TOOLS_PROVIDER = 'custom-user-tools';
 
 type ContentItem = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
 export type ToolResult = { content: ContentItem[]; isError?: boolean };
-export type CustomToolDefinition = { description: string; inputSchema: JsonRecord };
+type CustomToolDefinition = { description: string; inputSchema: JsonRecord };
 
 const RAW_INPUT_NOTE = 'Pass the complete raw input as the string field "input".';
 
@@ -66,6 +66,15 @@ function inputSchema(descriptor: ToolDescriptor): JsonRecord {
   return contract.type === 'object' ? contract : { ...contract, type: 'object' };
 }
 
+/** Why a function call's arguments do not fit its contract, in words the model can act on. */
+function argumentProblem(descriptor: ToolDescriptor, args: unknown): string | undefined {
+  if (!isRecord(args)) return `${descriptor.proxyName} takes a JSON object. The tool did not run.`;
+  const { declared, missing, issue } = checkToolArguments(args, descriptor.contract);
+  const parameters = `its parameters are ${declared.map(fieldName).join(', ')}. The tool did not run.`;
+  if (missing.length) return `${descriptor.proxyName} needs ${missing.map(fieldName).join(', ')}; ${parameters}`;
+  return issue ? `${descriptor.proxyName} has invalid ${issue}; ${parameters}` : undefined;
+}
+
 /** A raw-input tool's string: `input`, or the single string field a model used instead. */
 function rawInput(args: JsonRecord): string | undefined {
   if (typeof args.input === 'string') return args.input;
@@ -74,7 +83,7 @@ function rawInput(args: JsonRecord): string | undefined {
 }
 
 /** The Codex call for a native tool call, or the error the model is told so it can correct itself. */
-export function codexCall(descriptor: ToolDescriptor, args: unknown, callId: string): ToolCall | { error: string } {
+function codexCall(descriptor: ToolDescriptor, args: unknown, callId: string): ToolCall | { error: string } {
   const record = isRecord(args) ? args : {};
   if (descriptor.type === 'custom') {
     const raw = rawInput(record);
@@ -105,7 +114,7 @@ export function toolResult(item: ResponseInputItem): ToolResult {
   return { content: content.length ? content : [{ type: 'text', text: '(no output)' }] };
 }
 
-export type NativeYield = { text: string; calls: ToolCall[]; finished: boolean; usage?: JsonRecord };
+type NativeYield = { text: string; calls: ToolCall[]; finished: boolean; usage?: JsonRecord };
 type Held = { callId: string; respond: (result: ToolResult) => void };
 
 /**
@@ -127,9 +136,7 @@ export class NativeRun {
   private wake?: () => void;
   closed = false;
 
-  /** `validate` names what is wrong with a function call's arguments, or returns undefined. */
-  constructor(readonly byKey: Map<string, ToolDescriptor>, private readonly settleMs: number,
-    private readonly validate: (descriptor: ToolDescriptor, args: unknown) => string | undefined = () => undefined) {}
+  constructor(readonly byKey: Map<string, ToolDescriptor>, private readonly settleMs: number) {}
 
   /** Callback from the bridge: the model called `toolName`. Resolves when Codex's result arrives. */
   call(toolName: string, args: unknown): Promise<ToolResult> {
@@ -138,7 +145,7 @@ export class NativeRun {
     if (!descriptor) return Promise.resolve(errorResult(`Unknown tool ${toolName}; use one of the listed tools.`));
     const callId = randomId('call');
     // Arguments that do not fit the tool go back to the model to fix; Codex never sees them.
-    const invalid = descriptor.type === 'function' ? this.validate(descriptor, args) : undefined;
+    const invalid = descriptor.type === 'function' ? argumentProblem(descriptor, args) : undefined;
     const call = invalid ? { error: invalid } : codexCall(descriptor, args, callId);
     if ('error' in call) {
       logSafe('cursor-native-args-refused', { tool: descriptor.proxyName });
@@ -207,11 +214,6 @@ function errorResult(text: string): ToolResult {
   return { content: [{ type: 'text', text }], isError: true };
 }
 
-function sameSecret(left: string, right: string): boolean {
-  const a = Buffer.from(left), b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
-
 /**
  * The loopback endpoint every bridge of one Cursor login calls for custom tools. A call names its
  * agent; only a run the router registered for that agent can answer it. Held callbacks have no
@@ -228,7 +230,7 @@ export class NativeCallbackServer {
       fetch: async (req, server) => {
         server.timeout(req, 0);
         if (req.method !== 'POST' || new URL(req.url).pathname !== '/sdk.v1.SdkCustomToolCallbackService/CallCustomTool') return new Response('not found', { status: 404 });
-        if (!sameSecret(req.headers.get('authorization') ?? '', `Bearer ${this.token}`)) return new Response('unauthorized', { status: 401 });
+        if (!equalSecret(req.headers.get('authorization') ?? '', `Bearer ${this.token}`)) return new Response('unauthorized', { status: 401 });
         let body: unknown;
         try { body = await req.json(); } catch { return Response.json({ code: 'invalid_argument', message: 'invalid JSON' }, { status: 400 }); }
         const agentId = isRecord(body) && typeof body.agentId === 'string' ? body.agentId : '';

@@ -11,7 +11,7 @@ import { isRecord, randomId } from '../json';
 import { logSafe } from '../log';
 import { continuationRequest, type ImageBlock, outputSchema, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponsesRequest } from '../protocol/types';
-import { transportError } from '../transport';
+import { abortable, transportError } from '../transport';
 import { claudeLimits, ClaudeUsageLimits, ClaudeUsageLimitError } from './claude-limits';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, type SubscriptionBackend } from './contract';
 
@@ -55,13 +55,13 @@ export function reportedUsage(usage: unknown): { promptTokens: number; outputTok
   return promptTokens > 0 ? { promptTokens, outputTokens: count('output_tokens') } : undefined;
 }
 
-export function resolveEffort(request: ResponsesRequest): string {
+function resolveEffort(request: ResponsesRequest): string {
   const effort = request.reasoning?.effort ?? 'high';
   if (!(EFFORTS as readonly string[]).includes(effort)) throw new Error(`Unsupported staged effort: ${effort}`);
   return effort;
 }
 
-export function resolveModel(model: string): string {
+function resolveModel(model: string): string {
   const resolved = MODEL_ALIASES[model] ?? model;
   const known = resolved.startsWith('claude-') || ['opus', 'sonnet', 'haiku'].includes(resolved);
   if (!/^[a-zA-Z0-9._-]+$/.test(resolved) || !known) throw new Error(`Unsupported Claude model: ${model}`);
@@ -224,12 +224,7 @@ export class ClaudeAccount {
     const probe = current && current.binding === binding && !current.controller.signal.aborted ? current : this.startProbe(binding);
     probe.waiters++;
     try {
-      if (!signal) await probe.done;
-      else await new Promise<void>((resolve, reject) => {
-        const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error('Claude request cancelled'));
-        signal.addEventListener('abort', abort, { once: true });
-        probe.done.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
-      });
+      await abortable(probe.done, signal);
     } finally {
       // The last caller to give up stops the probe; one cancelled turn never fails the others.
       if (--probe.waiters === 0 && signal?.aborted) {
@@ -387,7 +382,7 @@ export class ClaudeAccount {
   }
 }
 
-export const primaryClaudeAccount = new ClaudeAccount({expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG}, claudeLimits);
+const primaryClaudeAccount = new ClaudeAccount({expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG}, claudeLimits);
 export function onClaudeRateLimit(sink: (info: unknown) => void): void { primaryClaudeAccount.onRateLimit(sink); }
 
 type PendingTurn = { resolve: (result: ClaudeResult) => void; reject: (error: Error) => void };

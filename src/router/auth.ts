@@ -1,18 +1,11 @@
 // Only the local Codex client may use the router. It must present the same ChatGPT token that
 // Codex itself stores in auth.json; the router never stores, refreshes or logs that token.
-import { timingSafeEqual } from 'node:crypto';
-import { isRecord } from '../json';
+import { equalSecret, isRecord } from '../json';
 
 /** After Codex refreshes its token, requests already in flight may still carry the old one. */
 const ROTATION_GRACE_MS = 60_000;
 
 type Identity = { token: string; account: string };
-
-export function equalSecret(left: string, right: string): boolean {
-  const a = Buffer.from(left);
-  const b = Buffer.from(right);
-  return a.length === b.length && timingSafeEqual(a, b);
-}
 
 async function readIdentity(file: string): Promise<Identity | undefined> {
   const auth: unknown = await Bun.file(file).json();

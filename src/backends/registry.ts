@@ -8,7 +8,7 @@ import { withOpusQuotaFallback } from './quota-fallback';
 
 export const secondaryClaude = configuredClaudeAccount();
 
-export const cursorBackend = configuredCursorBackend();
+const cursorBackend = configuredCursorBackend();
 if (process.env.CURSOR_CLAUDE_ACCOUNT_FALLBACK === '1' && (!secondaryClaude || !cursorBackend)) throw new Error('Cursor Claude fallback requires both a secondary Claude account and Cursor backend');
 const workClaude = secondaryClaude && (cursorBackend && process.env.CURSOR_CLAUDE_ACCOUNT_FALLBACK === '1' ? withOpusQuotaFallback(secondaryClaude.backend, cursorBackend) : secondaryClaude.backend);
 export const BACKENDS: readonly SubscriptionBackend[] = [claudeBackend, grokBackend, ...(workClaude ? [workClaude] : []), ...(cursorBackend ? [cursorBackend] : [])];

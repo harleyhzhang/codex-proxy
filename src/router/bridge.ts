@@ -11,7 +11,7 @@ import type { ResponseContentPart, ResponseInputItem, ResponsesBody } from '../p
 import type { SummaryCodec } from './capsule';
 
 /** OpenAI ciphertext starts with this Fernet-style prefix. */
-export const isOpenAICiphertext = (value: unknown): value is string => typeof value === 'string' && value.startsWith('gAAAA');
+const isOpenAICiphertext = (value: unknown): value is string => typeof value === 'string' && value.startsWith('gAAAA');
 
 /** GPT models tried in order to read OpenAI ciphertext for a subscription model. */
 export const DEFAULT_BRIDGE_MODELS = ['gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-astra'];
@@ -88,7 +88,7 @@ export function extractAgentMessage(raw: string): string | { reason: string } {
   return message;
 }
 
-export type UpstreamCall = (body: ResponsesBody) => Promise<Response>;
+type UpstreamCall = (body: ResponsesBody) => Promise<Response>;
 
 /** Reads OpenAI ciphertext through GPT once per payload, caching each result sealed on disk. */
 export class CompactionBridge {

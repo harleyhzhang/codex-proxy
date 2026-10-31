@@ -72,6 +72,25 @@ export function failureStream(event: unknown): Response {
   });
 }
 
+/** Waits `ms`, or rejects with the signal's reason as soon as it aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return abortable(new Promise<void>(resolve => { const timer = setTimeout(resolve, ms); signal?.addEventListener('abort', () => clearTimeout(timer), { once: true }); }), signal);
+}
+
+/**
+ * Awaits `promise`, but rejects with the signal's reason as soon as this caller aborts. The promise
+ * itself keeps running, so one cancelled waiter on shared work never fails the others.
+ */
+export function abortable<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise<T>((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
 // Nothing has reached Codex yet (a buffered backend, or an upstream connection that never opened).
 // Keep the same request pending through an outage instead of consuming Codex's finite
 // stream-reconnect budget. A real model timeout, auth/quota refusal or cancellation still follows
@@ -90,11 +109,7 @@ export async function reconnectTransport<T>(attempt: () => Promise<T>, signal?: 
       const network = transportError(error);
       if (!network || !network.reconnectable) throw error;
       options.onRetry?.(attempts, delay);
-      await new Promise<void>((resolve, reject) => {
-        const cancel = () => { clearTimeout(timer); reject(signal!.reason); };
-        const timer = setTimeout(() => { signal?.removeEventListener('abort', cancel); resolve(); }, delay);
-        signal?.addEventListener('abort', cancel, { once: true });
-      });
+      await sleep(delay, signal);
       delay = Math.min(delay * 2, maxDelay);
     }
   }

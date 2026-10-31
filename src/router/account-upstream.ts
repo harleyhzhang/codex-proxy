@@ -104,13 +104,13 @@ export async function nativeAccountRequest(options: AccountOptions, method: 'acc
 }
 
 /** Native Codex owns refresh-token rotation and its credential-file persistence. */
-export async function refreshAccount(options: AccountOptions): Promise<void> {
+async function refreshAccount(options: AccountOptions): Promise<void> {
   await nativeAccountRequest(options, 'account/read', { refreshToken: true });
 }
 
 /** Native Codex rewrites models_cache.json as a side effect of listing models; the bundled binary
  *  always asks as a current client, so a cache left behind by an outdated CLI gets repaired. */
-export async function refreshCatalog(options: AccountOptions): Promise<void> {
+async function refreshCatalog(options: AccountOptions): Promise<void> {
   await nativeAccountRequest(options, 'model/list', {});
 }
 

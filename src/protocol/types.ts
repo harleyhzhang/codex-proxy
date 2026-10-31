@@ -63,7 +63,7 @@ export type ResponsesBody = Partial<ResponsesRequest> & {
 
 export type ToolCall = { name: string; arguments: string; callId?: string };
 
-export type Usage = { inputTokens: number; outputTokens: number; totalTokens: number };
+type Usage = { inputTokens: number; outputTokens: number; totalTokens: number };
 
 /** What a subscription backend returns for one turn. */
 export type ProxyOutput = { text: string; toolCalls: ToolCall[]; usage: Usage };
@@ -71,7 +71,7 @@ export type ProxyOutput = { text: string; toolCalls: ToolCall[]; usage: Usage };
 export type OutputItem = { type: string; id?: string; [key: string]: unknown };
 
 /** Token accounting in the Responses API wire format. */
-export type ResponseUsage = {
+type ResponseUsage = {
   input_tokens: number;
   input_tokens_details?: { cached_tokens: number };
   output_tokens: number;

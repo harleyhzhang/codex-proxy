@@ -49,8 +49,7 @@ non-generating connection warmup. A continuation sends only new input when its
 previous response and complete history prefix match the same connection.
 Account, authorization or model changes start a new connection; a lost upstream
 response earns one full-history replay before output is exposed. Unsupported
-upgrades fall back to HTTP. HTTP clients continue to use HTTP. Set
-`UPSTREAM_WEBSOCKET=0` to use the former HTTP relay for every client.
+upgrades fall back to HTTP. HTTP clients continue to use HTTP.
 
 Secondary-account identity checks, token refresh and speed policies are shared
 by both transports. Each client's connection and history stay separate.
@@ -247,57 +246,50 @@ bun run catalog
 bun start
 ```
 
-The picker adds **Kimi K3 (Work)**, **Grok 4.7 (Work)** and **Opus 5.5 via
-Cursor (Work)**, with their own supported reasoning choices. Kimi is text-only
-with a conservative 200K context cap; Grok supports images and 256K, and Opus
-supports images and 1M. Reopen Codex after catalog changes.
+The picker adds **Kimi K3 (Work)**, **Grok 4.7 (Work)**, **Opus 5.5 via
+Cursor (Work)** and **Muse Wonder (Work)**, with their own supported reasoning
+choices. Kimi is text-only with a conservative 200K context cap; Grok supports
+images and 256K, Opus images and 1M, and Muse Wonder images and 300K. Reopen
+Codex after catalog changes.
 
 Each request verifies the pinned executable and authenticated account, uses
 credential-bound account/catalog discovery cached for five minutes, and
 validates the exact model parameters. A bounded pool reuses local bridges;
-each bridge runs only one request at a time. Fresh agents get a separate empty
-working directory, an empty built-in tool list, no setting sources, no MCP and
-no subagents. A validated tool call can retain its agent for the next tool
-result, sending only the new history. Reuse requires matching model parameters,
-instructions, tools and the complete model-visible history prefix. Changed
-history, credentials or expired sessions start a fresh agent with full replay.
-Codex tool calls are parsed and validated before returning any actions. Native
-Cursor tool/compaction events, unsupported attachments, model substitutions,
-partial output and failed streams are refused. Cancellation ends only that
-request's exclusively leased bridge; cancelling a queued request leaves active
-runs alone. Idle bridges and their stores are removed after two minutes by
-default. Idle retained agents yield immediately when other work needs a bridge.
-Cursor's SDK sandbox helper is unavailable in the tested standalone macOS build;
-this adapter enforces no native actions through the tool list and event guard.
-Codex's own execution sandbox and approvals still apply to returned calls.
+each bridge runs one request at a time. Every agent gets its own empty working
+directory, no setting sources and no subagents.
 
-**Native tool calls (default).** Codex's client tools are registered with the
-agent as SDK custom tools (`local.customTools`), and the bridge is pointed at a
-loopback callback with `SetToolCallback`. The model calls them as real tool
-calls; each call arrives at the router as `CallCustomTool` and is held while the
-router hands it to Codex as an ordinary `function_call`/`custom_tool_call`. When
-Codex's next request carries the results, the held callbacks are answered and the
-same Cursor run continues: no new agent, no re-prompt and nothing parsed out of
-model text. Calls written within `CURSOR_TOOL_SETTLE_MS` (350 ms) of each other
-are returned together as one parallel step. The agent's allowed tools are only
-the `mcp` group and its only MCP server is the router's, so it has no shell,
-edit, read, web or subagent tool; any other tool event stops the turn. Function
-arguments that miss a required field or break the schema go back to the model to
-fix and never reach Codex. Tool results keep inline images. A run waiting on
-Codex holds its bridge up to `CURSOR_SESSION_IDLE_MS`; when held runs fill the
-pool, the one waiting longest is cancelled and replays if continued later. A
-changed history, a tool search or a user message mid-run also replays in a
-fresh agent. `CURSOR_NATIVE_TOOLS=0` restores the JSON-envelope path with its
-output repairs and retries.
+Codex's client tools are registered with the agent as SDK custom tools
+(`local.customTools`), and each bridge is pointed at a loopback callback with
+`SetToolCallback`. The model calls them as real tool calls; each call arrives at
+the router as `CallCustomTool` and is held while the router hands it to Codex as
+an ordinary `function_call`/`custom_tool_call`. When Codex's next request carries
+the results, the held callbacks are answered and the same Cursor run continues:
+no new agent, no re-prompt and nothing parsed out of model text. Calls written
+within `CURSOR_TOOL_SETTLE_MS` (350 ms) of each other are returned together as
+one parallel step. The agent's allowed tools are only the `mcp` group and its
+only MCP server is the router's, so it has no shell, edit, read, web or subagent
+tool; any other tool event stops the turn. Function arguments that miss a
+required field or break the schema go back to the model to fix and never reach
+Codex. Tool results keep inline images.
+
+A run continues only when its model parameters, instructions, tools, credential
+and complete model-visible history prefix are unchanged and the request answers
+exactly the held calls; anything else (a user message mid-run, a tool search, a
+rotated login) cancels it and replays the history in a fresh agent. A run waiting
+on Codex holds its bridge up to `CURSOR_SESSION_IDLE_MS`; when held runs fill the
+pool, the one waiting longest is cancelled and replays if continued later.
+Unsupported attachments, model substitutions and failed streams are refused.
+Cancellation ends only that request's exclusively leased bridge. A finished turn
+returns at once while its bridge stays leased until `CloseAgent` completes. Idle
+bridges and their stores are removed after two minutes by default. Cursor's SDK
+sandbox helper is unavailable in the tested standalone macOS build; this adapter
+enforces no native actions through the tool list and event guard. Codex's own
+execution sandbox and approvals still apply to returned calls.
 
 The default pool holds at most eight bridges, bounding local process and memory
-pressure during helper fan-out. `CURSOR_MAX_BRIDGES` tunes that bound. Set
-`CURSOR_SESSION_REUSE=0` to keep bridge pooling but replay each agent in full,
-or `CURSOR_BRIDGE_REUSE=0` to restore the former per-request process lifecycle.
-Neither setting changes the selected model, reasoning effort, speed policy or
-context limit. Content-free `cursor-turn` phase counters distinguish queue,
-setup, generation and continuation reuse; `cursor-cleanup` reports cleanup
-after validated output has been delivered.
+pressure during helper fan-out; `CURSOR_MAX_BRIDGES` tunes that bound.
+Content-free `cursor-turn` counters record setup time, continuation and call
+counts.
 
 To enable **secondary Opus only → Cursor Opus** on a typed Claude quota refusal:
 
@@ -337,7 +329,6 @@ Everything has a default; set only what you need.
 | `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
-| `UPSTREAM_WEBSOCKET` | `1` | Keep GPT WebSocket clients on native upstream WebSockets; `0` uses HTTP upstream |
 | `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |
 | `CLAUDE_BIN` | `claude` | Claude CLI path |
 | `CLAUDE_CONFIG_DIR` | CLI default | Primary Claude login/configuration directory |
@@ -356,13 +347,10 @@ Everything has a default; set only what you need.
 | `CLAUDE_STANDBY_MAX` | `3` | Unused prewarmed CLIs per account, one per distinct launch (model, effort, tool set), least recently wanted evicted first; each idles at about 125-190 MB; `0` disables prewarming |
 | `CLAUDE_STANDBY_IDLE_MS` | `900000` | Lifetime of an unused prewarmed Claude CLI (also started by a chat-open warmup) |
 | `CURSOR_MAX_BRIDGES` | `8` | Resident Cursor bridge bound, including startup and cleanup; maximum `32` |
-| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges; a bridge holding a retained tool session stays until that session expires |
+| `CURSOR_BRIDGE_IDLE_MS` | `120000` | Idle lifetime of extra bridges |
 | `CURSOR_WARM_BRIDGES` | `1` | Idle bridges per login kept for `CURSOR_WARM_BRIDGE_IDLE_MS` instead; a chat-open warmup also starts one |
 | `CURSOR_WARM_BRIDGE_IDLE_MS` | `900000` | Idle lifetime of those warm bridges |
-| `CURSOR_SESSION_IDLE_MS` | `900000` | Maximum age of a retained Cursor tool session |
-| `CURSOR_BRIDGE_REUSE` | `1` | `0` restores one bridge process per request |
-| `CURSOR_SESSION_REUSE` | `1` | `0` disables agent continuation while retaining bridge pooling |
-| `CURSOR_NATIVE_TOOLS` | `1` | `0` returns to the JSON-envelope tool path (prompted tool list, parsed and repaired output) |
+| `CURSOR_SESSION_IDLE_MS` | `900000` | How long a run waiting on Codex tool results holds its bridge |
 | `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
 | `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |
 | `GROK_CWD` | unset | Empty working directory for Grok |
@@ -390,9 +378,7 @@ pause the backend for review rather than allowing unverified target contents.
 Valid JSON argument strings retain their exact semantics; malformed string
 escapes can be repaired, and nested tool contracts are validated before any
 action reaches Codex. Explicit new user rechecks and agent-wait polling are
-not treated as stuck repeated reads. Cursor models can repair malformed output
-in the same agent with a bounded correction budget. Authentication, native
-action attempts, model changes and cancelled runs never use that repair path.
+not treated as stuck repeated reads.
 
 The CLI must receive `--verbatim`: Grok Build 1.0.46 otherwise replaces prompts
 over roughly 100 KB with excerpts and an archive pointer, losing history and

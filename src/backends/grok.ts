@@ -1,18 +1,18 @@
 // Grok through the official Grok Build CLI. Subscription access stays with the CLI; its OAuth token
 // is never read or forwarded. Every turn runs in a fresh, private directory with native tools
 // removed, denied and hooked, so Codex remains the only thing that executes actions.
-import { existsSync, lstatSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
-import { isRecord, type JsonRecord, randomId, sha256 } from '../json';
+import { isRecord, type JsonRecord, pinnedFileHash, randomId, sha256 } from '../json';
 import { logSafe } from '../log';
 import { outputSchema, preparePrompt, requestToPrompt, requestTools, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
 import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 import { transportError } from '../transport';
-import { sameToolArguments, toolSchemaIssue } from '../protocol/tool-schema';
+import { checkToolArguments, fieldName, sameToolArguments } from '../protocol/tool-schema';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
@@ -39,7 +39,7 @@ const NATIVE_TOOLS = [
 const ALLOWED_TOOLS = 'read_file';
 const DENIED_TOOLS = ['Bash', 'Read', 'Grep', 'Edit', 'Write', 'WebFetch', 'MCPTool'];
 /** The message the PreToolUse hook (scripts/grok-deny-native.py) returns for every native call. */
-export const NATIVE_DENIAL = 'Native Grok actions disabled: Codex owns execution';
+const NATIVE_DENIAL = 'Native Grok actions disabled: Codex owns execution';
 
 /**
  * Each hook denial of a native attempt costs Grok one internal turn. Three left no room after a
@@ -241,21 +241,12 @@ export function checkArgumentShape(name: string, raw: string, contract: unknown)
   let args: unknown;
   try { args = JSON.parse(raw); } catch { throw new GrokError('Grok returned invalid tool arguments; no tools were executed', true, true); }
   if (!isRecord(args)) throw new GrokError('Grok tool arguments must be a JSON object; no tools were executed', true, true);
-  const properties = isRecord(contract) && isRecord(contract.properties) ? contract.properties : undefined;
-  const declared = properties ? Object.keys(properties) : [];
-  const required = isRecord(contract) && Array.isArray(contract.required) ? contract.required.filter((key): key is string => typeof key === 'string') : [];
-  const missing = required.filter(key => !Object.hasOwn(args, key));
-  const unexpected = properties && isRecord(contract) && contract.additionalProperties === false && !contract.patternProperties ? Object.keys(args).filter(key => !Object.hasOwn(properties, key)) : [];
-  const fieldName = (key: string) => (/^[A-Za-z0-9_.-]{1,64}$/.test(key) ? key : '(invalid name)');
+  const { declared, missing, dropped: unexpected, issue } = checkToolArguments(args, contract);
   if (missing.length) {
     logSafe('grok-argument-shape', { tool: name, missing: missing.length, dropped: 0 });
     const got = unexpected.length ? `; got ${unexpected.map(fieldName).join(', ')}` : '';
     throw new GrokError(`Grok called ${name} without its required ${missing.map(fieldName).join(', ')}${got}. Its parameters are ${declared.map(fieldName).join(', ')}; no tools were executed`, true, true);
   }
-  // Preserve the existing harmless-extra tolerance at the top level. Nested contracts are checked
-  // recursively, including required fields, unions, arrays, types, enums and additional properties.
-  for (const key of unexpected) delete args[key];
-  const issue = toolSchemaIssue(args, contract);
   if (issue) {
     logSafe('grok-argument-shape', { tool: name, missing: 0, dropped: unexpected.length, invalid: true });
     throw new GrokError(`Grok called ${name} with invalid ${issue}; no tools were executed`, true, true);
@@ -421,8 +412,6 @@ export function grokOutputSchema(tools: ResponseTool[]): Record<string, unknown>
   return schema;
 }
 
-const ARGUMENT_RULES =
-  ' Each arguments value is a JSON string that itself contains JSON, so inside it every backslash must be written as \\\\ and every double quote inside a value as \\". For example, the shell regex a\\.b inside a command becomes a\\\\.b in the inner JSON.';
 const SYSTEM_PROMPT = `You are the model inside the Codex external agent loop. The listed Codex tools are real, available tools. Request them using the exact name and arguments in the required structured tool_calls JSON output. Your output must be an object with text (string) and tool_calls (array). Each call must have name (exact listed string) and arguments. For a function tool, arguments is the JSON object with the tool parameters, written directly as an object, not a second JSON encoding. For a custom tool, arguments is the exact raw input string. Ordinary JSON escaping still applies to string values; do not add an extra JSON-encoding layer to function objects. Your native Grok tools, search and subagents are disabled; the listed Codex tools are not. When Codex lists collaboration.spawn_agent, wait_agent or other collaboration tools, use those tools directly to create or wait for helpers. Do not emulate a Codex subagent or poll for it with shell commands or a nested CLI. Use a completed helper response without polling it again, then continue any remaining requested work. Finish only when the user's whole task is complete. To run a command or read a file, return the listed Codex tool (for example exec_command) in tool_calls; Codex owns all execution. Never claim a tool executed without its result in history.`;
 
 /** Headless flags: `--tools` only takes effect in headless mode, never under ACP. */
@@ -491,26 +480,13 @@ const MEDIA_PARTS = new Set(['input_file', 'input_audio', 'audio', 'file', 'inpu
 /** An uploaded image referenced by id carries no inline data, so it would vanish from the prompt. */
 const IMAGE_PARTS = new Set(['input_image', 'image']);
 
-/**
- * The pinned binary's hash, recomputed only when the file's identity or timestamps change. Hashing
- * the 150 MB CLI cost about 60 ms and a 150 MB allocation on every attempt; a replaced, rewritten or
- * re-permissioned file changes its inode, size, mtime or ctime and is hashed again before it runs.
- */
-let pinnedBinary: { key: string; hash: string } | undefined;
-function pinnedBinaryHash(binary: string): string {
-  const stat = statSync(binary);
-  const key = [binary, stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs].join(':');
-  if (pinnedBinary?.key !== key) pinnedBinary = { key, hash: sha256(readFileSync(binary)) };
-  return pinnedBinary.hash;
-}
-
 /** Integrity gates: a changed native profile or binary pauses the backend until it is reviewed. */
 function grokInstallation(): { binary: string; cwd: string } {
   const { GROK_BIN: binary, GROK_CWD: cwd, GROK_PROFILE_SHA256: profileHash, GROK_BIN_SHA256: binaryHash } = process.env;
   if (profileHash && grokProfileHash() !== profileHash) {
     throw new GrokError('Grok native configuration changed; backend paused pending isolation review');
   }
-  if (binary && binaryHash && pinnedBinaryHash(binary) !== binaryHash) throw new GrokError('Grok pinned binary changed; backend paused');
+  if (binary && binaryHash && pinnedFileHash(binary) !== binaryHash) throw new GrokError('Grok pinned binary changed; backend paused');
   if (!binary || !cwd) throw new GrokError('Grok Build backend is not configured');
   return { binary, cwd };
 }

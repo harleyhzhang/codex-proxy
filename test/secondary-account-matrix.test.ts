@@ -68,8 +68,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
   if (path.endsWith('/CancelRun') || path.endsWith('/CloseAgent')) return json({});
   if (path.endsWith('/Send')) {
     appendFileSync('${scratch}/send.log', 's\\n');
-    const run = { result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result: JSON.stringify({ text: 'CURSOR_OPUS_OK', tool_calls: [] }), model: { id: 'claude-opus-5-5', params: [{ id: 'effort', value: 'high' }, { id: 'context', value: '1m' }, { id: 'fast', value: 'false' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } };
-    // The reply streams as assistant text (native path) and is the run result (JSON-envelope path).
+    const run = { result: { status: FINISHED, runId: 'run-1', result: { status: FINISHED, result: 'CURSOR_OPUS_OK', model: { id: 'claude-opus-5-5', params: [{ id: 'effort', value: 'high' }, { id: 'context', value: '1m' }, { id: 'fast', value: 'false' }] }, usage: { inputTokens: 3, outputTokens: 2 } } } };
     const said = { sdkMessage: { type: 'assistant', message: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'CURSOR_OPUS_OK' }] } } } };
     return new Response(Buffer.concat([frame(0, said), frame(0, run), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers: { 'content-type': 'application/connect+json' } });
   }

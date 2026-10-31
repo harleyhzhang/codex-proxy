@@ -2,7 +2,6 @@ import {test,expect} from 'bun:test';
 import { items, firstText, unwrap } from './support';
 import { grokEnvironment, parseGrokOutput, runGrok } from '../src/backends/grok';
 import { SummaryCodec, compactRequest } from '../src/router/capsule';
-import { HistoryCache } from '../src/router/history';
 import { localResponse } from '../src/router/local';
 import { normalizeAgentPayloads } from '../src/router/bridge';
 const tools:any[]=[{type:'namespace',name:'functions',tools:[{type:'custom',name:'exec'}]},{type:'function',name:'read'}];

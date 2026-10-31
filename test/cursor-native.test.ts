@@ -2,21 +2,18 @@
 // arrive as SDK custom tools, the model's calls come back over the host callback, and the run waits
 // for the router's answer before it continues. The script is chosen by a word in the prompt.
 import { afterAll, beforeAll, expect, test } from 'bun:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { createCursorBackend, type CursorBackend } from '../src/backends/cursor';
 import { isRecord, sha256, type JsonRecord } from '../src/json';
 import { responseObject } from '../src/protocol/output';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest } from '../src/protocol/types';
 
-const saved = { native: process.env.CURSOR_NATIVE_TOOLS, settle: process.env.CURSOR_TOOL_SETTLE_MS };
-beforeAll(() => { process.env.CURSOR_NATIVE_TOOLS = '1'; process.env.CURSOR_TOOL_SETTLE_MS = '60'; });
-afterAll(() => {
-  if (saved.native === undefined) delete process.env.CURSOR_NATIVE_TOOLS; else process.env.CURSOR_NATIVE_TOOLS = saved.native;
-  if (saved.settle === undefined) delete process.env.CURSOR_TOOL_SETTLE_MS; else process.env.CURSOR_TOOL_SETTLE_MS = saved.settle;
-});
+const savedSettle = process.env.CURSOR_TOOL_SETTLE_MS;
+beforeAll(() => { process.env.CURSOR_TOOL_SETTLE_MS = '60'; });
+afterAll(() => { if (savedSettle === undefined) delete process.env.CURSOR_TOOL_SETTLE_MS; else process.env.CURSOR_TOOL_SETTLE_MS = savedSettle; });
 
-type Fixture = { backend: CursorBackend; events(): Promise<JsonRecord[]> };
+type Fixture = { backend: CursorBackend; root: string; binary: string; auth: string; source: string; events(): Promise<JsonRecord[]> };
 async function fixture(run: (fixture: Fixture) => Promise<void>, limit?: number): Promise<void> {
   const root = await mkdtemp(tmpdir() + '/cursor-native-');
   const binary = root + '/bridge', auth = root + '/auth.json';
@@ -27,22 +24,31 @@ const event = (operation, fields = {}) => appendFileSync(root + '/events.jsonl',
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
 const frame = (value) => { const data = Buffer.from(JSON.stringify(value)), header = Buffer.alloc(5); header.writeUInt32BE(data.length, 1); return Buffer.concat([header, data]); };
 let callback; const agents = new Map(); let next = 0;
+event('start');
 const say = (text) => frame({ sdkMessage: { type: 'assistant', message: { type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text }] } } } });
 const server = Bun.serve({ hostname: '127.0.0.1', port: 0, idleTimeout: 255, async fetch(req) {
   const method = new URL(req.url).pathname.split('/').at(-1);
-  if (method === 'Me') return Response.json({ user: { userEmail: 'test@example.com', userId: 'fixture' } });
+  if (method === 'Me') return Response.json({ user: { userEmail: process.env.CURSOR_API_KEY === 'wrong-owner' ? 'other@example.com' : 'test@example.com', userId: 'fixture' } });
   if (method === 'ListModels') return Response.json({ items: [{ id: 'kimi-k3', parameters: [{ id: 'reasoning', values: [{ value: 'high' }] }] }] });
   const bytes = Buffer.from(await req.arrayBuffer());
   const body = JSON.parse((method === 'Send' ? bytes.subarray(5) : bytes).toString());
   if (method === 'SetToolCallback') { callback = body; event('callback-set'); return Response.json({}); }
-  if (method === 'CreateAgent') { const agentId = 'agent-' + (++next); agents.set(agentId, body.options); event('create', { agentId, tools: body.options.tools, disallowed: body.options.disallowedTools, custom: body.options.local.customTools ?? null }); return Response.json({ agentId }); }
+  if (method === 'CreateAgent') { const agentId = process.pid + '-' + (++next); agents.set(agentId, { ...body.options }); event('create', { agentId, cwd: body.options.local.cwd[0], tools: body.options.tools, disallowed: body.options.disallowedTools, custom: body.options.local.customTools ?? null }); return Response.json({ agentId }); }
   if (method === 'CancelRun') { event('cancel', { agentId: body.agentId }); return Response.json({}); }
-  if (method === 'CloseAgent') { event('close', { agentId: body.agentId }); return Response.json({}); }
+  if (method === 'CloseAgent') {
+    const agent = agents.get(body.agentId); event('close', { agentId: body.agentId });
+    if (agent?.slowClose) await Bun.sleep(350);
+    if (agent?.failClose) return new Response('{}', { status: 500 });
+    event('close-end', { agentId: body.agentId }); return Response.json({});
+  }
   if (method !== 'Send') return new Response('{}', { status: 404 });
   const agentId = body.agentId, prompt = body.message.text, runId = 'run-' + agentId;
-  event('send', { agentId, text: prompt });
+  event('send', { agentId, text: prompt, images: body.message.images?.length ?? 0 });
   // Like a model, act on the newest user message; a replay carries the whole transcript.
   const text = prompt.slice(prompt.lastIndexOf('<user>'));
+  if (text.includes('SLOW_CLOSE')) agents.get(agentId).slowClose = true;
+  if (text.includes('FAIL_CLOSE')) agents.get(agentId).failClose = true;
+  if (text.includes('SLOW_TURN')) await Bun.sleep(150);
   const call = async (toolName, args) => {
     const response = await fetch(callback.url + '/sdk.v1.SdkCustomToolCallbackService/CallCustomTool', { method: 'POST', headers: { authorization: 'Bearer ' + callback.authToken, 'content-type': 'application/json' }, body: JSON.stringify({ toolName, args, toolCallId: 'tc-' + toolName, agentId }) });
     const result = (await response.json()).result;
@@ -86,7 +92,7 @@ await new Promise(() => {});
   if (limit) process.env.CURSOR_MAX_BRIDGES = String(limit);
   const backend = createCursorBackend({ binary, binaryHash: sha256(source), authFile: auth, cwd: root, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'fixture', label: 'Fixture' });
   const events = async () => (await readFile(root + '/events.jsonl', 'utf8').catch(() => '')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line) as unknown).filter(isRecord);
-  try { await run({ backend, events }); }
+  try { await run({ backend, root, binary, auth, source, events }); }
   finally {
     await backend.close(); await rm(root, { recursive: true, force: true });
     if (savedLimit === undefined) delete process.env.CURSOR_MAX_BRIDGES; else process.env.CURSOR_MAX_BRIDGES = savedLimit;
@@ -239,3 +245,145 @@ test('the prompt lists each tool schema and names the raw-input tools, so no dis
   expect(prompt).toContain('- echo: {"type":"object","properties":{"value":{"type":"string"}}');
   expect(prompt).toContain('Only apply_patch takes one raw string');
 }));
+
+async function waitFor(events: Fixture['events'], operation: string, times = 1): Promise<void> {
+  for (let i = 0; i < 400 && count(await events(), operation) < times; i++) await Bun.sleep(5);
+  if (count(await events(), operation) < times) throw new Error('fixture event missing: ' + operation);
+}
+
+test('recognized image parts travel as SDK attachments while ordinary tool metadata stays in text', () => fixture(async f => {
+  const inline = 'data:image/png;base64,AAAA';
+  await f.backend.run({ ...request('PLAIN'), tools: [], input: [
+    { role: 'user', content: [{ type: 'input_text', text: 'PLAIN describe' }, { type: 'image', mimeType: 'image/png', data: 'AAAA' }] },
+    { type: 'computer_call_output', call_id: 'typed', output: { type: 'computer_screenshot', image_url: inline } },
+    { type: 'computer_call_output', call_id: 'legacy', output: { image_url: inline } },
+    { type: 'function_call_output', call_id: 'metadata', output: { image_url: 'https://example.invalid/metadata.png', file_id: 'database-row' } },
+  ] as ResponseInputItem[] });
+  const send = (await f.events()).find(event => event.operation === 'send');
+  expect(send?.images).toBe(3);
+  expect(String(send?.text)).toContain('https://example.invalid/metadata.png');
+  expect(f.backend.catalog.find(model => model.slug === 'fixture-grok-4.7')?.inputModalities).toEqual(['text', 'image']);
+  expect(f.backend.catalog.find(model => model.slug === 'fixture-kimi-k3')?.inputModalities).toEqual(['text']);
+}));
+
+test('a finished turn returns before a slow CloseAgent, and the bridge stays leased until cleanup ends', () => fixture(async f => {
+  expect((await f.backend.run(request('PLAIN SLOW_CLOSE'))).text).toBe('hello');
+  expect(count(await f.events(), 'close-end')).toBe(0);
+  const second = f.backend.run(request('PLAIN another'));
+  await Bun.sleep(20);
+  expect(count(await f.events(), 'create')).toBe(1);
+  expect((await second).text).toBe('hello');
+  expect(count(await f.events(), 'start')).toBe(1);
+}, 1));
+
+test('a failed CloseAgent discards the bridge and frees its capacity', () => fixture(async f => {
+  expect((await f.backend.run(request('PLAIN FAIL_CLOSE'))).text).toBe('hello');
+  expect((await f.backend.run(request('PLAIN after'))).text).toBe('hello');
+  expect(count(await f.events(), 'start')).toBe(2);
+}, 1));
+
+test('cancelling one turn stops only its own bridge; a concurrent turn completes', () => fixture(async f => {
+  const controller = new AbortController();
+  const cancelled = f.backend.run(request('HANG'), controller.signal).catch((error: unknown) => error);
+  await waitFor(f.events, 'send');
+  const other = f.backend.run(request('PLAIN SLOW_TURN'));
+  await Bun.sleep(20);
+  controller.abort(new Error('cancel fixture'));
+  expect(await cancelled).toBeInstanceOf(Error);
+  expect((await other).text).toBe('hello');
+  expect(count(await f.events(), 'start')).toBe(2);
+}));
+
+test('a parked bridge that died is replaced', () => fixture(async f => {
+  await f.backend.run(request('PLAIN'));
+  await waitFor(f.events, 'close-end');
+  process.kill(Number((await f.events()).find(event => event.operation === 'start')?.pid), 'SIGKILL');
+  await Bun.sleep(20);
+  expect((await f.backend.run(request('PLAIN again'))).text).toBe('hello');
+  expect(count(await f.events(), 'start')).toBe(2);
+}));
+
+test('a queued turn rechecks the executable pin and the credential once it gets a bridge', () => fixture(async f => {
+  await f.backend.run(request('PLAIN SLOW_CLOSE'));
+  const pinned = f.backend.run(request('PLAIN queued')).catch((error: unknown) => error);
+  await Bun.sleep(10);
+  await writeFile(f.binary, f.source + '\n// changed while queued');
+  expect(String(await pinned)).toContain('pinned bridge changed');
+  await writeFile(f.binary, f.source);
+  await f.backend.run(request('PLAIN SLOW_CLOSE'));
+  const rotated = f.backend.run(request('PLAIN queued'));
+  await Bun.sleep(10);
+  await writeFile(f.auth, JSON.stringify({ apiKey: 'rotated-in-queue', email: 'test@example.com', backendUrl: 'https://api2.cursor.sh' }));
+  // The stale login's bridge is never used; the retry starts a bridge under the new key.
+  expect((await rotated).text).toBe('hello');
+  expect(count(await f.events(), 'start')).toBeGreaterThanOrEqual(2);
+}, 1));
+
+test('a held run never continues under a rotated, exposed or foreign credential', () => fixture(async f => {
+  const first = request('ONE_TOOL');
+  const calling = await f.backend.run(first);
+  await writeFile(f.auth, JSON.stringify({ apiKey: 'rotated-key', email: 'test@example.com', backendUrl: 'https://api2.cursor.sh' }));
+  await f.backend.run(nextTurn(first, calling, ['r']));
+  expect(count(await f.events(), 'create')).toBe(2);
+  expect(count(await f.events(), 'cancel')).toBe(1);
+
+  const again = await f.backend.run(first);
+  await chmod(f.auth, 0o644);
+  await expect(f.backend.run(nextTurn(first, again, ['r']))).rejects.toThrow('owner-only');
+  await chmod(f.auth, 0o600);
+  const third = await f.backend.run(first);
+  await writeFile(f.auth, JSON.stringify({ apiKey: 'wrong-owner', email: 'test@example.com', backendUrl: 'https://api2.cursor.sh' }));
+  await expect(f.backend.run(nextTurn(first, third, ['r']))).rejects.toThrow('differs from the pinned identity');
+}));
+
+test('bridges die with a parent that exits normally', () => fixture(async f => {
+  const script = `
+    import {createCursorBackend} from ${JSON.stringify(import.meta.dir + '/../src/backends/cursor.ts')};
+    const backend = createCursorBackend(${JSON.stringify({ binary: f.binary, binaryHash: sha256(f.source), authFile: f.auth, cwd: f.root, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'exitfixture', label: 'Fixture' })});
+    await backend.run(${JSON.stringify(request('PLAIN'))});
+    process.exit(0);
+  `;
+  const parent = Bun.spawn([process.execPath, '-e', script], { stdout: 'ignore', stderr: 'ignore' });
+  expect(await parent.exited).toBe(0);
+  const pid = Number((await f.events()).find(event => event.operation === 'start')?.pid);
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  for (let i = 0; i < 100 && alive(); i++) await Bun.sleep(5);
+  expect(alive()).toBe(false);
+}));
+
+for (const [signal, code] of [['SIGTERM', 143], ['SIGINT', 130]] as const) {
+  test(`router ${signal} kills parked bridges and keeps the signal exit code`, () => fixture(async f => {
+    const probe = Bun.serve({ hostname: '127.0.0.1', port: 0, fetch: () => new Response('unused') });
+    const port = probe.port; probe.stop(true);
+    await Bun.write(f.root + '/catalog.json', '{"models":[]}');
+    const ready = f.root + '/owner-ready';
+    const script = `
+      import {createCursorBackend} from ${JSON.stringify(import.meta.dir + '/../src/backends/cursor.ts')};
+      await import(${JSON.stringify(import.meta.dir + '/../src/main.ts')});
+      const backend = createCursorBackend(${JSON.stringify({ binary: f.binary, binaryHash: sha256(f.source), authFile: f.auth, cwd: f.root, expectedEmail: 'test@example.com', expectedUserId: 'fixture', prefix: 'exitfixture', label: 'Fixture' })});
+      await backend.run(${JSON.stringify(request('PLAIN'))});
+      await Bun.write(${JSON.stringify(ready)}, 'ready');
+      await new Promise(() => {});
+    `;
+    const parent = Bun.spawn([process.execPath, '-e', script], {
+      env: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: f.root, CODEX_HOME: f.root, PORT: String(port), CATALOG_FILE: f.root + '/catalog.json', PROXY_STATE_DIR: f.root + '/state' },
+      stdout: 'ignore', stderr: 'ignore',
+    });
+    let pid: number | undefined;
+    const alive = () => { if (!pid) return false; try { process.kill(pid, 0); return true; } catch { return false; } };
+    try {
+      for (let i = 0; i < 500 && !(await Bun.file(ready).exists()) && parent.exitCode === null; i++) await Bun.sleep(5);
+      expect(await Bun.file(ready).exists()).toBe(true);
+      pid = Number((await f.events()).find(event => event.operation === 'start')?.pid);
+      expect(alive()).toBe(true);
+      parent.kill(signal);
+      expect(await parent.exited).toBe(code);
+      for (let i = 0; i < 100 && alive(); i++) await Bun.sleep(5);
+      expect(alive()).toBe(false);
+    } finally {
+      if (parent.exitCode === null) parent.kill('SIGKILL');
+      if (alive()) process.kill(pid!, 'SIGKILL');
+      await parent.exited;
+    }
+  }));
+}

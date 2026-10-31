@@ -1,13 +1,13 @@
 /** Exclusive leases keep a cancelled Cursor run from ever killing another request's bridge. */
 export type CursorLease<T> = {
   value: T; reused: boolean;
-  /** Returns the bridge to the pool; `holdMs` keeps it at least that long, e.g. for a retained session. */
-  release(holdMs?: number): void;
+  /** Returns the bridge to the pool. */
+  release(): void;
   discard(): Promise<void>;
 };
 type Entry<T> = { key: string; value?: T; busy: boolean; startup?: AbortController; timer?: ReturnType<typeof setTimeout>; idleSince?: number };
 type Waiter<T> = {
-  key: string; preferred?: T; signal?: AbortSignal;
+  key: string; signal?: AbortSignal;
   resolve(lease: CursorLease<T>): void; reject(error: unknown): void; abort(): void;
 };
 
@@ -34,12 +34,12 @@ export class CursorBridgePool<T> {
     private readonly warmIdleMs = idleMs,
   ) {}
 
-  acquire(key: string, signal?: AbortSignal, preferred?: T): Promise<CursorLease<T>> {
+  acquire(key: string, signal?: AbortSignal): Promise<CursorLease<T>> {
     signal?.throwIfAborted();
     if (this.closed) return Promise.reject(new Error('Cursor bridge pool is closed'));
     return new Promise((resolve, reject) => {
       const waiter: Waiter<T> = {
-        key, preferred, signal, resolve, reject,
+        key, signal, resolve, reject,
         abort: () => {
           const index = this.waiting.indexOf(waiter);
           if (index >= 0) this.waiting.splice(index, 1);
@@ -71,8 +71,7 @@ export class CursorBridgePool<T> {
         for (const entry of this.entries) {
           if (!entry.busy && entry.value && (!this.alive(entry.value) || entry.key !== waiter.key)) this.evict(entry);
         }
-        const idle = [...this.entries].filter(entry => !entry.busy && entry.key === waiter.key);
-        let entry = idle.find(candidate => candidate.value === waiter.preferred) ?? idle[0];
+        let entry = [...this.entries].find(entry => !entry.busy && entry.key === waiter.key);
         if (!entry && this.entries.size + this.disposing.size >= this.limit) return;
         this.waiting.shift();
         waiter.signal?.removeEventListener('abort', waiter.abort);
@@ -105,13 +104,13 @@ export class CursorBridgePool<T> {
     let released = false;
     return {
       value: entry.value!, reused,
-      release: (holdMs?: number) => {
+      release: () => {
         if (released) return;
         released = true;
         if (this.closed || !this.alive(entry.value!)) { this.evict(entry); return; }
         entry.busy = false;
         entry.idleSince = Date.now();
-        entry.timer = setTimeout(() => this.expire(entry), Math.max(this.idleMs, holdMs ?? 0));
+        entry.timer = setTimeout(() => this.expire(entry), this.idleMs);
         entry.timer.unref?.();
         this.drain();
       },

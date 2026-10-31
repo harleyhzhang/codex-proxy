@@ -56,7 +56,6 @@ const HTTP_VISIBLE = /^(Request too large|Request body|Unsupported|Previous|Miss
 const CLIENT_FAULT = /^(Request |Missing request|Unsupported)/;
 const WS_VISIBLE = /^(OpenAI-encrypted history|OpenAI compaction|Compaction produced|Unsupported|Previous)/;
 const WS_LOGGED = /^(Unsupported|Previous|OpenAI-encrypted history|OpenAI compaction|Compaction produced|model is required|Request|tools must)/;
-const GENERIC_FAILURE = 'Model request failed; retry or check subscription access';
 /** Native Codex treats its own internal errors as retryable; so does the router (a 500 is retried, a 400 is not). */
 const INTERNAL_FAILURE = 'Internal router error; Codex will retry.';
 
@@ -167,7 +166,6 @@ export function startRouter(options: RouterOptions) {
   };
   const upstreamFetch = withPolicy(base);
   const timeoutMs = options.upstreamTimeoutMs ?? 900_000;
-  const deadline = (signal: AbortSignal) => AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]);
 
   const stateDir = options.summaryKeyFile ? dirname(options.summaryKeyFile) : undefined;
   const codec = options.summaryKeyFile ? new SummaryCodec(readFileSync(options.summaryKeyFile)) : undefined;

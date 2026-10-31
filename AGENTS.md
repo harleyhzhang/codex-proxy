@@ -8,7 +8,7 @@ src/
   config.ts      env → Config (env.ts holds the shared integer parser)
   catalog.ts     builds models.json from Codex's model cache + backend catalogs
   protocol/      Responses API types, prompt building, output and SSE
-  backends/      contract.ts (SubscriptionBackend), claude.ts, grok.ts, registry.ts
+  backends/      contract.ts (SubscriptionBackend), registry.ts, claude.ts, grok.ts, cursor.ts (+ cursor-native.ts tools, cursor-pool.ts)
   router/        server.ts (HTTP + WebSocket), auth, account-upstream, history, capsule, bridge, upstream
 test/            bun test; support.ts has shared fixtures
 scripts/         account-cache.ts (native secondary catalog), grok-deny-native.py (Grok PreToolUse hook)

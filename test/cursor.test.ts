@@ -1,36 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { connectFrames, cursorEnvironment, cursorSelection, interpretCursorEvents, parseCursorOutput, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, coerceCustomArguments, CursorError } from '../src/backends/cursor';
-
-test('Cursor unwraps object-wrapped custom tool arguments instead of refusing the turn',()=>{
- expect(coerceCustomArguments('raw')).toBe('raw');
- expect(coerceCustomArguments({code:'await tools.exec_command({cmd:"ls"})'})).toBe('await tools.exec_command({cmd:"ls"})');
- expect(coerceCustomArguments({input:'*** Begin Patch'})).toBe('*** Begin Patch');
- expect(coerceCustomArguments({whatever:'x'})).toBe('x');
- expect(coerceCustomArguments({a:'x',b:'y'})).toBeUndefined();
- expect(coerceCustomArguments({code:'text(1)',patch:'different input'})).toBeUndefined();
- expect(coerceCustomArguments({code:'text(1)',yield_time_ms:1000})).toBeUndefined();
- expect(coerceCustomArguments({code:'text(1)',call_id:'fixture',index:0})).toBe('text(1)');
- expect(coerceCustomArguments({cmd:1})).toBeUndefined();
- expect(coerceCustomArguments(undefined)).toBe('');
- const req={model:'kimi-k3',input:'t',tools:[{type:'custom',name:'exec'}]} as const;
- const out=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{name:'exec',arguments:{code:'text(1)'}}]}),req as never);
- expect(out.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['exec','text(1)']]);
-});
-
-test('Cursor unwraps Kimi native-markup custom calls that carry a call_id beside a singular argument key (October 13 refusal)',()=>{
- // Exact shape captured in mixed/cursor-integration/invalid-output on October 13: {call_id, argument}.
- expect(coerceCustomArguments({call_id:'call_6b3a',argument:'text(JSON.stringify(ALL_TOOLS.map(t=>t.name)));'})).toBe('text(JSON.stringify(ALL_TOOLS.map(t=>t.name)));');
- expect(coerceCustomArguments({id:'x',index:1,payload:'raw'})).toBe('raw');
- expect(coerceCustomArguments({cmd:'ls'})).toBe('ls');
- // Only pragma numbers and no code at all is still unrecoverable.
- expect(coerceCustomArguments({max_output_tokens:4000,yield_time_ms:25000})).toBeUndefined();
- const req={model:'kimi-k3',input:'t',tools:[{type:'custom',name:'exec'}]} as const;
- const markup='Checking ALL_TOOLS.<|open|>tools<|sep|><|open|>call tool="exec" index="1"<|sep|><|open|>argument key="call_id" type="string"<|sep|>call_6b3a<|close|>argument<|sep|><|open|>argument key="argument" type="string"<|sep|>text(ALL_TOOLS.length);<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>';
- const out=parseCursorOutput(markup,req as never);
- expect(out.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['exec','text(ALL_TOOLS.length);']]);
- const bad=JSON.stringify({text:'',tool_calls:[{name:'exec',arguments:{max_output_tokens:4000,yield_time_ms:25000}}]});
- expect(()=>parseCursorOutput(bad,req as never)).toThrow(/got max_output_tokens, yield_time_ms.*@exec: pragma/);
-});
+import { connectFrames, cursorEnvironment, cursorSelection, finishedRun, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
 
 test('Cursor sanitizer drops encrypted reasoning and compaction items, keeps inline images and replaces other media instead of refusing the turn',()=>{
  type R=Record<string,unknown>;
@@ -58,11 +27,9 @@ import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { BackendError, type SubscriptionBackend } from '../src/backends/contract';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
 import type { ResponsesRequest } from '../src/protocol/types';
-import { responseObject } from '../src/protocol/output';
-import { preparePrompt, requestTools, toolDescriptors } from '../src/protocol/prompt';
+import { preparePrompt } from '../src/protocol/prompt';
 import type { JsonRecord } from '../src/json';
 const request: ResponsesRequest = {model:'kimi-k3',input:'test',tools:[{type:'namespace',name:'functions',tools:[{type:'function',name:'read',parameters:{type:'object',properties:{path:{type:'string'}},required:['path'],additionalProperties:false}}]},{type:'custom',name:'apply_patch'}]};
-const output=(value:unknown)=>parseCursorOutput(JSON.stringify(value),request);
 test('Cursor preserves MCP/typed/legacy computer images for actual attachment and keeps ordinary tool metadata as text',()=>{
  const inline='data:image/png;base64,AAAA';
  const history=[
@@ -91,39 +58,6 @@ test('Cursor applies the legacy image exception only to computer outputs, includ
  const prepared=preparePrompt({model:'grok-4.7',input:sanitized.input as never,tools:[]});
  expect(prepared.images).toHaveLength(0);expect(prepared.prompt).toContain('ordinary-record');
 });
-test('Cursor preserves namespaced function objects and exact custom raw input',()=>{
- const result=output({text:'',tool_calls:[{name:'functions.read',arguments:{path:'hello'}},{name:'apply_patch',arguments:'*** Begin Patch\n*** End Patch'}]});
- expect(result.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['functions.read','{"path":"hello"}'],['apply_patch','*** Begin Patch\n*** End Patch']]);
-});
-for(const invalid of [
- {text:'',tool_calls:[{name:'shell',arguments:{}}]},
- {text:'',tool_calls:[{name:'functions.read',arguments:{path:1}}]},
- {text:'',tool_calls:[{name:'functions.read',arguments:{}}]},
- {text:'',tool_calls:[{name:'apply_patch',arguments:{patch:1,other:true}}]},
-])test('Cursor refuses malformed or unavailable action '+JSON.stringify(invalid),()=>{expect(()=>output(invalid)).toThrow(CursorError)});
-test('Cursor lenient parser tolerates fences, extra keys, extra args and OpenAI-style calls',()=>{
- const fenced='Here is my answer:\n```json\n{"text":"hi","tool_calls":[{"name":"functions.read","arguments":"{\\"path\\":\\"a\\"}"}]}\n```';
- expect(parseCursorOutput(fenced,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['functions.read','{"path":"a"}']]);
- expect(output({text:'',tool_calls:[{name:'functions.read',arguments:{path:'a',extra:true}}]}).toolCalls[0]!.arguments).toBe('{"path":"a"}');
- expect(output({text:'',tool_calls:[],extra:true}).toolCalls).toEqual([]);
- expect(output({text:'',tool_calls:[{type:'function',function:{name:'functions.read',arguments:{path:'a'}}}]}).toolCalls[0]!.name).toBe('functions.read');
- expect(()=>parseCursorOutput('this is not the JSON object',request)).toThrow(/no Codex actions were executed/);
-});
-test('Cursor does not classify assistant quota text as a failure',()=>expect(output({text:'quota 429 expired',tool_calls:[]}).text).toBe('quota 429 expired'));
-test('Cursor accepts a tool that an earlier tool_search loaded and replies with its namespace',()=>{
- const web={type:'namespace',name:'mcp__apps__search',tools:[{type:'function',name:'_web_run',parameters:{type:'object',properties:{q:{type:'string'}}}}]};
- const loaded:ResponsesRequest={...request,input:[{type:'tool_search_call',call_id:'c1',arguments:{query:'web'}},{type:'tool_search_output',call_id:'c1',tools:[web,request.tools![0]]}]};
- const text=JSON.stringify({text:'',tool_calls:[{name:'mcp__apps__search._web_run',arguments:{q:'boron'}}]});
- expect(()=>parseCursorOutput(text,request)).toThrow(/unknown tool/);
- const parsed=parseCursorOutput(text,loaded);
- expect(parsed.toolCalls.map(c=>[c.name,c.arguments])).toEqual([['mcp__apps__search._web_run','{"q":"boron"}']]);
- expect(responseObject(loaded,parsed).output).toContainEqual(expect.objectContaining({type:'function_call',namespace:'mcp__apps__search',name:'_web_run'}));
- expect(toolDescriptors(requestTools(loaded)).filter(t=>t.proxyName==='functions.read')).toHaveLength(1);
-});
-test('Cursor repairs Kimi miscounted closers at the end of a tool call',()=>{
- const body='{"text":"t","tool_calls":[{"name":"apply_patch","arguments":"x({a:\'{\'})"}';
- for(const tail of ['}]}','}}]}','}}]'])expect(parseCursorOutput(body+tail,request).toolCalls.map(c=>[c.name,c.arguments])).toEqual([['apply_patch',"x({a:'{'})"]]);
-});
 test('Cursor model parameters are family specific and unsupported effort is refused',()=>{
  expect(cursorSelection('muse-wonder-1.0','max',true)).toEqual({id:'muse-wonder-1.0',params:[{id:'reasoning_effort',value:'max'},{id:'context',value:'300k'}]});
  expect(cursorSelection('kimi-k3','max').params).toEqual([{id:'reasoning',value:'max'}]);
@@ -145,21 +79,20 @@ test('Cursor verifies both email and stable user id before inference',()=>{
 const selection=cursorSelection('kimi-k3','low');
 const events:JsonRecord[]=[{result:{status:'RUN_LIFECYCLE_STATUS_FINISHED',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_FINISHED',result:'{"text":"ok","tool_calls":[]}',model:selection}}},{done:{runId:'r'}}];
 test('Cursor requires matching terminal success, done and exact model',()=>{
- expect(interpretCursorEvents(events,request,selection).text).toBe('ok');
- expect(()=>interpretCursorEvents(events.slice(0,1),request,selection)).toThrow();
- expect(()=>interpretCursorEvents(events,request,cursorSelection('kimi-k3','high'))).toThrow();
- expect(()=>interpretCursorEvents([...events,events[0]!],request,selection)).toThrow();
+ expect(finishedRun(events,selection).result).toBe('{"text":"ok","tool_calls":[]}');
+ expect(()=>finishedRun(events.slice(0,1),selection)).toThrow();
+ expect(()=>finishedRun(events,cursorSelection('kimi-k3','high'))).toThrow();
+ expect(()=>finishedRun([...events,events[0]!],selection)).toThrow();
 });
 test('an errored run is retryable only when Cursor gives no reason or a transient one',()=>{
  const errored=(run:JsonRecord):JsonRecord[]=>[{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',...run}}},{done:{runId:'r'}}];
- const caught=(run:JsonRecord)=>{try{interpretCursorEvents(errored(run),request,selection);}catch(error){return error as CursorError;}throw new Error('expected a refusal');};
+ const caught=(run:JsonRecord)=>{try{finishedRun(errored(run),selection);}catch(error){return error as CursorError;}throw new Error('expected a refusal');};
  const opaque=caught({});
  expect(opaque.retryable).toBe(true); expect(opaque.message).toContain('run status ERROR with no reason from Cursor');
  expect(caught({error:'upstream provider rate limit exceeded'}).retryable).toBe(true);
  const policy=caught({error:'model refused the request policy'});
  expect(policy.retryable).toBe(false); expect(policy.message).toContain('run status ERROR: model refused the request policy');
 });
-for(const event of [{sdkMessage:{type:'tool_call',message:{}}},{sdkMessage:{type:'task',message:{}}},{step:{type:'summaryMessage',step:{}}}])test('Cursor rejects native execution and native compaction',()=>expect(()=>interpretCursorEvents([event,...events],request,selection)).toThrow());
 function frame(value:unknown,flag=0){const data=Buffer.from(JSON.stringify(value));const h=Buffer.alloc(5);h[0]=flag;h.writeUInt32BE(data.length,1);return Buffer.concat([h,data]);}
 const stream=(chunks:Uint8Array[])=>new ReadableStream<Uint8Array>({start(c){chunks.forEach(x=>c.enqueue(x));c.close()}});
 test('Connect decoder handles split headers, multiple records and end frames',async()=>{
@@ -263,75 +196,12 @@ for(const refusal of ['identity','authentication','quota']as const){
  });
 }
 
-test('Cursor bare prose (Grok narration) refuses on the first attempt with the exact wrap and is delivered as text-only on the retry',()=>{
- expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/wrote the narration \"I'll read those sections next\.\" instead of acting/);
- expect(()=>parseCursorOutput("I'll read those sections next.",request)).toThrow(/must begin with the character \{/);
- try { parseCursorOutput("I'll read those sections next.",request); } catch (error) { expect((error as CursorError).retries).toBe(2); expect((error as CursorError).retryable).toBe(true); }
- const out=parseCursorOutput("  I'll read those sections next.\n",request,undefined,true);
- expect(out.text).toBe("I'll read those sections next.");
- expect(out.toolCalls).toEqual([]);
-});
-test('Cursor malformed JSON containing a brace is still refused as unparseable even on the retry',()=>{
- expect(()=>parseCursorOutput('{"text": "oops", tool_calls: [',request,undefined,true)).toThrow(/parseable JSON object/);
-});
-test('Cursor accepts plain text immediately only when the complete tool list is empty',()=>{
- const withoutTools={...request,tools:[]};
- expect(parseCursorOutput('  ordinary final answer\n',withoutTools).text).toBe('ordinary final answer');
- expect(parseCursorOutput('ordinary final answer',withoutTools).toolCalls).toEqual([]);
- expect(()=>parseCursorOutput('{"text": broken',withoutTools)).toThrow(/parseable JSON object/);
- expect(()=>parseCursorOutput('broken JSON }',withoutTools)).toThrow(/parseable JSON object/);
- expect(()=>parseCursorOutput('ordinary final answer',request)).toThrow(/wrote the narration/);
- const loaded={...withoutTools,input:[{type:'tool_search_output',tools:[{type:'function',name:'loaded',parameters:{type:'object'}}]}]};
- expect(()=>parseCursorOutput('ordinary final answer',loaded)).toThrow(/wrote the narration/);
-});
-
-test('Cursor accepts standard explicit namespaces and custom envelopes only for exact declared tools',()=>{
- const req:ResponsesRequest={model:'grok-4.7',input:'Inspect the synthetic fixture.',tools:[{type:'namespace',name:'functions',tools:[{type:'custom',name:'exec'},{type:'function',name:'lookup',parameters:{type:'object',properties:{key:{type:'string'}},required:['key'],additionalProperties:false}}]}]};
- const custom=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{type:'custom_tool_call',namespace:'functions',name:'exec',input:'text("synthetic");'}]}),req);
- expect(custom.toolCalls.map(call=>[call.name,call.arguments])).toEqual([['functions.exec','text("synthetic");']]);
- const wrapped=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{custom:{namespace:'functions',name:'exec',input:'text(1)'}}]}),req);
- expect(wrapped.toolCalls[0]?.name).toBe('functions.exec');expect(wrapped.toolCalls[0]?.arguments).toBe('text(1)');
- const standalone=parseCursorOutput(JSON.stringify({type:'custom_tool_call',namespace:'functions',name:'exec',input:'text(2)'}),req);
- expect(standalone.toolCalls.map(call=>[call.name,call.arguments])).toEqual([['functions.exec','text(2)']]);
- const fn=parseCursorOutput(JSON.stringify({text:'',tool_calls:[{namespace:'functions',name:'lookup',arguments:{key:'fixture'}}]}),req);
- expect(fn.toolCalls[0]?.name).toBe('functions.lookup');expect(JSON.parse(fn.toolCalls[0]!.arguments)).toEqual({key:'fixture'});
- expect(()=>parseCursorOutput(JSON.stringify({text:'',tool_calls:[{namespace:'other',name:'exec',input:'text(1)'}]}),req)).toThrow(/unknown tool/);
- expect(()=>parseCursorOutput(JSON.stringify({unexpected:'synthetic'}),req)).toThrow(/without text or tool_calls/);
- expect(()=>parseCursorOutput(JSON.stringify({name:'undeclared',arguments:{}}),req)).toThrow(/unknown tool/);
-});
-
-test('Cursor does not finish a clear short action request with only a future-action promise, even on its final attempt',()=>{
- const action={...request,input:'Please inspect the synthetic fixture and report the result.'};
- const narration="I'll inspect the synthetic fixture next.";
- for(const accept of[false,true]){
-  expect(()=>parseCursorOutput(narration,action,undefined,accept)).toThrow(/narration/);
-  expect(()=>parseCursorOutput(JSON.stringify({text:narration,tool_calls:[]}),action,undefined,accept)).toThrow(/future tool action/);
- }
- for(const verb of['call','invoke']){
-  const req={...request,input:`${verb} the declared tool once with the synthetic payload.`};
-  const promise=`I will ${verb} the declared tool now.`;
-  expect(()=>parseCursorOutput(JSON.stringify({text:promise,tool_calls:[]}),req,undefined,true)).toThrow(/future tool action/);
-  expect(parseCursorOutput(promise,{...request,input:'Return exactly this literal sentence: '+promise}).text).toBe(promise);
-  expect(parseCursorOutput(JSON.stringify({text:promise,tool_calls:[]}),{...request,input:'Draft an email using this sentence: '+promise}).text).toBe(promise);
- }
-});
-
-test('Cursor preserves legitimate quoted wording, drafts, translations, plans and final prose without forcing tools',()=>{
- const prose="I'll inspect the synthetic fixture next.";
- for(const input of['Return exactly this sentence: '+prose,'Draft an email that says '+prose,'Translate this quoted sentence into English: '+prose,'Write a plan for checking the synthetic fixture.','Review this draft email wording.']){
-  const req={...request,input};
-  expect(parseCursorOutput(prose,req).text).toBe(prose);
-  expect(parseCursorOutput(JSON.stringify({text:prose,tool_calls:[]}),req).toolCalls).toEqual([]);
- }
- expect(parseCursorOutput('The synthetic fixture has three fields.',{...request,input:'Inspect the synthetic fixture.'},undefined,true).text).toBe('The synthetic fixture has three fields.');
-});
-
 test('Cursor lifecycle cancellation is terminal and provider context overflow uses the native context code',()=>{
  for(const status of['CANCELLED','CANCELED']){
-  try{interpretCursorEvents([{result:{status:'RUN_LIFECYCLE_STATUS_'+status,runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_'+status}}},{done:{runId:'r'}}],request,selection);throw new Error('expected failure');}
+  try{finishedRun([{result:{status:'RUN_LIFECYCLE_STATUS_'+status,runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_'+status}}},{done:{runId:'r'}}],selection);throw new Error('expected failure');}
   catch(error){expect(error).toBeInstanceOf(CursorError);expect((error as CursorError).retryable).toBe(false)}
  }
- try{interpretCursorEvents([{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',error:'prompt is too long for this model'}}},{done:{runId:'r'}}],request,selection);throw new Error('expected failure');}
+ try{finishedRun([{result:{status:'RUN_LIFECYCLE_STATUS_ERROR',runId:'r',result:{status:'RUN_LIFECYCLE_STATUS_ERROR',error:'prompt is too long for this model'}}},{done:{runId:'r'}}],selection);throw new Error('expected failure');}
  catch(error){expect((error as BackendError).code).toBe('context_length_exceeded');expect((error as BackendError).retryable).toBe(false)}
 });
 

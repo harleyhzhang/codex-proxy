@@ -36,7 +36,7 @@ export interface SubscriptionBackend {
   prewarm?(request: ResponsesRequest): void;
 }
 
-export type FailureOptions = {
+type FailureOptions = {
   /** The code Codex receives. Refusals default to `invalid_request_error`. */
   code?: string;
   /** A content-free event the router logs when it delivers this refusal. */
@@ -118,12 +118,12 @@ export async function retryOnce(
 }
 
 /** A text-only output that explains a refusal in the chat instead of failing the turn. */
-export function refusalMessage(backend: string, error: BackendError): ProxyOutput {
+function refusalMessage(backend: string, error: BackendError): ProxyOutput {
   const text = `${backend} could not produce a valid action for this turn, even after one retry: ${error.message}. Nothing was executed. Reply to continue, or rephrase the request.`;
   return { text, toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } };
 }
 
-export type CliFailure =
+type CliFailure =
   | 'subscription usage limit reached'
   | 'authentication failed'
   | 'structured output failed'
@@ -165,7 +165,7 @@ export function terminalEvent(error: BackendError) {
  * Codes native Codex classifies itself (codex-api sse/responses.rs): `context_length_exceeded` becomes
  * ContextWindowExceeded, which stops retrying and tells the user to compact instead of looping.
  */
-export const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded', 'server_is_overloaded']);
+const NATIVE_TERMINAL_CODES = new Set(['context_length_exceeded', 'server_is_overloaded']);
 
 /** Subscription CLIs report a prompt over the model window in prose; match it so Codex sees the native code. */
 export const CONTEXT_OVERFLOW_TEXT = /prompt is too long|context (?:window|length)(?: limit)? (?:exceeded|reached)|exceeds? (?:the )?(?:model'?s? )?(?:maximum )?context|too many (?:input )?tokens/i;

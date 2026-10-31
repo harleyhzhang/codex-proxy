@@ -44,6 +44,6 @@ const server = startRouter({
   bridgeModels: config.bridgeModels,
   secondaryAccount: config.secondaryAccount,
   primaryStandard: config.primaryStandard,
-  upstreamWebSocket: config.upstreamWebSocket,
+  upstreamWebSocket: true,
 });
 console.log(`codex-subscription-proxy listening on http://127.0.0.1:${server.port}`);

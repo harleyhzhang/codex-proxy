@@ -113,7 +113,7 @@ test('token, account, model and connection lifetime changes discard continuation
 });
 
 test('missing connection-local history earns exactly one full replay before visible output', async () => {
-  const app = fixture((peer, request, count) => {
+  const app = fixture((peer, _request, count) => {
     if (count === 2) {
       emit(peer, { type: 'response.created', response: { id: 'discarded', output: [] } });
       emit(peer, { type: 'response.output_item.added', item: { id: 'stray', type: 'message' } });

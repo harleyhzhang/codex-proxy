@@ -3,7 +3,7 @@
 import { isRecord } from '../json';
 import { BackendError } from './contract';
 
-export type UsageWindow = { used_percent: number; window_minutes: number; resets_at: number | null };
+type UsageWindow = { used_percent: number; window_minutes: number; resets_at: number | null };
 
 export type ClaudeUsage = {
   updated_at: number;

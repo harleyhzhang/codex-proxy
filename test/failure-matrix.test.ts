@@ -10,7 +10,7 @@ import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { BackendError, type SubscriptionBackend } from '../src/backends/contract';
 import { configuredCursorBackend } from '../src/backends/cursor';
 import { withOpusQuotaFallback } from '../src/backends/quota-fallback';
-import { BACKENDS, backendFor, publicModels } from '../src/backends/registry';
+import { BACKENDS, publicModels } from '../src/backends/registry';
 import { responseObject, streamResponse } from '../src/protocol/output';
 import { MAX_BODY_BYTES } from '../src/protocol/stream';
 import type { ProxyOutput, ResponsesBody } from '../src/protocol/types';

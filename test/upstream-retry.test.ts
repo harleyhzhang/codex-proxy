@@ -34,6 +34,17 @@ test('4xx is returned at once and 5xx gives up after four retries, like native C
   expect(calls).toBe(5);
 });
 
+test('cancelling during a retry backoff stops at once instead of sleeping it out', async () => {
+  process.env.UPSTREAM_RETRY_BASE_MS = '10000';
+  try {
+    const controller = new AbortController();
+    const started = performance.now();
+    setTimeout(() => controller.abort(new Error('cancelled')), 50);
+    await expect(postJson(async () => new Response('x', { status: 503 }), '/responses', new Headers(), body, controller.signal)).rejects.toThrow('cancelled');
+    expect(performance.now() - started).toBeLessThan(2000);
+  } finally { process.env.UPSTREAM_RETRY_BASE_MS = '1'; }
+});
+
 test('compaction survives a transient 507, and a lasting one reaches Codex as 507 rather than 400', async () => {
   let failuresLeft = 1;
   const app = await fixtureRouter({

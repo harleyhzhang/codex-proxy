@@ -2,7 +2,7 @@
 import { nonNegativeInt } from '../env';
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
-import { reconnectTransport, transportError } from '../transport';
+import { reconnectTransport, sleep, transportError } from '../transport';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
@@ -158,13 +158,13 @@ export async function postJson(
       const network = transportError(error);
       if (!network || network.timedOut || attempt >= retries || signal.aborted) throw error;
       logSafe('upstream-retry', { path, status: 0, attempt: attempt + 1 });
-      await Bun.sleep(retryDelayMs(baseDelayMs, attempt));
+      await sleep(retryDelayMs(baseDelayMs, attempt), signal);
       continue;
     }
     if (response.status < 500 || attempt >= retries || signal.aborted) return response;
     logSafe('upstream-retry', { path, status: response.status, attempt: attempt + 1 });
     await response.body?.cancel().catch(() => {});
-    await Bun.sleep(retryDelayMs(baseDelayMs, attempt));
+    await sleep(retryDelayMs(baseDelayMs, attempt), signal);
   }
 }
 

@@ -36,15 +36,9 @@ if (scenario === 'BRIDGE_BADHANDSHAKE') { console.error('cursor-sdk-bridge ready
 if (scenario === 'BRIDGE_SLOW') await new Promise(r => setTimeout(r, 3000));
 if (scenario === 'BRIDGE_SLOW_ONCE') { const marker = '${scratch}/slow-start-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); await new Promise(r => setTimeout(r, 3000)); } }
 const FINISHED = 'RUN_LIFECYCLE_STATUS_FINISHED';
+// A finished run streams its reply as assistant text before the terminal record.
 const rawFrame = (flags, value) => { const json = Buffer.from(JSON.stringify(value)); const head = Buffer.alloc(5); head[0] = flags; head.writeUInt32BE(json.length, 1); return Buffer.concat([head, json]); };
-// A finished run also streams its reply as assistant text, which is what the native path reads;
-// the JSON-envelope path reads the run result. Each scenario therefore serves both paths.
-const frame = (flags, value) => {
-  const result = value?.result?.result?.result;
-  if (typeof result !== 'string') return rawFrame(flags, value);
-  let text = result; try { const parsed = JSON.parse(result); if (typeof parsed?.text === 'string') text = parsed.text; } catch {}
-  return Buffer.concat([rawFrame(0, { sdkMessage: { type: 'assistant', message: { type: 'assistant', run_id: 'run-1', message: { role: 'assistant', content: [{ type: 'text', text }] } } } }), rawFrame(flags, value)]);
-};
+const frame = (flags, value) => { const text = value?.result?.result?.result; return typeof text === 'string' ? Buffer.concat([rawFrame(0, { sdkMessage: { type: 'assistant', message: { type: 'assistant', run_id: 'run-1', message: { role: 'assistant', content: [{ type: 'text', text }] } } } }), rawFrame(flags, value)]) : rawFrame(flags, value); };
 const json = (value, status = 200) => new Response(JSON.stringify(value), { status, headers: { 'content-type': 'application/json' } });
 const catalog = { items: [
   { id: 'kimi-k3', parameters: [{ id: 'reasoning', values: [{ value: 'low' }, { value: 'high' }, { value: 'max' }] }] },
@@ -80,7 +74,7 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
       // Six keepalive frames 250 ms apart, then the result: 1.5 s total, never more than 250 ms silent.
       const stream = new ReadableStream({ async start(controller) {
         for (let i = 0; i < 6; i++) { await new Promise(r => setTimeout(r, 250)); controller.enqueue(frame(0, { sdkMessage: { message: { runId: 'run-1', step: i } } })); }
-        controller.enqueue(frame(0, run(JSON.stringify({ text: 'CURSOR_SLOW_OK', tool_calls: [] })))); controller.enqueue(frame(0, { done: { runId: 'run-1' } })); controller.enqueue(frame(2, {})); controller.close();
+        controller.enqueue(frame(0, run('CURSOR_SLOW_OK'))); controller.enqueue(frame(0, { done: { runId: 'run-1' } })); controller.enqueue(frame(2, {})); controller.close();
       } });
       return new Response(stream, { headers });
     }
@@ -92,16 +86,13 @@ const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) 
     // A provider-side transient failure (what native Codex retries on 429/5xx): the first run errors
     // with Cursor's reason string, the fresh retry succeeds. A non-transient reason is not retried.
     // Each attempt launches a fresh bridge process, so the first/second distinction lives on disk.
-    if (scenario === 'UNFINISHED_TRANSIENT') { const marker = '${scratch}/transient-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'upstream provider rate limit exceeded, try again' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_AFTER_TRANSIENT', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
+    if (scenario === 'UNFINISHED_TRANSIENT') { const marker = '${scratch}/transient-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'upstream provider rate limit exceeded, try again' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run('CURSOR_AFTER_TRANSIENT')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
     if (scenario === 'UNFINISHED_REASON') return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', error: 'model refused the request policy' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
     // 2026-10-15 live shape: status ERROR with every reason field empty. Nothing has executed, so it
     // gets the same single fresh attempt as a transient provider error; here the retry succeeds.
-    if (scenario === 'UNFINISHED_OPAQUE') { const marker = '${scratch}/opaque-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_AFTER_OPAQUE', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
-    if (scenario === 'WRONG_MODEL') { const body = run(JSON.stringify({ text: 'x', tool_calls: [] })); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
-    if (scenario === 'BAD_OUTPUT') return new Response(Buffer.concat([frame(0, run('this is not the JSON object')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
-    if (scenario === 'BAD_JSON') return new Response(Buffer.concat([frame(0, run('{"text": "oops", tool_calls: [')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
-    if (scenario === 'PROSE_THEN_JSON') { globalThis.__sends = (globalThis.__sends || 0) + 1; return new Response(Buffer.concat([frame(0, run(globalThis.__sends === 1 ? 'I will read the file next.' : JSON.stringify({ text: 'wrapped after correction', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
-    return new Response(Buffer.concat([frame(0, run(JSON.stringify({ text: 'CURSOR_OK', tool_calls: [] }))), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
+    if (scenario === 'UNFINISHED_OPAQUE') { const marker = '${scratch}/opaque-seen'; if (!(await Bun.file(marker).exists())) { await Bun.write(marker, '1'); return new Response(Buffer.concat([frame(0, { result: { status: 'RUN_LIFECYCLE_STATUS_ERROR', runId: 'run-1', result: { status: 'RUN_LIFECYCLE_STATUS_ERROR' } } }), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); } return new Response(Buffer.concat([frame(0, run('CURSOR_AFTER_OPAQUE')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
+    if (scenario === 'WRONG_MODEL') { const body = run('x'); body.result.result.model.params = [{ id: 'reasoning', value: 'low' }]; return new Response(Buffer.concat([frame(0, body), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers }); }
+    return new Response(Buffer.concat([frame(0, run('CURSOR_OK')), frame(0, { done: { runId: 'run-1' } }), frame(2, {})]), { headers });
   }
   return json({ code: 'unimplemented' }, 404);
 } });
@@ -175,19 +166,12 @@ const expectTerminal = (seen: Seen[], fragment: string) => {
     if (cell.transport === 'http') expect(cell.status).toBe(400);
   }
 };
-const expectRetryable = (seen: Seen[], message: string) => {
-  for (const cell of seen) { expect(cell.code, cell.transport).toBe('server_error'); expect(cell.message, cell.transport).toBe(message); if (cell.transport === 'http') expect(cell.status).toBeGreaterThanOrEqual(500); }
-};
 const expectOk = (seen: Seen[], text: string) => { for (const cell of seen) { expect(cell.code, cell.transport).toBe('ok'); expect(cell.message, cell.transport).toBe(text); } };
 const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 const bridgePid = async () => Number(await readFile(scratch + '/bridge.pid', 'utf8'));
 
-// Every failure mode runs on the native tool path (the default) and on the JSON-envelope rollback.
-for (const mode of ['native', 'json'] as const) describe(`Cursor bridge failures through the router (${mode})`, () => {
-  const saved = process.env.CURSOR_NATIVE_TOOLS;
-  beforeAll(() => { process.env.CURSOR_NATIVE_TOOLS = mode === 'native' ? '1' : '0'; });
-  afterAll(() => { if (saved === undefined) delete process.env.CURSOR_NATIVE_TOOLS; else process.env.CURSOR_NATIVE_TOOLS = saved; });
+describe('Cursor bridge failures through the router', () => {
   test('the scripted bridge serves normal turns on every transport and stays available for reuse', async () => {
     const app = await fixtureRouter();
     try {
@@ -385,42 +369,6 @@ for (const mode of ['native', 'json'] as const) describe(`Cursor bridge failures
   });
 
   // Envelope repair exists only on the JSON path; native replies are text and real tool calls.
-  test.skipIf(mode === 'native')('malformed JSON output is retried once and then delivered as a refusal chat message, not a failed turn', async () => {
-    const app = await fixtureRouter();
-    try {
-      await scenario('BAD_JSON');
-      for (const cell of await everyTransport(app, body('x'))) {
-        expect(cell.code, cell.transport).toBe('ok');
-        expect(cell.message, cell.transport).toContain('Cursor could not produce a valid action');
-        expect(cell.message, cell.transport).toContain('no Codex actions were executed');
-        if (cell.transport === 'http') expect(cell.status).toBe(200);
-      }
-    } finally { await app.close(); }
-  });
-
-  test.skipIf(mode === 'native')('narration is corrected inside the same agent, so one attempt yields the wrapped reply', async () => {
-    const app = await fixtureRouter();
-    try {
-      await scenario('PROSE_THEN_JSON');
-      for (const cell of await everyTransport(app, { ...body('x'), tools: [{ type: 'function', name: 'echo', parameters: { type: 'object' } }] })) {
-        expect(cell.code, cell.transport).toBe('ok');
-        expect(cell.message, cell.transport).toBe('wrapped after correction');
-      }
-    } finally { await app.close(); }
-  });
-
-  test('bare prose is delivered immediately when no tools are available', async () => {
-    const app = await fixtureRouter();
-    try {
-      await scenario('BAD_OUTPUT');
-      for (const cell of await everyTransport(app, body('x'))) {
-        expect(cell.code, cell.transport).toBe('ok');
-        expect(cell.message, cell.transport).toBe('this is not the JSON object');
-        if (cell.transport === 'http') expect(cell.status).toBe(200);
-      }
-    } finally { await app.close(); }
-  });
-
   test('a hung Send is cut at the Cursor timeout and the bridge is killed', async () => {
     const app = await fixtureRouter();
     try {

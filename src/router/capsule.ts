@@ -12,8 +12,8 @@ const CONTEXT_FORMAT = 'ccp_context_v2';
 const LEGACY_CAPSULE_PREFIXES = ['harley_cc_v1.'];
 const LEGACY_CONTEXT_FORMATS = ['harley_cc_context_v2'];
 
-export const ANCHOR_PREFIX = 'VERBATIM_HISTORICAL_USER_REQUEST:\n';
-export const SUMMARY_PREFIX = 'Earlier conversation context summary:';
+const ANCHOR_PREFIX = 'VERBATIM_HISTORICAL_USER_REQUEST:\n';
+const SUMMARY_PREFIX = 'Earlier conversation context summary:';
 const COMPACTION_TYPES = new Set(['compaction', 'compaction_summary', 'context_compaction']);
 const CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'computer_call', 'tool_search_call']);
 const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);

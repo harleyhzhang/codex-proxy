@@ -1,6 +1,6 @@
 // Logs are one JSON object per line. They never contain prompts, model output or credentials.
 
-export type LogFields = Record<string, unknown>;
+type LogFields = Record<string, unknown>;
 
 export const log = {
   info(event: string, fields: LogFields = {}): void {

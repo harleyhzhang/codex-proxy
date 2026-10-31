@@ -32,13 +32,11 @@ describe('Cursor bounded exclusive bridge pool', () => {
     expect(f.destroyed).toHaveLength(2);
   });
 
-  test('rotation replaces idle credentials; preferred idle sessions are selected without reserving permits', async () => {
+  test('rotation replaces idle credentials', async () => {
     const f = fixture();
     try {
       const a = await f.pool.acquire('one'), b = await f.pool.acquire('one');
       a.release(); b.release();
-      const continued = await f.pool.acquire('one', undefined, b.value);
-      expect(continued.value).toBe(b.value); continued.release();
       const rotated = await f.pool.acquire('two');
       expect(rotated.value.key).toBe('two'); expect(rotated.reused).toBe(false);
       expect(f.destroyed.sort()).toEqual([1, 2]); rotated.release();
@@ -98,7 +96,7 @@ describe('Cursor bounded exclusive bridge pool', () => {
       expect(destroyed).toHaveLength(2);
 
       const held = await pool.acquire('other');
-      held.release(100);
+      held.release();
       await Bun.sleep(60);
       expect(held.value.live).toBe(true);
 

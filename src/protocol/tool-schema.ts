@@ -12,10 +12,29 @@ function equalJson(left: unknown, right: unknown, depth = 0): boolean {
 }
 /** Parameter-object equality ignores JSON member order while preserving exact string values. */
 export function sameToolArguments(left: unknown, right: unknown): boolean { return equalJson(left, right); }
-const field = (name: string) => /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? name : '(field)';
+/** A field name safe to put in a diagnostic: model-written names that look like content are masked. */
+export const fieldName = (name: string) => /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? name : '(field)';
+const field = fieldName;
+
+/**
+ * Checks a function call's arguments against its contract. Models swap a parameter name (`command`
+ * for `cmd`), which is reported as missing; undeclared top-level extras (models like adding
+ * `description`) carry no meaning for the tool and are deleted from `args` before the full schema
+ * check. Nested contracts are checked recursively.
+ */
+export function checkToolArguments(args: Record<string, unknown>, contract: unknown): { declared: string[]; missing: string[]; dropped: string[]; issue?: string } {
+  const properties = isRecord(contract) && isRecord(contract.properties) ? contract.properties : undefined;
+  const declared = properties ? Object.keys(properties) : [];
+  const required = isRecord(contract) && Array.isArray(contract.required) ? contract.required.filter((key): key is string => typeof key === 'string') : [];
+  const missing = required.filter(key => !Object.hasOwn(args, key));
+  const dropped = properties && isRecord(contract) && contract.additionalProperties === false && !contract.patternProperties ? Object.keys(args).filter(key => !Object.hasOwn(properties, key)) : [];
+  if (missing.length) return { declared, missing, dropped };
+  for (const key of dropped) delete args[key];
+  return { declared, missing, dropped, issue: toolSchemaIssue(args, contract) };
+}
 
 /** Returns the first content-free schema issue. No argument values enter diagnostics. */
-export function toolSchemaIssue(value: unknown, contract: unknown): string | undefined {
+function toolSchemaIssue(value: unknown, contract: unknown): string | undefined {
   let budget = 100_000;
   let exhausted = false;
   const check = (value: unknown, schema: unknown, path: string, depth = 0): string | undefined => {

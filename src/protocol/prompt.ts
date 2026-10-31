@@ -35,7 +35,7 @@ export type ToolDescriptor = {
 
 export type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: string; data: string } };
 
-export type PreparedPrompt = { prompt: string; images: ImageBlock[] };
+type PreparedPrompt = { prompt: string; images: ImageBlock[] };
 
 const TOOL_SEARCH_CONTRACT = {
   type: 'object',
