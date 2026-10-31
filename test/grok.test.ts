@@ -1,164 +1,194 @@
-import {test,expect} from 'bun:test';
-import { items, firstText, unwrap } from './support';
-import { grokEnvironment, parseGrokOutput, runGrok } from '../src/backends/grok';
-import { SummaryCodec, compactRequest } from '../src/router/capsule';
-import { localResponse } from '../src/router/local';
-import { normalizeAgentPayloads } from '../src/router/bridge';
-const tools:any[]=[{type:'namespace',name:'functions',tools:[{type:'custom',name:'exec'}]},{type:'function',name:'read'}];
-test('Grok enforces tool allowlist, raw custom input, object function args and unique IDs',()=>{
- const request={model:'grok-4.7',input:'test',tools};
- const parsed=parseGrokOutput(JSON.stringify({text:'',tool_calls:[{name:'functions.exec',arguments:'await tools.read();'},{name:'read',arguments:'{"path":"fixture"}'}]}),request);
- expect(parsed.toolCalls[0].arguments).toBe('await tools.read();');expect(parsed.toolCalls[0].callId).not.toBe(parsed.toolCalls[1].callId);
- for(const tool_calls of [[{name:'native_shell',arguments:'{}'}],[{name:'read',arguments:'not json'}],[{name:'read',arguments:'[]'}],[{name:'read',arguments:5}]])expect(()=>parseGrokOutput(JSON.stringify({text:'',tool_calls}),request)).toThrow();
- expect(()=>parseGrokOutput('broken',request)).toThrow();
+// Grok over xAI's Responses endpoint against a scripted xAI, OAuth issuer and npm registry: the tool and
+// history mapping, the login refresh it owns, and every refusal Codex can receive.
+import { afterAll, beforeEach, expect, test } from 'bun:test';
+import { mkdtempSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createGrokBackend } from '../src/backends/grok';
+import type { JsonRecord } from '../src/json';
+import { responseObject } from '../src/protocol/output';
+import type { ResponsesRequest } from '../src/protocol/types';
+
+type Seen = { path: string; headers: Record<string, string>; body: JsonRecord };
+type Handler = (body: JsonRecord) => Response | Promise<Response>;
+const seen: Seen[] = [];
+let replies: Handler[] = [];
+let refreshes = 0;
+let refreshReply: () => Response = () => Response.json({ access_token: `access-${++refreshes}`, refresh_token: `refresh-${refreshes}`, expires_in: 21600, token_type: 'Bearer' });
+let latestVersion = '1.0.46';
+
+const sse = (...events: JsonRecord[]) => new Response(events.map(event => `event: ${String(event.type)}\ndata: ${JSON.stringify(event)}\n\n`).join(''), { headers: { 'content-type': 'text/event-stream' } });
+const completed = (output: JsonRecord[], usage: JsonRecord = { input_tokens: 40, output_tokens: 5, input_tokens_details: { cached_tokens: 32 } }) =>
+  sse({ type: 'response.created', response: { status: 'in_progress' } }, { type: 'response.completed', response: { status: 'completed', output, usage } });
+const say = (text: string) => ({ type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] });
+
+const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req): Promise<Response> {
+  const path = new URL(req.url).pathname;
+  const headers: Record<string, string> = {};
+  req.headers.forEach((value, key) => { headers[key] = value; });
+  if (path === '/.well-known/openid-configuration') return Response.json({ token_endpoint: `${origin}/oauth2/token` });
+  if (path === '/oauth2/token') { const form = new URLSearchParams(await req.text()); seen.push({ path, headers, body: Object.fromEntries(form) }); return refreshReply(); }
+  if (path === '/npm') return Response.json({ version: latestVersion });
+  const body = await req.json() as JsonRecord;
+  seen.push({ path, headers, body });
+  if (headers['x-grok-client-version'] !== latestVersion) return Response.json({ code: 'upgrade-required', error: 'Client too old' }, { status: 426 });
+  const handler = replies.shift();
+  return handler ? handler(body) : completed([say('ok')]);
+} });
+const origin: string = `http://127.0.0.1:${server.port}`;
+afterAll(() => server.stop(true));
+
+function login(expiresInMs: number): string {
+  const home = mkdtempSync(join(tmpdir(), 'grok-test-'));
+  writeFileSync(join(home, 'auth.json'), JSON.stringify({ [`${origin}::client`]: { key: 'access-0', refresh_token: 'refresh-0', expires_at: new Date(Date.now() + expiresInMs).toISOString(), email: 'grok@example.com', team_id: 'team' } }), { mode: 0o600 });
+  return home;
+}
+const backend = (home: string) => createGrokBackend({ home, baseUrl: `${origin}/v1`, issuer: origin, versionUrl: `${origin}/npm` });
+const responses = () => seen.filter(entry => entry.path === '/v1/responses');
+const hello = (extra: Partial<ResponsesRequest> = {}): ResponsesRequest => ({ model: 'grok-4.7', input: [{ role: 'user', content: 'hello' }], ...extra });
+
+beforeEach(() => {
+  seen.length = 0; replies = []; refreshes = 0; latestVersion = '1.0.46';
+  refreshReply = () => Response.json({ access_token: `access-${++refreshes}`, refresh_token: `refresh-${refreshes}`, expires_in: 21600, token_type: 'Bearer' });
 });
-test('Grok warmup never starts CLI, images and foreign subagent ciphertext fail closed',async()=>{
- expect((await localResponse({model:'grok-4.7',input:[],generate:false})).usage?.total_tokens).toBe(0);
- await expect(runGrok({model:'grok-4.7',input:[{type:'agent_message',content:[{type:'encrypted_content',encrypted_content:'gAAAA-opaque'}]}]})).rejects.toThrow('encrypted GPT');
- await expect(runGrok({model:'grok-4.7',input:[{role:'user',content:[{type:'input_image',image_url:'data:image/png;base64,YQ=='}]}]})).rejects.toThrow('no image');
- await expect(runGrok({model:'grok-4.6',input:'hi'})).rejects.toThrow('Unsupported');
+
+const TOOLS: ResponsesRequest['tools'] = [
+  { type: 'function', name: 'exec_command', description: 'Run a command', parameters: { type: 'object', properties: { cmd: { type: 'string' } }, required: ['cmd'] } },
+  { type: 'custom', name: 'apply_patch', description: 'Edit files', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/' } },
+  { type: 'namespace', name: 'mcp__docs', tools: [{ type: 'function', name: 'search', parameters: { type: 'object', properties: { q: { type: 'string' } } } }] },
+];
+
+test('Codex tools go out as function tools and history keeps its shape; calls come back as the Codex tools they stand for', async () => {
+  replies.push(() => completed([
+    { type: 'reasoning', id: 'rs_1', encrypted_content: 'xai-thoughts', summary: [] },
+    say('working'),
+    { type: 'function_call', call_id: 'call_x1', name: 'apply_patch', arguments: JSON.stringify({ input: '*** Begin Patch\n*** End Patch' }) },
+    { type: 'function_call', call_id: 'call_x2', name: 'mcp__docs_search', arguments: '{"q":"boron"}' },
+  ]));
+  const request: ResponsesRequest = { model: 'grok-4.7', instructions: 'Be brief.', reasoning: { effort: 'xhigh' }, tools: TOOLS, prompt_cache_key: 'thread-1', input: [
+    { role: 'developer', content: [{ type: 'input_text', text: 'House rules.' }] },
+    { role: 'user', content: [{ type: 'input_text', text: 'Patch it' }, { type: 'input_image', image_url: 'data:image/png;base64,AAAA' }] },
+    { type: 'reasoning', encrypted_content: 'gAAAA-openai-only' },
+    { id: 'msg_from_gpt', type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: 'Looking.' }] },
+    { type: 'custom_tool_call', call_id: 'c0', name: 'apply_patch', input: '*** Begin Patch' },
+    { type: 'custom_tool_call_output', call_id: 'c0', output: 'failed' },
+    { type: 'function_call', call_id: 'c1', namespace: 'mcp__docs', name: 'search', arguments: '{"q":"a"}' },
+    { type: 'function_call_output', call_id: 'c1', output: [{ type: 'input_text', text: 'shot' }, { type: 'input_image', image_url: 'data:image/png;base64,BBBB' }] },
+  ] } as ResponsesRequest;
+  const output = await backend(login(3_600_000)).run(request);
+
+  const sent = responses()[0]!.body;
+  expect(sent).toMatchObject({ model: 'grok-4.7', instructions: 'Be brief.', reasoning: { effort: 'xhigh' }, prompt_cache_key: 'thread-1', stream: true, store: false, parallel_tool_calls: true });
+  expect((sent.tools as JsonRecord[]).map(tool => [tool.type, tool.name])).toEqual([['function', 'exec_command'], ['function', 'apply_patch'], ['function', 'mcp__docs_search']]);
+  expect((sent.tools as JsonRecord[])[1]!.parameters).toMatchObject({ required: ['input'] });
+  expect(sent.input).toEqual([
+    { type: 'message', role: 'developer', content: [{ type: 'input_text', text: 'House rules.' }] },
+    { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Patch it' }, { type: 'input_image', image_url: 'data:image/png;base64,AAAA' }] },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Looking.' }] },
+    { type: 'function_call', call_id: 'c0', name: 'apply_patch', arguments: '{"input":"*** Begin Patch"}' },
+    { type: 'function_call_output', call_id: 'c0', output: 'failed' },
+    { type: 'function_call', call_id: 'c1', name: 'mcp__docs_search', arguments: '{"q":"a"}' },
+    { type: 'function_call_output', call_id: 'c1', output: [{ type: 'input_text', text: 'shot' }, { type: 'input_image', image_url: 'data:image/png;base64,BBBB' }] },
+  ]);
+
+  expect(output.text).toBe('working');
+  expect(output.toolCalls).toEqual([
+    { name: 'apply_patch', arguments: '*** Begin Patch\n*** End Patch', callId: 'call_x1' },
+    { name: 'mcp__docs.search', arguments: '{"q":"boron"}', callId: 'call_x2' },
+  ]);
+  expect(output.usage).toEqual({ inputTokens: 40, outputTokens: 5, totalTokens: 45 });
+  // The router renders them as Codex's own item types.
+  expect(responseObject(request, output).output.map(item => [item.type, item.name ?? null, item.namespace ?? null])).toEqual([
+    ['message', null, null], ['custom_tool_call', 'apply_patch', null], ['function_call', 'search', 'mcp__docs'],
+  ]);
 });
-test('Grok does not inherit paid API keys or scanner integrations',()=>{
- const before=process.env.XAI_API_KEY;process.env.XAI_API_KEY='fixture-paid-key';try{const env=grokEnvironment();expect(env.XAI_API_KEY).toBeUndefined();expect(env.GROK_MEMORY).toBe('0');expect(env.GROK_SUBAGENTS).toBe('0');expect(env.GROK_CLAUDE_HOOKS_ENABLED).toBe('0');}finally{if(before===undefined)delete process.env.XAI_API_KEY;else process.env.XAI_API_KEY=before;}
+
+test('Grok reasoning is put back before its own calls on the next turn', async () => {
+  const grok = backend(login(3_600_000));
+  replies.push(() => completed([{ type: 'reasoning', id: 'rs_1', encrypted_content: 'xai-thoughts', summary: [] }, { type: 'function_call', call_id: 'call_r', name: 'exec_command', arguments: '{"cmd":"ls"}' }]));
+  const first = hello({ tools: TOOLS });
+  const output = await grok.run(first);
+  const next = { ...first, input: [...(first.input as JsonRecord[]), ...responseObject(first, output).output, { type: 'function_call_output', call_id: 'call_r', output: 'a b' }] } as ResponsesRequest;
+  await grok.run(next);
+  const input = responses()[1]!.body.input as JsonRecord[];
+  expect(input.map(item => item.type)).toEqual(['message', 'reasoning', 'function_call', 'function_call_output']);
+  expect(input[1]).toMatchObject({ encrypted_content: 'xai-thoughts' });
 });
-test('Grok bridges GPT compaction before consumption, refuses missing bridge or tampered summary',async()=>{
- const codec=new SummaryCodec(Buffer.alloc(32,3));let calls=0;const body={model:'grok-4.7',input:[{type:'compaction',encrypted_content:'gAAAA-opaque'}]};
- await expect(unwrap(codec,body)).rejects.toThrow('OpenAI-encrypted');
- const readable=await unwrap(codec,body,async encrypted=>{calls++;expect(encrypted).toBe('gAAAA-opaque');return 'CONSTRAINT=NO_WRITE';});expect(calls).toBe(1);expect(firstText(items(readable)[0])).toContain('CONSTRAINT=NO_WRITE');
- const capsule=codec.seal('test');await expect(unwrap(codec,{model:'grok-4.7',input:[{type:'compaction',encrypted_content:capsule.slice(0,-4)+'aaaa'}]})).rejects.toThrow();
- const compact=compactRequest({...body,tools,context_management:{},input:[{role:'user',content:'constraint'},{type:'compaction_trigger'}]});expect(compact.tools).toEqual([]);expect(compact.context_management).toBeUndefined();
+
+test('an expiring login refreshes once for concurrent turns and writes the rotated tokens back, keeping other fields', async () => {
+  const home = login(60_000);
+  const grok = backend(home);
+  await Promise.all([grok.run(hello()), grok.run(hello())]);
+  expect(seen.filter(entry => entry.path === '/oauth2/token')).toHaveLength(1);
+  expect(seen.find(entry => entry.path === '/oauth2/token')!.body).toMatchObject({ grant_type: 'refresh_token', refresh_token: 'refresh-0' });
+  expect(responses().map(entry => entry.headers.authorization)).toEqual(['Bearer access-1', 'Bearer access-1']);
+  const stored = Object.values(JSON.parse(readFileSync(join(home, 'auth.json'), 'utf8')))[0] as JsonRecord;
+  expect(stored).toMatchObject({ key: 'access-1', refresh_token: 'refresh-1', email: 'grok@example.com', team_id: 'team' });
+  expect(Date.parse(String(stored.expires_at)) - Date.now()).toBeGreaterThan(21_000_000);
+  expect(statSync(join(home, 'auth.json')).mode & 0o777).toBe(0o600);
+  // A valid token is used as is.
+  await grok.run(hello());
+  expect(refreshes).toBe(1);
 });
-test('Grok plaintext subagent task reaches every recipient with metadata preserved',()=>{
- const body={input:[{type:'agent_message',author:'/root',recipient:'/root/child',content:[{type:'encrypted_content',encrypted_content:'TASK=READ_ONLY; PATH=/fixture'}]}]};const normalized=normalizeAgentPayloads(body);expect(items(normalized)[0]!.author).toBe('/root');expect(items(normalized)[0]!.recipient).toBe('/root/child');expect(items(normalized)[0]!.content?.[0]).toEqual({type:'input_text',text:'TASK=READ_ONLY; PATH=/fixture'});
+
+test('a 401 refreshes and retries once; a rejected refresh tells the user to sign in again', async () => {
+  const home = login(3_600_000);
+  replies.push(() => Response.json({ error: 'expired' }, { status: 401 }));
+  expect((await backend(home).run(hello())).text).toBe('ok');
+  expect(responses().map(entry => entry.headers.authorization)).toEqual(['Bearer access-0', 'Bearer access-1']);
+
+  refreshReply = () => Response.json({ error: 'invalid_grant' }, { status: 400 });
+  await expect(backend(login(0)).run(hello())).rejects.toThrow(/signed out.*grok login/);
+  await expect(backend(mkdtempSync(join(tmpdir(), 'grok-empty-'))).run(hello())).rejects.toThrow(/signed out/);
 });
-test('Grok refuses unresolved compaction and unsupported files before any model generation',async()=>{
- await expect(runGrok({model:'grok-4.7',input:[{type:'compaction',content:'opaque'}]})).rejects.toThrow('unrestored compaction');
- await expect(runGrok({model:'grok-4.7',input:[{role:'user',content:[{type:'input_file',file_id:'fixture-file'}]}]})).rejects.toThrow('attachment');
+
+test('a server that rejects the client version is retried with the current Grok Build version', async () => {
+  latestVersion = '1.0.52';
+  expect((await backend(login(3_600_000)).run(hello())).text).toBe('ok');
+  expect(responses().map(entry => [entry.headers['x-grok-client-version'], entry.headers['user-agent']])).toEqual([['1.0.46', 'xai-grok-workspace/1.0.46'], ['1.0.52', 'xai-grok-workspace/1.0.52']]);
 });
-test('Grok unsafe inputs produce terminal HTTP and WebSocket failures without upstream fallback',async()=>{
- const {mkdtemp,rm}=await import('node:fs/promises');const {tmpdir}=await import('node:os');const {startRouter}=await import('../src/router/server');
- const dir=await mkdtemp(tmpdir()+'/grok-terminal-');await Bun.write(dir+'/auth.json',JSON.stringify({auth_mode:'chatgpt',tokens:{access_token:'fixture',account_id:'fixture'}}));await Bun.write(dir+'/catalog.json','{}');let upstream=0;
- const server=startRouter({port:0,authFile:dir+'/auth.json',catalog:dir+'/catalog.json',upstreamFetch:(async()=>{upstream++;throw new Error('unexpected fallback');}) as unknown as typeof fetch});
- const headers={authorization:'Bearer fixture'};
- try {
-  const response=await fetch(server.url+'v1/responses',{method:'POST',headers,body:JSON.stringify({model:'grok-4.6',input:'test',generate:false,stream:true})});const raw=await response.text();expect(raw).toContain('response.failed');expect(raw).toContain('invalid_prompt');
-  const result=await new Promise<any>((resolve,reject)=>{const Socket=WebSocket as unknown as {new(url:string,options:{headers:Record<string,string>}):WebSocket};const ws=new Socket(String(server.url).replace('http','ws')+'v1/responses',{headers});const timer=setTimeout(()=>{ws.close();reject(new Error('timeout'));},2000);ws.onopen=()=>ws.send(JSON.stringify({type:'response.create',model:'grok-4.7',input:[{type:'compaction',encrypted_content:'unrestored'}]}));ws.onmessage=e=>{const event=JSON.parse(String(e.data));if(!['response.failed','response.completed','error'].includes(event.type))return;clearTimeout(timer);ws.close();resolve(event);};ws.onerror=reject;});
-  expect(result.type).toBe('response.failed');expect(result.response.error.code).toBe('invalid_prompt');expect(upstream).toBe(0);
- }finally{server.stop(true);await rm(dir,{recursive:true});}
+
+test('refusals reach Codex with the code it acts on', async () => {
+  const grok = backend(login(3_600_000));
+  replies.push(() => Response.json({ code: 'invalid-argument', error: 'Failed to start sampling: [input_too_large] The prompt is too long for this model\'s context window' }, { status: 400 }));
+  await expect(grok.run(hello())).rejects.toMatchObject({ code: 'context_length_exceeded' });
+  replies.push(() => Response.json({ error: 'Rate limit exceeded' }, { status: 429 }));
+  await expect(grok.run(hello())).rejects.toThrow('Grok usage limit reached: Rate limit exceeded');
+  replies.push(() => Response.json({ error: 'overloaded' }, { status: 503 }));
+  await expect(grok.run(hello())).rejects.toMatchObject({ code: 'server_is_overloaded' });
+  replies.push(() => Response.json({ error: 'The model does not exist' }, { status: 404 }));
+  await expect(grok.run(hello())).rejects.toThrow('xAI HTTP 404: The model does not exist');
+  await expect(grok.run(hello({ reasoning: { effort: 'max' } }))).rejects.toThrow('Unsupported Grok reasoning effort');
 });
-test('encrypted helper handoff decoder preserves metadata, caches authenticated text and fails closed on invalid extraction',async()=>{
- const {mkdtemp,rm}=await import('node:fs/promises');const {tmpdir}=await import('node:os');const {CompactionBridge}=await import('../src/router/bridge');
- const dir=await mkdtemp(tmpdir()+'/grok-handoff-');const codec=new SummaryCodec(Buffer.alloc(32,4));let calls=0;const item={type:'agent_message',author:'/root',recipient:'/root/child',content:[]};
- const frame=(e:any)=>'data: '+JSON.stringify(e)+'\n\n';
- const bridge=new CompactionBridge(codec,dir,async body=>{calls++;expect(body.tools).toEqual([]);expect(items(body)[0]!.author).toBe('/root');expect(items(body)[0]!.recipient).toBe('/root/child');expect((items(body)[0]!.content?.[0] as { encrypted_content?: string }).encrypted_content).toBe('gAAAA-fixture');return new Response(frame({type:'response.output_text.delta',delta:JSON.stringify({message:'TASK=ONLY_READ /fixture; NEVER_WRITE'})})+frame({type:'response.completed',response:{}}));});
- try{
-  expect(await bridge.agentText(item,'gAAAA-fixture')).toBe('TASK=ONLY_READ /fixture; NEVER_WRITE');expect(await bridge.agentText(item,'gAAAA-fixture')).toBe('TASK=ONLY_READ /fixture; NEVER_WRITE');expect(calls).toBe(1);
-  for(const file of new Bun.Glob('*.cap').scanSync(dir))expect(await Bun.file(dir+'/'+file).text()).not.toContain('NEVER_WRITE');
-  const invalid=new CompactionBridge(codec,dir,async()=>new Response(frame({type:'response.output_text.delta',delta:'invented response without structured message'})+frame({type:'response.completed',response:{}})));await expect(invalid.agentText(item,'gAAAA-other')).rejects.toThrow('no task was sent');
-  const refused=new CompactionBridge(codec,dir,async()=>new Response(frame({type:'response.output_text.delta',delta:JSON.stringify({message:"I cannot recover the task."})})+frame({type:'response.completed',response:{}})));await expect(refused.agentText(item,'gAAAA-refusal')).rejects.toThrow('no task was sent');
- }finally{await rm(dir,{recursive:true});}
+
+test('a 5xx is retried like native Codex, and a stream that fails after opening gets one fresh attempt', async () => {
+  const grok = backend(login(3_600_000));
+  replies.push(() => new Response('{}', { status: 500 }), () => new Response('{}', { status: 502 }));
+  expect((await grok.run(hello())).text).toBe('ok');
+  expect(responses()).toHaveLength(3);
+  seen.length = 0;
+  replies.push(() => sse({ type: 'response.failed', response: { error: { message: 'sampler crashed' } } }));
+  expect((await grok.run(hello())).text).toBe('ok');
+  expect(responses()).toHaveLength(2);
+  replies.push(() => sse({ type: 'response.failed', response: { error: { message: 'prompt is too long' } } }));
+  await expect(grok.run(hello())).rejects.toMatchObject({ code: 'context_length_exceeded' });
 });
-test('Grok isolation fingerprint changes for a modified native deny hook',async()=>{
- const {mkdtemp,mkdir,writeFile,rm}=await import('node:fs/promises');const {tmpdir}=await import('node:os');const {grokProfileHash}=await import('../src/backends/grok');
- const dir=await mkdtemp(tmpdir()+'/grok-profile-');await mkdir(dir+'/home');await mkdir(dir+'/home/hooks');await writeFile(dir+'/home/hooks/deny.json','deny');await writeFile(dir+'/deny-native.py','deny');const old=process.env.GROK_HOME;
- try{process.env.GROK_HOME=dir+'/home';const before=grokProfileHash();await writeFile(dir+'/deny-native.py','changed');expect(grokProfileHash()).not.toBe(before);}finally{if(old===undefined)delete process.env.GROK_HOME;else process.env.GROK_HOME=old;await rm(dir,{recursive:true});}
+
+test('a stream that ends without a terminal event is a dropped connection, and silence trips the idle timeout', async () => {
+  const grok = backend(login(3_600_000));
+  replies.push(() => sse({ type: 'response.created', response: {} }));
+  await expect(grok.run(hello())).rejects.toMatchObject({ name: 'ProxyTransportError', reconnectable: true });
+  const saved = process.env.GROK_TIMEOUT_MS;
+  process.env.GROK_TIMEOUT_MS = '150';
+  try {
+    replies.push(() => new Response(new ReadableStream({ start() {} }), { headers: { 'content-type': 'text/event-stream' } }));
+    const failure = await grok.run(hello()).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(Error);
+    // The router reads a TimeoutError as a timed-out connection, which Codex retries.
+    expect((failure as Error).name).toBe('TimeoutError');
+  } finally { if (saved === undefined) delete process.env.GROK_TIMEOUT_MS; else process.env.GROK_TIMEOUT_MS = saved; }
 });
-test('portable compaction retains short user requests even if the model omits middle constraints',async()=>{
- const {portableSummary}=await import('../src/router/capsule');const codec=new SummaryCodec(Buffer.alloc(32,8));
- const source=[{role:'user',content:'FRONT=123; NEVER WRITE /locked'},{role:'user',content:'irrelevant '.repeat(9000)},{role:'user',content:[{type:'input_text',text:'MIDDLE=456; pending read-only /next'}]},{role:'user',content:'TAIL=789'}];
- const first=codec.seal(portableSummary('Lossy summary contains only TAIL=789',source));
- const restored=await unwrap(codec,{model:'grok-4.7',input:[{type:'compaction',encrypted_content:first}]});
- expect(JSON.stringify(restored)).toContain('MIDDLE=456');expect(JSON.stringify(restored)).toContain('NEVER WRITE /locked');expect(restored.input).toHaveLength(5);
- const second=codec.seal(portableSummary('Another lossy summary',items(restored)));
- for(const model of ['gpt-6.1-sol','claude-opus-5-5','grok-4.7']){const again=await unwrap(codec,{model,input:[{type:'compaction',encrypted_content:second}]});expect(JSON.stringify(again)).toContain('MIDDLE=456');expect(again.input).toHaveLength(5);}
- // An oversized chat still compacts: first and newest requests stay exact, the trimmed middle is counted.
- const big=JSON.parse(portableSummary('summary',Array.from({length:100},(_,i)=>({role:'user',content:`REQ${i} `+'x'.repeat(2000)}))));
- expect(big.anchors[0].startsWith('REQ0 ')).toBe(true);expect(big.anchors.at(-1).startsWith('REQ99 ')).toBe(true);
- expect(big.summary).toMatch(/\d+ older verbatim user requests exceeded capsule capacity/);
- expect(Buffer.byteLength(JSON.stringify({anchors:big.anchors,tool_history:big.tool_history}))).toBeLessThanOrEqual(96000);
- expect(JSON.parse(portableSummary('s',[{role:'user',content:'same'},{role:'user',content:'same'}])).anchors).toEqual(['same']);
-});
-test('Grok function arguments: raw control characters are repaired losslessly, garbage still fails closed',async()=>{
- const {functionArguments,GrokError}=await import('../src/backends/grok');
- const raw='{"cmd":"git -C /repo log\n--stat\tx"}';
- const fixed=functionArguments(raw);expect(JSON.parse(fixed)).toEqual({cmd:'git -C /repo log\n--stat\tx'});
- expect(functionArguments('{"cmd":"ls"}')).toBe('{"cmd":"ls"}');
- expect(JSON.parse(functionArguments(JSON.stringify(JSON.stringify({cmd:'ls'}))))).toEqual({cmd:'ls'});
- expect(JSON.parse(functionArguments('{"cmd":"echo \\"a\nb\\""}')).cmd).toBe('echo "a\nb"');
- for(const bad of ['{"cmd":"ls"','not json','[1]','5']){let error:any;try{functionArguments(bad);}catch(e){error=e;}expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);}
-});
-test('Grok function arguments: regex and shell backslashes survive as literal backslashes; valid escapes keep their meaning',async()=>{
- const {functionArguments,GrokError}=await import('../src/backends/grok');
- // The shape that failed live: a secrets grep whose regex escapes were never doubled.
- const command=String.raw`git -C /repo grep -nE 'api[_-]?key\s*=|\.env$|token\|secret' -- . | grep -v \$HOME | grep -E '\bpassword\b'`;
- const raw='{"cmd":"'+command+'","workdir":"/repo"}';
- expect(()=>JSON.parse(raw)).toThrow();
- expect(JSON.parse(functionArguments(raw))).toEqual({cmd:command,workdir:'/repo'});
- // Valid JSON is authoritative, including standard backspace/form-feed escapes. Literal regex
- // backslashes are preserved when encoded correctly rather than silently changing valid data.
- const controls=String.raw`{"cmd":"rg '\bfoo\b' \f"}`;
- expect(functionArguments(controls)).toBe(controls);expect(JSON.parse(functionArguments(controls))).toEqual(JSON.parse(controls));
- const regex=String.raw`rg '\bfoo\b' \f`;
- expect(JSON.parse(functionArguments(JSON.stringify({cmd:regex}))).cmd).toBe(regex);
- // Already-valid escapes are untouched byte for byte.
- const valid=String.raw`{"cmd":"a\nb \"q\" A \\ \/ \t"}`;
- expect(functionArguments(valid)).toBe(valid);expect(JSON.parse(functionArguments(valid)).cmd).toBe('a\nb "q" A \\ / \t');
- // A double-encoded object whose inner JSON carries the same invalid escapes.
- expect(JSON.parse(functionArguments(JSON.stringify(String.raw`{"cmd":"grep a\.b"}`)))).toEqual({cmd:String.raw`grep a\.b`});
- // Repair never touches structure: anything broken outside string literals still fails closed and retryable.
- for(const bad of [String.raw`{"cmd":"a\.b"`,String.raw`{"cmd":"a\.b",}`,String.raw`{cmd:"a\.b"}`,String.raw`{"cmd":"a\"}`,String.raw`["a\.b"]`]){let error:any;try{functionArguments(bad);}catch(e){error=e;}expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);}
-});
-test('Grok repeat guard refuses a third identical call with an identical result; recap puts the latest result last',async()=>{
- const {assertNotLooping,latestStepRecap,GrokError}=await import('../src/backends/grok');
- const args='{"cmd":"rg -n sleep README.md"}';
- const step=(id:string,output:string)=>[{type:'function_call',name:'exec_command',call_id:id,arguments:args},{type:'function_call_output',call_id:id,output}];
- const same=(id:string,wall:string)=>step(id,`Chunk ID: ${id}\nWall time: ${wall}\nOutput:\n50: sleep notes`);
- const looping={model:'grok-4.7',input:[{role:'user',content:'go'},...same('a','0.1'),...same('b','0.0')]} as any;
- let error:any;try{assertNotLooping(looping,[{name:'exec_command',arguments:args}]);}catch(e){error=e;}
- expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);expect(error.message).toContain('call_id b');
- // A different next step, a changed result, a single prior run, or a polling tool all pass.
- assertNotLooping(looping,[{name:'exec_command',arguments:'{"cmd":"cat sleep.md"}'}]);
- assertNotLooping({...looping,input:[...same('a','0.1'),...step('b','Output:\n51: changed')]},[{name:'exec_command',arguments:args}]);
- assertNotLooping({...looping,input:same('a','0.1')},[{name:'exec_command',arguments:args}]);
- const poll='{"session_id":1,"chars":""}';
- assertNotLooping({model:'grok-4.7',input:[{type:'function_call',name:'write_stdin',call_id:'p',arguments:poll},{type:'function_call_output',call_id:'p',output:'x'},{type:'function_call',name:'write_stdin',call_id:'q',arguments:poll},{type:'function_call_output',call_id:'q',output:'x'}]} as any,[{name:'write_stdin',arguments:poll}]);
- // The recap appears only when the conversation ends on a tool result, and it carries that result.
- const recap=latestStepRecap(looping);expect(recap).toContain('<latest_step>');expect(recap).toContain('call_id b');expect(recap).toContain('50: sleep notes');
- expect(latestStepRecap({...looping,input:[...looping.input,{role:'user',content:'new question'}]})).toBe('');
- expect(latestStepRecap({model:'grok-4.7',input:'hi'} as any)).toBe('');
-});
-test('Grok function arguments may be a real object; custom payloads must be unambiguous raw strings; schema allows both',async()=>{
- const {parseGrokOutput,grokOutputSchema,GrokError}=await import('../src/backends/grok');
- const tools=[{type:'function',name:'exec_command',parameters:{type:'object'}},{type:'custom',name:'apply_patch'}] as any;
- const req={model:'grok-4.7',input:'go',tools} as any;
- const cmd=String.raw`rg -n "a\.b" --glob '!x'`;
- const out=parseGrokOutput(JSON.stringify({text:'',tool_calls:[{name:'exec_command',arguments:{cmd}}]}),req);
- expect(JSON.parse(out.toolCalls[0]!.arguments)).toEqual({cmd});
- for(const bad of [{name:'apply_patch',arguments:{patch:'x',other:'ambiguous'}},{name:'exec_command',arguments:['x']}]){let error:any;try{parseGrokOutput(JSON.stringify({text:'',tool_calls:[bad]}),req);}catch(e){error=e;}expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);}
- const schema:any=grokOutputSchema(tools);
- expect(schema.properties.tool_calls.items.properties.arguments).toEqual({anyOf:[{type:'object'},{type:'string'}]});
-});
-test('Grok calls missing a required field are refused; harmless extra fields are dropped',async()=>{
- const {parseGrokOutput,GrokError}=await import('../src/backends/grok');
- const parameters={type:'object',properties:{cmd:{type:'string'},workdir:{type:'string'}},required:['cmd'],additionalProperties:false};
- const req={model:'grok-4.7',input:'go',tools:[{type:'function',name:'exec_command',parameters},{type:'function',name:'open',parameters:{type:'object',properties:{path:{type:'string'}}}}]} as any;
- const call=(name:string,args:any)=>parseGrokOutput(JSON.stringify({text:'',tool_calls:[{name,arguments:args}]}),req);
- expect(JSON.parse(call('exec_command',{cmd:'ls',workdir:'/tmp'}).toolCalls[0]!.arguments)).toEqual({cmd:'ls',workdir:'/tmp'});
- expect(call('open',{path:'a',extra:1}).toolCalls).toHaveLength(1);
- expect(JSON.parse(call('exec_command',{cmd:'ls',description:'list'}).toolCalls[0]!.arguments)).toEqual({cmd:'ls'});
- expect(JSON.parse(call('exec_command',{cmd:'ls',command:'ls'}).toolCalls[0]!.arguments)).toEqual({cmd:'ls'});
- for(const args of [{command:'ls'},'{"command":"ls"}']){
-  let error:any;try{call('exec_command',args);}catch(e){error=e;}
-  expect(error).toBeInstanceOf(GrokError);expect(error.retryable).toBe(true);expect(error.message).toContain('exec_command');expect(error.message).toContain('cmd');
- }
-});
-test('helper message extraction accepts reports and fenced JSON, rejects real refusals only',async()=>{
- const {extractAgentMessage}=await import('../src/router/bridge');
- const report='FINAL_ANSWER: done. There was no task left for the cleanup branch; missing instructions in README were fixed. '+'detail '.repeat(80);
- expect(extractAgentMessage(JSON.stringify({message:report}))).toBe(report);
- expect(extractAgentMessage('```json\n'+JSON.stringify({message:'Review PR #835'})+'\n```')).toBe('Review PR #835');
- expect(extractAgentMessage(JSON.stringify({message:"I can't recover the encrypted message."}))).toEqual({reason:'refusal'});
- expect(extractAgentMessage('{"unavailable":true}')).toEqual({reason:'unavailable'});
- expect(extractAgentMessage('plain prose')).toEqual({reason:'not-json'});
- expect(extractAgentMessage(JSON.stringify({message:'x',extra:1}))).toEqual({reason:'wrong-shape'});
+
+test('the catalog row advertises images and the real 500K window', () => {
+  expect(backend(login(0)).catalog).toEqual([expect.objectContaining({ slug: 'grok-4.7', inputModalities: ['text', 'image'], contextWindow: 500_000, efforts: ['low', 'medium', 'high', 'xhigh'] })]);
 });

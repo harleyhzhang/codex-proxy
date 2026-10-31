@@ -15,7 +15,8 @@ import { logSafe } from '../log';
 import { abortable, ProxyTransportError, sleep, transportError } from '../transport';
 import { CursorBridgePool, type CursorLease } from './cursor-pool';
 import { responseObject } from '../protocol/output';
-import { CUSTOM_TOOLS_PROVIDER, NativeCallbackServer, NativeRun, nativeToolList, nativeTools, rawInputTools, toolResult, type ToolResult } from './cursor-native';
+import { CUSTOM_TOOLS_PROVIDER, NativeCallbackServer, NativeRun, nativeToolList, toolResult, type ToolResult } from './cursor-native';
+import { functionTools, rawInputTools } from '../protocol/native-tools';
 
 const CURSOR_MODELS = {
   // `context` is the Cursor model parameter requested (the largest each model offers); `window` is what
@@ -521,7 +522,7 @@ class CursorRuntime {
       if (!isRecord(discovered) || !Array.isArray(discovered.parameters)) throw new CursorError('Requested model is unavailable on the pinned Cursor account');
       const definitions = discovered.parameters;
       if ((selection.params as Array<{ id: string; value: string }>).some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
-      const tools = nativeTools(toolDescriptors(requestTools(request)));
+      const tools = functionTools(toolDescriptors(requestTools(request)));
       const hasTools = tools.byKey.size > 0;
       const agentDir = await mkdtemp(join(bridge.dir, 'agent-')); await chmod(agentDir, 0o700);
       // Only the MCP group is allowed, and the only MCP server is the router's: no shell, edit, read,

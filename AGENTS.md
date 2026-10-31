@@ -11,7 +11,7 @@ src/
   backends/      contract.ts (SubscriptionBackend), registry.ts, claude.ts, grok.ts, cursor.ts (+ cursor-native.ts tools, cursor-pool.ts)
   router/        server.ts (HTTP + WebSocket), auth, account-upstream, history, capsule, bridge, upstream
 test/            bun test; support.ts has shared fixtures
-scripts/         account-cache.ts (native secondary catalog), grok-deny-native.py (Grok PreToolUse hook)
+scripts/         account-cache.ts (native secondary catalog)
 ```
 
 Rules:

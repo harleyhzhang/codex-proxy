@@ -1,778 +1,359 @@
-// Grok through the official Grok Build CLI. Subscription access stays with the CLI; its OAuth token
-// is never read or forwarded. Every turn runs in a fresh, private directory with native tools
-// removed, denied and hooked, so Codex remains the only thing that executes actions.
-import { existsSync, lstatSync, readdirSync, readFileSync } from 'node:fs';
-import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises';
+// Grok through xAI's Responses endpoint, signed in with the Grok Build login (its auth.json in GROK_HOME,
+// refreshed here). Codex's tools become function tools, so Grok makes real tool calls; requests and
+// replies are the Responses format Codex already speaks, translated only where names and item types differ.
+import { readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { childEnvironment, nonNegativeInt, positiveInt } from '../env';
-import { isRecord, type JsonRecord, pinnedFileHash, randomId, sha256 } from '../json';
+import { positiveInt } from '../env';
+import { isRecord, type JsonRecord } from '../json';
 import { logSafe } from '../log';
-import { outputSchema, preparePrompt, requestToPrompt, requestTools, type ToolDescriptor, toolDescriptors } from '../protocol/prompt';
-import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ResponseTool, ToolCall } from '../protocol/types';
-import { BackendError, classifyCliFailure, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
-import { transportError } from '../transport';
-import { checkToolArguments, fieldName, sameToolArguments } from '../protocol/tool-schema';
+import { functionTools, rawInput } from '../protocol/native-tools';
+import { COMPUTER_TOOL_NAME, imageUrl, isImagePart, requestTools, TOOL_SEARCH_NAME, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { sseEvents } from '../protocol/stream';
+import type { ProxyOutput, ResponseInputItem, ResponsesRequest, StreamEvent, ToolCall } from '../protocol/types';
+import { abortable, ProxyTransportError, sleep } from '../transport';
+import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, type SubscriptionBackend } from './contract';
 
 const MODEL = 'grok-4.7';
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'] as const;
-const MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
-const MAX_TOOL_CALLS = 64;
+/** Grok Build's public OAuth client; the login in auth.json was issued to it. */
+const CLIENT_ID = 'b1a00492-073a-47ea-816f-4c329264a828';
+const REFRESH_LEAD_MS = 5 * 60_000;
+/** Native Codex retries a 5xx four times with a doubling 200 ms backoff. */
+const SERVER_RETRIES = 4;
 
-/**
- * Grok's own tool names, denied by exact internal ID (the CLI has no alias map). `run_terminal_cmd`
- * and `write` are the real shell and write IDs; `search_tool`/`use_tool` are the MCP meta tools the
- * allowlist always keeps unless they are denied. The older names stay for other CLI versions.
- */
-const NATIVE_TOOLS = [
-  'Agent', 'bash', 'run_terminal_command', 'read_file', 'write_file', 'search_replace', 'apply_patch',
-  'list_dir', 'grep_search', 'file_search', 'todo_write', 'web_fetch', 'web_search', 'grep', 'glob', 'ls',
-  'view_file', 'edit_file', 'create_file', 'delete_file',
-  'run_terminal_cmd', 'write', 'search_tool', 'use_tool',
-];
-/**
- * The `--tools` allowlist. It must name a tool the CLI recognizes: an unknown name makes Grok Build
- * 1.0.46 log "tools allowlist had unmappable entries; keeping full grok toolset" and enable every
- * remaining native tool. `read_file` is recognized and also denied above, so the session registers no tools at
- * all (verified October 30, 2026: tool_count=0, empty tool_definitions).
- */
-const ALLOWED_TOOLS = 'read_file';
-const DENIED_TOOLS = ['Bash', 'Read', 'Grep', 'Edit', 'Write', 'WebFetch', 'MCPTool'];
-/** The message the PreToolUse hook (scripts/grok-deny-native.py) returns for every native call. */
-const NATIVE_DENIAL = 'Native Grok actions disabled: Codex owns execution';
+export type GrokOptions = {
+  /** The Grok Build home holding auth.json. */
+  home: string;
+  baseUrl?: string;
+  issuer?: string;
+  /** Where the current Grok Build version is looked up after the server rejects ours as too old. */
+  versionUrl?: string;
+};
 
-/**
- * Each hook denial of a native attempt costs Grok one internal turn. Three left no room after a
- * single denial; six does, and every native attempt must still show a confirmed denial.
- */
-const MAX_TURNS = 6;
-
-/** Polling tools are expected to repeat, so the loop guard ignores them. */
-const POLLING_TOOLS = new Set(['write_stdin', 'wait', 'sleep', 'clock__sleep', 'wait_agent', 'wait_threads']);
-function isPollingTool(name: string): boolean {
-  const leaf = name.split('.').at(-1) ?? name;
-  // Normalize only Codex's explicit MCP convention, never arbitrary suffixes or read/get tools.
-  const poll = /^mcp__[A-Za-z0-9_-]+__(wait_agent|wait_threads)$/.exec(leaf)?.[1] ?? leaf;
-  return POLLING_TOOLS.has(poll);
-}
-const CALL_TYPES = new Set(['function_call', 'custom_tool_call']);
-const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output']);
-const BLOCKED_ENV = /^(XAI_API_KEY|GROK_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_OAUTH_TOKEN|PROXY_API_KEY)$/;
-
-/** A Grok refusal. Retryable only when nothing reached Codex; see `retryOnce`. */
 export class GrokError extends BackendError {
-  constructor(message: string, retryable = false, modelOutput = false) {
-    super(message, { retryable, modelOutput });
+  constructor(message: string, retryable = false) {
+    super(message, { retryable });
     this.name = 'GrokError';
   }
 }
 
-const grokHome = () => process.env.GROK_HOME ?? join(homedir(), '.grok');
-
-/** A hash of every file that can change how Grok behaves: config, policy, hooks and plugins. */
-export function grokProfileHash(): string {
-  const home = grokHome();
-  const parts: Array<string | Uint8Array> = [];
-  const files = [
-    join(home, 'config.toml'),
-    join(home, 'managed_config.toml'),
-    join(home, 'requirements.toml'),
-    join(home, '..', 'deny-native.py'),
-    '/etc/grok/managed_config.toml',
-    '/etc/grok/requirements.toml',
-  ];
-  for (const path of files) {
-    if (existsSync(path)) parts.push(path, readFileSync(path));
-  }
-  for (const folder of [join(home, 'hooks'), join(home, 'plugins')]) {
-    if (existsSync(folder)) hashTree(folder, parts, { files: 0, bytes: 0 }, 0);
-  }
-  return sha256(Buffer.concat(parts.map((part) => (typeof part === 'string' ? Buffer.from(part) : part))));
-}
-
-const PROFILE_TREE_LIMITS = { depth: 8, files: 2000, bytes: 64 * 1024 * 1024 };
+const signedOut = (home: string) =>
+  new GrokError(`Grok is signed out: its login expired or was rejected. Sign in again with \`GROK_HOME=${JSON.stringify(home)} grok login\`; no automatic fallback`);
 
 /**
- * Hooks and plugins, recursively. Each entry contributes its path, then a file its bytes or a
- * directory its own entries, so a flat folder hashes exactly as the earlier one-level scan did and
- * existing pins stay valid. A symlink pauses the backend: its target's bytes could change behind an
- * unchanged link, and following it could loop or leave the profile. A tree past the limits also
- * pauses the backend instead of hashing part of it.
+ * The Grok Build login. The access token lasts six hours and every refresh rotates the refresh token,
+ * so the router is the only thing that refreshes it: concurrent turns share one refresh and the new
+ * tokens are written back atomically (other fields untouched), where `grok login` also writes.
  */
-function hashTree(folder: string, parts: Array<string | Uint8Array>, seen: { files: number; bytes: number }, depth: number): void {
-  if (depth > PROFILE_TREE_LIMITS.depth) throw new GrokError('Grok native profile is nested too deeply to verify; backend paused pending isolation review');
-  for (const name of readdirSync(folder).sort()) {
-    const file = `${folder}/${name}`;
-    parts.push(file);
-    const stat = lstatSync(file);
-    if (stat.isSymbolicLink()) {
-      throw new GrokError('Grok native profile contains a symlink under hooks or plugins; backend paused pending isolation review');
-    } else if (stat.isDirectory()) {
-      hashTree(file, parts, seen, depth + 1);
-    } else if (stat.isFile()) {
-      seen.files += 1;
-      seen.bytes += stat.size;
-      if (seen.files > PROFILE_TREE_LIMITS.files || seen.bytes > PROFILE_TREE_LIMITS.bytes) {
-        throw new GrokError('Grok native profile is too large to verify; backend paused pending isolation review');
-      }
-      parts.push(readFileSync(file));
-    }
+class GrokLogin {
+  private refreshing?: Promise<string>;
+  private tokenEndpoint?: string;
+  constructor(private readonly home: string, private readonly issuer: string) {}
+
+  private read(): { file: JsonRecord; entry: JsonRecord } {
+    let file: unknown;
+    try { file = JSON.parse(readFileSync(join(this.home, 'auth.json'), 'utf8')); } catch { throw signedOut(this.home); }
+    const slot = isRecord(file) ? Object.keys(file).find(key => key.startsWith(`${this.issuer}::`)) : undefined;
+    const entry = isRecord(file) && slot && isRecord(file[slot]) ? file[slot] : undefined;
+    if (!isRecord(file) || !entry || typeof entry.key !== 'string' || typeof entry.refresh_token !== 'string') throw signedOut(this.home);
+    return { file, entry };
   }
-}
 
-/** The CLI environment: no API keys, and every optional Grok subsystem switched off. */
-export function grokEnvironment(): Record<string, string> {
-  const env = childEnvironment((key) => BLOCKED_ENV.test(key));
-  Object.assign(env, {
-    GROK_HOME: grokHome(),
-    GROK_DISABLE_AUTOUPDATER: '1',
-    GROK_MEMORY: '0',
-    GROK_SUBAGENTS: '0',
-    GROK_WORKFLOWS: '0',
-    GROK_MANAGED_MCP_GATEWAY_TOOLS_ENABLED: '0',
-    GROK_LSP_TOOLS: '0',
-    GROK_TELEMETRY_ENABLED: '0',
-    GROK_TELEMETRY_TRACE_UPLOAD: '0',
-    GROK_TELEMETRY_MIXPANEL_ENABLED: '0',
-    // Documented `features.session_search`. Every run otherwise indexes all of the CLI's stored
-    // sessions before the request goes out (454 sessions, 147 MB read, 0.8 s warm on October 30,
-    // 2026), and each router turn adds one more. The router replays full history and never uses it.
-    GROK_SESSION_SEARCH: '0',
-  });
-  for (const vendor of ['CLAUDE', 'CURSOR', 'CODEX']) {
-    for (const kind of ['SKILLS', 'RULES', 'AGENTS', 'MCPS', 'HOOKS']) env[`GROK_${vendor}_${kind}_ENABLED`] = '0';
+  /** A token valid for at least the refresh lead. `stale` forces a refresh unless it was already replaced. */
+  async token(signal?: AbortSignal, stale?: string): Promise<string> {
+    const { entry } = this.read();
+    const key = entry.key as string;
+    if (key !== stale && Date.parse(String(entry.expires_at)) - Date.now() > REFRESH_LEAD_MS) return key;
+    // Shared and not tied to one turn's signal: a cancelled turn must not abandon a rotation mid-flight.
+    this.refreshing ??= this.refresh().finally(() => { this.refreshing = undefined; });
+    return abortable(this.refreshing, signal);
   }
-  return env;
-}
 
-const JSON_ESCAPES = new Set(['"', '\\', '/', 'n', 'r', 't']);
-
-/**
- * Grok's tool arguments are JSON inside JSON, and long shell commands often break the inner level:
- * raw newlines inside strings, or regex and shell backslashes such as `\.` `\s` `\|` `\$` left
- * undoubled. Inside string literals this escapes raw control characters and keeps any non-JSON
- * escape as a literal backslash, which is what the command meant. `\b` and `\f` also stay literal:
- * in a command they are regex word boundaries, never backspace or form feed. Text outside string
- * literals is never touched, so broken structure still fails closed.
- */
-export function repairJsonStrings(raw: string): string {
-  let out = '';
-  let inString = false;
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i] as string;
-    if (!inString) {
-      out += ch;
-      if (ch === '"') inString = true;
-    } else if (ch === '"') {
-      out += ch;
-      inString = false;
-    } else if (ch === '\\') {
-      const next = raw[i + 1] ?? '';
-      if (JSON_ESCAPES.has(next)) {
-        out += ch + next;
-        i++;
-      } else if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(raw.slice(i + 2, i + 6))) {
-        out += raw.slice(i, i + 6);
-        i += 5;
-      } else {
-        out += '\\\\';
-      }
-    } else {
-      const code = ch.charCodeAt(0);
-      out += code < 0x20 ? `\\u${code.toString(16).padStart(4, '0')}` : ch;
-    }
-  }
-  return out;
-}
-
-/** Valid JSON is authoritative. Repairs are only a fallback for invalid string escaping. */
-function parseArgumentJson(raw: string): { value: unknown; serialized: string } {
-  try { return { value: JSON.parse(raw) as unknown, serialized: raw }; }
-  catch {
-    const serialized = repairJsonStrings(raw);
-    return { value: JSON.parse(serialized) as unknown, serialized };
-  }
-}
-
-/**
- * Returns the exact JSON object string Codex will receive, or throws a retryable refusal. Nothing
- * has executed at this point, so a refusal is always safe to retry.
- */
-export function functionArguments(raw: string): string {
-  let value: unknown;
-  let serialized: string;
-  try {
-    ({ value, serialized } = parseArgumentJson(raw));
-  } catch (error) {
-    const trimmed = raw.trim();
-    logSafe('grok-invalid-arguments', {
-      bytes: raw.length,
-      starts_object: trimmed.startsWith('{'),
-      ends_object: trimmed.endsWith('}'),
-      control_chars: /[\u0000-\u001f]/.test(raw),
-      backslashes: (raw.match(/\\/g) ?? []).length,
-      quotes: (raw.match(/"/g) ?? []).length,
-      error: (error instanceof Error ? error.message : 'parse').replace(/[^A-Za-z ]+.*$/, '').slice(0, 60),
+  private async refresh(): Promise<string> {
+    const started = performance.now();
+    const { file, entry } = this.read();
+    this.tokenEndpoint ??= await this.discover();
+    const response = await fetch(this.tokenEndpoint, {
+      method: 'POST', signal: AbortSignal.timeout(30_000),
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+      body: new URLSearchParams({ grant_type: 'refresh_token', client_id: CLIENT_ID, refresh_token: entry.refresh_token as string }),
     });
-    throw new GrokError('Grok returned invalid tool arguments; no tools were executed', true, true);
+    const body: unknown = await response.json().catch(() => undefined);
+    const token = isRecord(body) && typeof body.access_token === 'string' ? body.access_token : undefined;
+    if (!response.ok || !token || !isRecord(body)) {
+      logSafe('grok-refresh-failed', { status: response.status, error: isRecord(body) ? String(body.error ?? '') : '' });
+      if (response.status >= 500) throw new GrokError(`Grok login refresh failed (xAI HTTP ${response.status}); retry the turn`);
+      throw signedOut(this.home);
+    }
+    entry.key = token;
+    if (typeof body.refresh_token === 'string') entry.refresh_token = body.refresh_token;
+    entry.expires_at = new Date(Date.now() + (typeof body.expires_in === 'number' ? body.expires_in : 3600) * 1000).toISOString();
+    const path = join(this.home, 'auth.json');
+    writeFileSync(`${path}.tmp-router`, JSON.stringify(file, null, 2), { mode: 0o600 });
+    renameSync(`${path}.tmp-router`, path);
+    logSafe('grok-login-refreshed', { ms: Math.round(performance.now() - started), expires_in: typeof body.expires_in === 'number' ? body.expires_in : 0 });
+    return token;
   }
 
-  let result: string | undefined;
-  if (isRecord(value)) {
-    result = serialized;
-  } else if (typeof value === 'string') {
-    // Double-encoded: a JSON string whose content is the real object.
-    try {
-      const inner = parseArgumentJson(value);
-      if (isRecord(inner.value)) result = inner.serialized;
-    } catch {}
+  private async discover(): Promise<string> {
+    const response = await fetch(`${this.issuer}/.well-known/openid-configuration`, { signal: AbortSignal.timeout(30_000) });
+    const body: unknown = await response.json().catch(() => undefined);
+    const endpoint = isRecord(body) && typeof body.token_endpoint === 'string' ? body.token_endpoint : '';
+    if (!response.ok || !endpoint.startsWith(`${new URL(this.issuer).origin}/`)) throw new GrokError(`Grok login discovery failed (HTTP ${response.status}); retry the turn`);
+    return endpoint;
   }
-  if (result === undefined) throw new GrokError('Grok tool arguments must be a JSON object; no tools were executed', true, true);
-  if (result !== raw) logSafe('grok-arguments-repaired', { bytes: raw.length });
-  return result;
 }
 
 /**
- * Grok sometimes swaps a parameter name (`command` for `cmd`), which Codex rejects after the turn.
- * A missing required field becomes a retry that names the mistake. Undeclared extras (Grok likes
- * adding `description`) carry no meaning for the tool, so they are dropped instead.
+ * Grok's encrypted reasoning for the calls it made, put back in front of those calls when the history
+ * returns, so a tool loop keeps its train of thought. Codex never sees it, and other models never get it.
  */
-export function checkArgumentShape(name: string, raw: string, contract: unknown): string {
-  let args: unknown;
-  try { args = JSON.parse(raw); } catch { throw new GrokError('Grok returned invalid tool arguments; no tools were executed', true, true); }
-  if (!isRecord(args)) throw new GrokError('Grok tool arguments must be a JSON object; no tools were executed', true, true);
-  const { declared, missing, dropped: unexpected, issue } = checkToolArguments(args, contract);
-  if (missing.length) {
-    logSafe('grok-argument-shape', { tool: name, missing: missing.length, dropped: 0 });
-    const got = unexpected.length ? `; got ${unexpected.map(fieldName).join(', ')}` : '';
-    throw new GrokError(`Grok called ${name} without its required ${missing.map(fieldName).join(', ')}${got}. Its parameters are ${declared.map(fieldName).join(', ')}; no tools were executed`, true, true);
+class ReasoningReplay {
+  private readonly byCall = new Map<string, unknown[]>();
+  remember(callId: string, items: unknown[]): void {
+    this.byCall.delete(callId);
+    this.byCall.set(callId, items);
+    while (this.byCall.size > 512) this.byCall.delete(this.byCall.keys().next().value!);
   }
-  if (issue) {
-    logSafe('grok-argument-shape', { tool: name, missing: 0, dropped: unexpected.length, invalid: true });
-    throw new GrokError(`Grok called ${name} with invalid ${issue}; no tools were executed`, true, true);
-  }
-  if (unexpected.length) { logSafe('grok-argument-shape', { tool: name, missing: 0, dropped: unexpected.length }); return JSON.stringify(args); }
-  return raw;
+  before(callId: string | undefined): unknown[] { return (callId && this.byCall.get(callId)) || []; }
 }
 
-type CompletedCall = { name: string; args: string; callId: string; output: string };
+const TEXT_PARTS = new Set(['input_text', 'output_text', 'text']);
+const CALL_TYPES = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'computer_call']);
+const OUTPUT_TYPES = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
 
-const callName = (item: ResponseInputItem) => {
-  const name = String(item.name);
-  return item.namespace && !name.startsWith(item.namespace + '.') ? `${item.namespace}.${name}` : name;
-};
-const outputText = (item: ResponseInputItem) =>
-  typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '');
-// Volatile headers such as chunk ids and timings differ between identical runs.
-const stableOutput = (text: string) => {
-  const output = /^(?:Output|Final output):\s*$/m.exec(text);
-  if (!output) return text.trim();
-  return (text.slice(0, output.index).replace(/^(Chunk ID|Wall time):.*$/gm, '') + text.slice(output.index)).trim();
-};
+/** An image part xAI can read (inline data or a web URL); anything else becomes a short note. */
+function imagePart(value: JsonRecord, legacy: boolean): JsonRecord {
+  const url = imageUrl(value, legacy);
+  return url && /^(data:image\/|https:\/\/)/.test(url) ? { type: 'input_image', image_url: url } : { type: 'input_text', text: '[image omitted: only inline or web images can be shown]' };
+}
 
-function completedCalls(request: ResponsesRequest): CompletedCall[] {
-  const input = Array.isArray(request.input) ? request.input : [];
-  const calls = new Map<string, { name: string; args: string }>();
-  const completed = new Map<string, CompletedCall>();
-  for (const item of input) {
-    if (typeof item.call_id !== 'string' || !item.call_id) continue;
-    if (CALL_TYPES.has(item.type ?? '')) {
-      const args = typeof item.arguments === 'string' ? item.arguments : typeof item.input === 'string' ? item.input : JSON.stringify(item.arguments ?? {});
-      calls.set(item.call_id, { name: callName(item), args });
-    } else if (OUTPUT_TYPES.has(item.type ?? '')) {
-      const call = calls.get(item.call_id);
-      if (call) { completed.delete(item.call_id); completed.set(item.call_id, { ...call, callId: item.call_id, output: outputText(item) }); }
+/** Message or tool-output content as xAI parts: text and images keep their kind, anything else is JSON text. */
+function parts(value: unknown, textType: 'input_text' | 'output_text', legacy = false): JsonRecord[] {
+  if (typeof value === 'string') return value ? [{ type: textType, text: value }] : [];
+  if (Array.isArray(value)) return value.flatMap(part => parts(part, textType, legacy));
+  if (!isRecord(value)) return value === undefined || value === null ? [] : [{ type: textType, text: JSON.stringify(value) }];
+  if (isImagePart(value, legacy)) return [imagePart(value, legacy)];
+  if (TEXT_PARTS.has(String(value.type)) && typeof value.text === 'string') return value.text ? [{ type: textType, text: value.text }] : [];
+  if (value.type === 'encrypted_content') return [{ type: textType, text: '[encrypted content from a GPT agent; unreadable here]' }];
+  return [{ type: textType, text: JSON.stringify(value) }];
+}
+
+/** A history call's Codex tool name, as `toolDescriptors` names it. */
+function codexName(item: ResponseInputItem): string {
+  if (item.type === 'tool_search_call') return TOOL_SEARCH_NAME;
+  if (item.type === 'computer_call') return COMPUTER_TOOL_NAME;
+  const name = String(item.name ?? '');
+  return item.namespace && !name.startsWith(`${item.namespace}.`) ? `${item.namespace}.${name}` : name;
+}
+
+function callArguments(item: ResponseInputItem): string {
+  if (item.type === 'custom_tool_call') return JSON.stringify({ input: item.input ?? '' });
+  if (item.type === 'computer_call') return JSON.stringify(item.actions ? { actions: item.actions } : item.action ?? {});
+  return typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
+}
+
+/** Codex's history as xAI input items. Calls use the flattened tool names the request declares. */
+export function grokInput(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ReasoningReplay): unknown[] {
+  if (typeof request.input === 'string') return [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: request.input }] }];
+  const input: unknown[] = [];
+  for (const item of request.input) {
+    const type = item.type ?? 'message';
+    if (CALL_TYPES.has(type)) {
+      input.push(...(replay?.before(item.call_id) ?? []));
+      input.push({ type: 'function_call', call_id: item.call_id, name: keyFor(codexName(item)), arguments: callArguments(item) });
+    } else if (OUTPUT_TYPES.has(type)) {
+      const output = type === 'tool_search_output' ? [{ type: 'input_text', text: JSON.stringify(item.tools ?? []) }] : parts(item.output, 'input_text', type === 'computer_call_output');
+      // Plain text stays a string; text with images stays a part list, which xAI shows the model as an image.
+      input.push({ type: 'function_call_output', call_id: item.call_id, output: output.every(part => part.type === 'input_text') ? output.map(part => part.text).join('\n') : output });
+    } else if (type === 'agent_message') {
+      const text = parts(item.content, 'input_text').map(part => part.text ?? '').join('\n');
+      input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: `<agent_message author=${JSON.stringify(item.author ?? 'unknown')} recipient=${JSON.stringify(item.recipient ?? 'unknown')}>\n${text}\n</agent_message>` }] });
+    } else if (type === 'message') {
+      const role = item.role === 'assistant' || item.role === 'developer' || item.role === 'system' ? item.role : 'user';
+      const content = parts(item.content, role === 'assistant' ? 'output_text' : 'input_text');
+      if (content.length) input.push({ type: 'message', role, content });
+    } else if (type !== 'reasoning' && !item.encrypted_content) {
+      // Reasoning and other encrypted items belong to another provider; anything else readable stays as text.
+      input.push({ type: 'message', role: 'user', content: [{ type: 'input_text', text: JSON.stringify(item) }] });
     }
   }
-  return [...completed.values()];
+  return input;
 }
 
-/**
- * Grok's prompt puts the tool list after the conversation, so the newest tool result can sit far
- * from the end and Grok re-runs a command it already has. A call identical to the last two calls,
- * which returned the same result, is refused before it reaches Codex.
- */
-export function assertNotLooping(request: ResponsesRequest, toolCalls: Array<{ name: string; arguments: string }>): void {
-  const input = Array.isArray(request.input) ? request.input : [];
-  // A new instruction is fresh intent even when it asks for the same action. Historical receipts
-  // are evidence for the model, never a reason to refuse a user's explicit recheck.
-  let boundary = -1;
-  for (let i = input.length - 1; i >= 0; i--) if (['user', 'developer', 'system'].includes(input[i]?.role ?? '') || input[i]?.type === 'agent_message') { boundary = i; break; }
-  const [before, last] = completedCalls({ ...request, input: input.slice(boundary + 1) }).slice(-2);
-  if (!before || !last) return;
-  const declared = new Map(toolDescriptors(requestTools(request)).map(tool => [tool.proxyName, tool]));
-  const canonicalName = (name: string) => !declared.has(name) && name.startsWith('functions.') && declared.has(name.slice(10)) ? name.slice(10) : name;
-  for (const call of toolCalls) {
-    if (isPollingTool(call.name)) continue;
-    const same = (prior: CompletedCall) => {
-      if (canonicalName(prior.name) !== canonicalName(call.name)) return false;
-      if (prior.args === call.arguments) return true;
-      if (declared.get(canonicalName(call.name))?.type !== 'function') return false;
-      try { return sameToolArguments(JSON.parse(prior.args) as unknown, JSON.parse(call.arguments) as unknown); } catch { return false; }
-    };
-    if (same(before) && same(last) && stableOutput(before.output) === stableOutput(last.output)) {
-      logSafe('grok-repeat-guard', { tool: call.name, bytes: call.arguments.length });
-      throw new GrokError(
-        `Grok repeated ${call.name} with identical arguments a third time; its result (call_id ${last.callId}) is already in the conversation. Use that result and take the next step`,
-        true, true,
-      );
-    }
-  }
+function toolChoice(choice: unknown, keyFor: (name: string) => string): unknown {
+  if (choice === 'auto' || choice === 'none' || choice === 'required') return choice;
+  if (isRecord(choice) && typeof choice.name === 'string') return { type: 'function', name: keyFor(choice.namespace ? `${String(choice.namespace)}.${choice.name}` : choice.name) };
+  return undefined;
 }
 
-/** Repeats the newest completed step at the very end of the prompt, where Grok attends most. */
-export function latestStepRecap(request: ResponsesRequest): string {
-  const last = completedCalls(request).at(-1);
-  const lastItem = Array.isArray(request.input) ? request.input.at(-1) : undefined;
-  if (!last || !lastItem || !OUTPUT_TYPES.has(lastItem.type ?? '') || lastItem.call_id !== last.callId) return '';
-  const output = last.output.length > 8000 ? `${last.output.slice(0, 8000)}\n[truncated; the full result is above]` : last.output;
-  const next = isPollingTool(last.name)
-    ? 'This is a polling/wait tool. If the work is still running or pending, or the wait timed out, continue waiting with this Codex tool. Identical polling arguments are allowed. If it reports completion, use the actual result and continue any remaining requested work. Finish only when the user\'s task is complete. Do not emulate agent waits with shell commands or a nested CLI.'
-    : 'Continue from this result. Do not repeat an identical call unless something has changed since.';
-  return `\n\n<latest_step>\nYour most recent action was ${last.name} (call_id ${last.callId}) with arguments:\n${last.args.slice(0, 2000)}\nIts result, also shown in full above:\n${output}\n${next}\n</latest_step>`;
-}
+type Prepared = { body: JsonRecord; byKey: Map<string, ToolDescriptor> };
 
-function toolCallArguments(call: JsonRecord, descriptor: ToolDescriptor): string {
-  const fields = ['arguments', 'input', 'parameters'].filter(key => Object.hasOwn(call, key));
-  if (fields.length !== 1) throw new GrokError('Grok returned conflicting or missing tool arguments; no tools were executed', true, true);
-  const value = call[fields[0]!];
-  if (descriptor.type === 'custom') {
-    if (typeof value === 'string') return value;
-    if (isRecord(value)) {
-      const metadata = new Set(['call_id', 'id', 'type']);
-      const payload = Object.keys(value).filter(key => !metadata.has(key));
-      if (payload.length === 1 && ['arguments', 'argument', 'input', 'code', 'source', 'patch', 'content', 'raw', 'value'].includes(payload[0]!) && typeof value[payload[0]!] === 'string') {
-        logSafe('grok-custom-args-unwrapped', { tool: descriptor.proxyName });
-        return value[payload[0]!] as string;
-      }
-    }
-    throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
-  }
-  if (isRecord(value)) return checkArgumentShape(descriptor.proxyName, JSON.stringify(value), descriptor.contract);
-  if (typeof value !== 'string') throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
-  return checkArgumentShape(descriptor.proxyName, functionArguments(value), descriptor.contract);
-}
-
-/** Validates Grok's structured output and turns it into the calls Codex will run. */
-export function parseGrokOutput(text: string, request: ResponsesRequest): ProxyOutput {
-  let value: unknown;
-  try {
-    const fenced = /^```(?:json)?\s*\n([\s\S]*?)\n```$/i.exec(text.trim());
-    const candidate = fenced ? fenced[1]!.trim() : text;
-    const parsed = parseArgumentJson(candidate);
-    value = parsed.value;
-    if (fenced || parsed.serialized !== candidate) logSafe('grok-output-repaired', { category: fenced ? 'fence' : 'strings', bytes: text.length });
-  } catch {
-    throw new GrokError('Grok returned invalid structured output; no tools were executed', true, true);
-  }
-  if (
-    !isRecord(value) ||
-    typeof value.text !== 'string' ||
-    !Array.isArray(value.tool_calls) ||
-    value.tool_calls.length > MAX_TOOL_CALLS ||
-    Object.keys(value).some((key) => key !== 'text' && key !== 'tool_calls')
-  ) {
-    throw new GrokError('Grok returned invalid structured output; no tools were executed', true, true);
-  }
-
-  const allowed = new Map(toolDescriptors(requestTools(request)).map((tool) => [tool.proxyName, tool]));
-  const toolCalls: ToolCall[] = value.tool_calls.map((call: unknown) => {
-    if (!isRecord(call)) throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
-    const inner = isRecord(call.function) ? call.function : call;
-    if (inner !== call && (['arguments', 'input', 'parameters'].some(key => Object.hasOwn(call, key)) || call.name !== undefined && call.name !== inner.name || call.namespace !== undefined && inner.namespace !== undefined && call.namespace !== inner.namespace)) {
-      throw new GrokError('Grok returned conflicting tool envelopes; no tools were executed', true, true);
-    }
-    let name = typeof inner.name === 'string' ? inner.name : '';
-    const namespace = typeof inner.namespace === 'string' ? inner.namespace : typeof call.namespace === 'string' ? call.namespace : undefined;
-    if (namespace && !name.startsWith(namespace + '.')) name = namespace + '.' + name;
-    if (!allowed.has(name) && name.startsWith('functions.') && allowed.has(name.slice(10))) name = name.slice(10);
-    const descriptor = allowed.get(name);
-    if (!descriptor) {
-      throw new GrokError('Grok requested an unavailable or malformed tool; no tools were executed', true, true);
-    }
-    return { name: descriptor.proxyName, arguments: toolCallArguments(inner, descriptor), callId: randomId('call') };
-  });
-  assertNotLooping(request, toolCalls);
-
-  const inputTokens = estimateVisibleTokens(requestToPrompt(request));
-  const outputTokens = estimateVisibleTokens(value.text + JSON.stringify(toolCalls));
-  return { text: value.text, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
-}
-
-/**
- * Arguments as a string meant JSON inside JSON, and Grok kept breaking the inner level. Letting
- * function arguments be a real object means the structured-output layer validates them once.
- */
-export function grokOutputSchema(tools: ResponseTool[]): Record<string, unknown> {
-  const schema = outputSchema(tools);
-  const toolCalls = (schema.properties as JsonRecord).tool_calls;
-  const items = isRecord(toolCalls) && isRecord(toolCalls.items) ? toolCalls.items : undefined;
-  if (isRecord(toolCalls)) toolCalls.maxItems = typeof toolCalls.maxItems === 'number' ? Math.min(toolCalls.maxItems, MAX_TOOL_CALLS) : MAX_TOOL_CALLS;
-  if (items && isRecord(items.properties)) items.properties.arguments = toolDescriptors(tools).every(tool => tool.type === 'custom') ? { type: 'string' } : { anyOf: [{ type: 'object' }, { type: 'string' }] };
-  return schema;
-}
-
-const SYSTEM_PROMPT = `You are the model inside the Codex external agent loop. The listed Codex tools are real, available tools. Request them using the exact name and arguments in the required structured tool_calls JSON output. Your output must be an object with text (string) and tool_calls (array). Each call must have name (exact listed string) and arguments. For a function tool, arguments is the JSON object with the tool parameters, written directly as an object, not a second JSON encoding. For a custom tool, arguments is the exact raw input string. Ordinary JSON escaping still applies to string values; do not add an extra JSON-encoding layer to function objects. Your native Grok tools, search and subagents are disabled; the listed Codex tools are not. When Codex lists collaboration.spawn_agent, wait_agent or other collaboration tools, use those tools directly to create or wait for helpers. Do not emulate a Codex subagent or poll for it with shell commands or a nested CLI. Use a completed helper response without polling it again, then continue any remaining requested work. Finish only when the user's whole task is complete. To run a command or read a file, return the listed Codex tool (for example exec_command) in tool_calls; Codex owns all execution. Never claim a tool executed without its result in history.`;
-
-/** Headless flags: `--tools` only takes effect in headless mode, never under ACP. */
-function grokArgs(dir: string, effort: string, request: ResponsesRequest, promptFile: string, retryNote: string): string[] {
-  return [
-    '--cwd', dir,
-    '-m', MODEL,
-    '--effort', effort,
-    '--permission-mode', 'dontAsk',
-    '--tools', ALLOWED_TOOLS,
-    ...DENIED_TOOLS.flatMap((tool) => ['--deny', tool]),
-    '--disallowed-tools', NATIVE_TOOLS.join(','),
-    '--no-plan',
-    '--no-subagents',
-    '--disable-web-search',
-    '--max-turns', String(MAX_TURNS),
-    '--system-prompt-override', SYSTEM_PROMPT + retryNote,
-    '--json-schema', JSON.stringify(grokOutputSchema(requestTools(request))),
-    '--output-format', 'streaming-messages-json',
-    // Raw `stream_event` deltas keep stdout live while the model thinks, so the run can be bounded
-    // by silence instead of a total deadline. `interpretRun` only reads `assistant`/`result` records.
-    '--include-partial-messages',
-    '--prompt-file', promptFile,
-    // Without it the CLI replaces any prompt over about 100 KB with an excerpt plus a pointer to an
-    // archived copy, hiding the newest history and the tool list (verified to 614 KB with it).
-    '--verbatim',
-  ];
-}
-
-/** Refuses anything Grok cannot consume faithfully before a process starts. Returns the effort. */
-function assertGrokRequest(request: ResponsesRequest): string {
-  if (request.model !== MODEL) throw new GrokError('Unsupported Grok model');
-  const effort = request.reasoning?.effort ?? 'high';
-  if (!(EFFORTS as readonly string[]).includes(effort)) throw new GrokError('Unsupported Grok reasoning effort');
-
-  const input = Array.isArray(request.input) ? request.input : [];
-  // Ciphertext must never become a misleading placeholder in a foreign model's context.
-  const encryptedHandoff = input.some(
-    (item) =>
-      item.type === 'agent_message' &&
-      Array.isArray(item.content) &&
-      item.content.some((part) => part.type === 'encrypted_content' && part.encrypted_content?.startsWith('gAAAA')),
-  );
-  if (encryptedHandoff) throw new GrokError('Grok cannot read encrypted GPT subagent content; use a plaintext handoff or GPT');
-  if (input.some((item) => ['compaction', 'compaction_summary', 'context_compaction'].includes(item.type ?? ''))) {
-    throw new GrokError('Grok received unrestored compaction; continue with the prior model');
-  }
-
-  // Only recognized attachment parts are refused. Ordinary tool JSON that merely mentions a URL or a
-  // file id is text and stays in the prompt; inline and remote images are handled by preparePrompt.
-  const inspect = (value: unknown): void => {
-    if (Array.isArray(value)) {
-      value.forEach(inspect);
-    } else if (isRecord(value)) {
-      const type = String(value.type);
-      if (MEDIA_PARTS.has(type) || (IMAGE_PARTS.has(type) && value.file_id !== undefined)) {
-        throw new GrokError('Grok bridge cannot safely consume this attachment; use GPT or Claude');
-      }
-      Object.values(value).forEach(inspect);
-    }
-  };
-  inspect(request.input);
-  return effort;
-}
-const MEDIA_PARTS = new Set(['input_file', 'input_audio', 'audio', 'file', 'input_video', 'video']);
-/** An uploaded image referenced by id carries no inline data, so it would vanish from the prompt. */
-const IMAGE_PARTS = new Set(['input_image', 'image']);
-
-/** Integrity gates: a changed native profile or binary pauses the backend until it is reviewed. */
-function grokInstallation(): { binary: string; cwd: string } {
-  const { GROK_BIN: binary, GROK_CWD: cwd, GROK_PROFILE_SHA256: profileHash, GROK_BIN_SHA256: binaryHash } = process.env;
-  if (profileHash && grokProfileHash() !== profileHash) {
-    throw new GrokError('Grok native configuration changed; backend paused pending isolation review');
-  }
-  if (binary && binaryHash && pinnedFileHash(binary) !== binaryHash) throw new GrokError('Grok pinned binary changed; backend paused');
-  if (!binary || !cwd) throw new GrokError('Grok Build backend is not configured');
-  return { binary, cwd };
-}
-
-function jsonLines(stdout: string): JsonRecord[] {
-  return stdout.split(/\r?\n/).flatMap((line) => {
-    try {
-      const value: unknown = JSON.parse(line);
-      return isRecord(value) ? [value] : [];
-    } catch {
-      return [];
-    }
-  });
-}
-
-/**
- * The CLI's own wording when its subscription login is gone: an expired session whose refresh token
- * was rejected (the CLI then deletes auth.json), or no login at all. Retrying cannot help, and the
- * shared classifier's `log.in` does not match the one-word `login`, so this used to read as a generic
- * retried "process failed". Only stderr and CLI status records are tested, never model text.
- */
-const LOGIN_REQUIRED = /grok login|session has expired|not logged in|XAI_API_KEY|ManualLogin|RefreshTokenRejected/i;
-const loginRequired = (exit?: number) =>
-  new GrokError(`Grok Build is signed out${exit === undefined ? '' : ` (exit ${exit})`}: its isolated login expired or was rejected. Sign in again with \`grok login\` using the router's GROK_HOME; no automatic fallback`);
-
-/**
- * A non-zero exit is classified from stderr and the CLI's own status records only, because stdout
- * also carries model text that can mention any word.
- */
-function exitFailure(exit: number, stdout: string, stderr: string): Error {
-  const records = jsonLines(stdout);
-  const status = records
-    .filter((record) => record.type === 'result' || record.type === 'error' || record.is_error === true)
-    .map((record) =>
-      JSON.stringify({
-        type: record.type,
-        subtype: record.subtype,
-        error: record.error,
-        stop: record.stop_reason ?? record.stopReason,
-        result: record.is_error ? record.result : undefined,
-      }),
-    );
-  if (LOGIN_REQUIRED.test(`${stderr}\n${status.join('\n')}`)) {
-    logSafe('grok-exit', { exit, category: 'login required', records: records.length });
-    return loginRequired(exit);
-  }
-  const { category, retryable } = classifyCliFailure(`${stderr}\n${status.join('\n')}`);
-  if (CONTEXT_OVERFLOW_TEXT.test(`${stderr}\n${status.join('\n')}`)) return contextOverflowError('Grok Build');
-  // The CLI could not reach xAI: the router's shared offline policy keeps the request pending
-  // and retries it, exactly as for every other backend. The fixed transport message hides stderr.
-  const network = transportError(new Error(`${stderr}\n${status.join('\n')}`));
-  if (network?.reconnectable) { logSafe('grok-exit', { exit, category: 'network', records: records.length }); return network; }
-  logSafe('grok-exit', {
-    exit,
-    category,
-    records: records.length,
-    last_type: String(records.at(-1)?.type ?? ''),
-    has_result: records.some((record) => record.type === 'result'),
-    stderr_hint: stderr.trim().split(/\r?\n/).at(-1) ?? '',
-  });
-  return new GrokError(`Grok Build ${category} (exit ${exit}); no automatic fallback`, retryable);
-}
-
-const contentParts = (record: JsonRecord): JsonRecord[] => {
-  const content = isRecord(record.message) ? record.message.content : undefined;
-  return Array.isArray(content) ? content.filter(isRecord) : [];
-};
-
-/**
- * Reads a finished run. Every native tool attempt must have been denied by the hook and the turn
- * must have ended cleanly within its budget; otherwise nothing is returned to Codex.
- */
-function interpretRun(stdout: string, request: ResponsesRequest): ProxyOutput {
-  let records: unknown[];
-  try {
-    records = stdout.trim().split(/\r?\n/).map((line) => JSON.parse(line) as unknown);
-  } catch {
-    throw new GrokError('Grok Build returned invalid output', true);
-  }
-  const events = records.filter(isRecord);
-  const nativeCalls = events.filter((event) => event.type === 'assistant').flatMap(contentParts).filter((part) => part.type === 'tool_use');
-  const nativeResults = events.flatMap(contentParts).filter((part) => part.type === 'tool_result');
-  const denied = (call: JsonRecord) =>
-    nativeResults.some(
-      (result) => result.tool_use_id === call.id && result.is_error === true && JSON.stringify(result.content).includes(NATIVE_DENIAL),
-    );
-  // Unconfirmed native execution is a safety failure, never retried.
-  if (events.some((event) => /auto_compact|compaction/.test(String(event.type ?? ''))) || nativeCalls.some((call) => !denied(call))) {
-    logSafe('grok-native-guard');
-    throw new GrokError('Grok attempted native compaction or unconfirmed native execution; no Codex actions were returned');
-  }
-
-  const result = [...events].reverse().find((event) => event.type === 'result') ?? events.at(-1) ?? {};
-  const stop = result.stop_reason ?? result.stopReason;
-  const turns = result.num_turns;
-  const structured = result.structured_output ?? result.structuredOutput;
-  const validTurns = typeof turns === 'number' && Number.isInteger(turns) && turns >= 1 && turns <= MAX_TURNS;
-  if (stop !== 'end_turn' || result.is_error || !validTurns) {
-    // A CLI-reported error is classified from the CLI's own result record, never model text: auth
-    // and quota surface immediately, anything else gets the one retry.
-    const errorText = result.is_error
-      ? [result.subtype, result.error, result.result].filter((part): part is string => typeof part === 'string').join(' ')
-      : '';
-    const failure = result.is_error ? classifyCliFailure(errorText) : undefined;
-    if (result.is_error && LOGIN_REQUIRED.test(errorText)) {
-      logSafe('grok-invalid-turn', { stop: String(stop), is_error: true, category: 'login required' });
-      throw loginRequired();
-    }
-    const network = result.is_error ? transportError(new Error(errorText)) : undefined;
-    logSafe('grok-invalid-turn', {
-      stop: String(stop),
-      turns: typeof turns === 'number' && Number.isInteger(turns) ? turns : null,
-      is_error: !!result.is_error,
-      category: failure?.category ?? null,
-      subtype: String(result.subtype ?? ''),
-      denied_native: nativeCalls.length,
-      structured: !!structured,
-      hint: errorText.slice(0, 120),
-    });
-    // Resending an oversized prompt can never succeed; give Codex its native overflow code. This comes
-    // before the quota and network checks: overflow text can carry a 429-like token count or a "fetch
-    // failed" prefix, and reading it as an outage would resend the same prompt forever.
-    if (CONTEXT_OVERFLOW_TEXT.test(errorText)) throw contextOverflowError('Grok Build');
-    if (failure && !failure.retryable) throw new GrokError(`Grok Build ${failure.category}; no automatic fallback`);
-    // A network failure reported in-band is an outage, not a bad turn: pending retry, never a refusal.
-    if (network?.reconnectable) throw network;
-    if (OVERLOADED_TEXT.test(errorText)) throw overloadedError('Grok Build');
-    throw new GrokError(
-      nativeCalls.length
-        ? 'Grok did not complete a valid constrained turn (it tried disabled native tools; return Codex tool_calls instead)'
-        : 'Grok did not complete a valid constrained turn',
-      true,
-    );
-  }
-  const text = structured ? JSON.stringify(structured) : String(result.result ?? result.text ?? '');
-  return parseGrokOutput(text, request);
-}
-
-async function readCapped(stream: ReadableStream<Uint8Array>, keepAll: boolean, onOverflow: () => void, onChunk?: (chunk: Uint8Array) => void): Promise<string> {
-  const decoder = new TextDecoder();
-  let total = 0;
-  let text = '';
-  for await (const chunk of stream) {
-    onChunk?.(chunk);
-    total += chunk.length;
-    if (total > MAX_OUTPUT_BYTES) {
-      onOverflow();
-      throw new GrokError('Grok output exceeded safety limit');
-    }
-    text = (text + decoder.decode(chunk, { stream: true })).slice(keepAll ? 0 : -65_536);
-  }
-  return text + decoder.decode();
-}
-
-/**
- * Each CLI runs as the leader of its own process group, so ending a run also ends any helper it
- * started (hooks, tool servers) instead of leaving them holding our pipes. Groups still alive when
- * the router exits are killed with it.
- */
-const liveGroups = new Set<number>();
-process.once('exit', () => { for (const pid of liveGroups) signalGroup(pid, 'SIGKILL'); });
-function signalGroup(pid: number, signal: NodeJS.Signals): void {
-  try { process.kill(-pid, signal); } catch {}
-}
-
-/**
- * One isolated CLI session per attempt: a private directory and prompt file, never reused between
- * parent and child agents. Everything created here, processes included, is removed on every exit path.
- */
-async function runGrokOnce(request: ResponsesRequest, signal?: AbortSignal, retryNote = ''): Promise<ProxyOutput> {
-  signal?.throwIfAborted();
-  const effort = assertGrokRequest(request);
-  let prepared: ReturnType<typeof preparePrompt>;
-  // A remote image URL is never fetched; refuse it as a Grok attachment, not a generic failure.
-  try { prepared = preparePrompt(request); }
-  catch { throw new GrokError('This Grok bridge supports no image input; switch to GPT or Claude for this conversation'); }
-  if (prepared.images.length) throw new GrokError('This Grok bridge supports no image input; switch to GPT or Claude for this conversation');
-
-  let dir: string | undefined;
-  let proc: Bun.Subprocess<'ignore', 'pipe', 'pipe'> | undefined;
-  let timeout: ReturnType<typeof setTimeout> | undefined;
-  let escalation: ReturnType<typeof setTimeout> | undefined;
-  let exited = false;
-  let aborted = false;
-  let timedOut = false;
-  // SIGTERM first so the CLI can close its session; a CLI that ignores it is killed after the grace.
-  const stop = () => {
-    if (!proc || escalation) return;
-    const { pid } = proc;
-    signalGroup(pid, 'SIGTERM');
-    escalation = setTimeout(() => signalGroup(pid, 'SIGKILL'), nonNegativeInt('GROK_KILL_GRACE_MS', 2000));
-  };
-  const cancel = () => {
-    aborted = true;
-    stop();
-  };
-  try {
-    const { binary, cwd } = grokInstallation();
-    dir = await mkdtemp(join(cwd, 'request-'));
-    await chmod(dir, 0o700);
-    const promptFile = join(dir, 'prompt.txt');
-    // The prompt is written verbatim: user text, tool output and code reach Grok exactly as Codex sent them.
-    const prompt = prepared.prompt + latestStepRecap(request);
-    await writeFile(promptFile, prompt, { mode: 0o600 });
-    signal?.throwIfAborted();
-
-    proc = Bun.spawn([binary, ...grokArgs(dir, effort, request, promptFile, retryNote)], {
-      cwd: dir,
-      env: grokEnvironment(),
-      stdin: 'ignore',
-      stdout: 'pipe',
-      stderr: 'pipe',
-      detached: true,
-    });
-    const { pid } = proc;
-    liveGroups.add(pid);
-    // Once the CLI itself has exited nothing in its group has legitimate work left, and a straggler
-    // would keep stdout open. Its already-written output stays readable in the pipe.
-    void proc.exited.then(() => { exited = true; signalGroup(pid, 'SIGKILL'); });
-    signal?.addEventListener('abort', cancel, { once: true });
-    if (signal?.aborted) cancel();
-    // Bound the run by silence, like native Codex (DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300 s): every
-    // stdout/stderr chunk restarts the window. A total deadline cut long xhigh turns mid-answer.
-    const idleMs = positiveInt('GROK_TIMEOUT_MS', 300_000);
-    const touch = () => {
-      clearTimeout(timeout);
-      timeout = setTimeout(() => {
-        timedOut = true;
-        stop();
-      }, idleMs);
-    };
-    touch();
-
-    // Content-free phase timing: when the CLI first wrote, when its result record arrived, when it exited.
-    const spawned = performance.now();
-    let firstOutput: number | undefined, resultAt: number | undefined, exitAt: number | undefined;
-    void proc.exited.then(() => { exitAt = performance.now(); });
-    const resultMarker = new TextDecoder();
-    const onStdout = (chunk: Uint8Array) => {
-      touch();
-      firstOutput ??= performance.now();
-      if (resultAt === undefined && resultMarker.decode(chunk, { stream: true }).includes('"type":"result"')) resultAt = performance.now();
-    };
-    const [stdout, stderr, exit] = await Promise.all([
-      readCapped(proc.stdout, true, stop, onStdout),
-      readCapped(proc.stderr, false, stop, touch),
-      proc.exited,
-    ]);
-    const since = (at: number | undefined) => (at === undefined ? null : Math.round(at - spawned));
-    logSafe('grok-turn-phases', { first_output_ms: since(firstOutput), result_ms: since(resultAt), exit_ms: since(exitAt), drained_ms: since(performance.now()), exit, retry: retryNote !== '' });
-    if (aborted) throw new GrokError('Grok request cancelled');
-    if (timedOut) throw new GrokError(`Grok Build request timed out after ${Math.round(idleMs / 1000)}s without output; no automatic model fallback`, true);
-    if (exit !== 0) throw exitFailure(exit, stdout, stderr);
-    return interpretRun(stdout, request);
-  } finally {
-    clearTimeout(timeout);
-    signal?.removeEventListener('abort', cancel);
-    if (proc) {
-      // Every early exit (overflow, cancel, a thrown check) ends the whole group without a grace.
-      if (!exited) signalGroup(proc.pid, 'SIGKILL');
-      await proc.exited;
-      signalGroup(proc.pid, 'SIGKILL');
-      clearTimeout(escalation);
-      liveGroups.delete(proc.pid);
-    }
-    if (dir) await rm(dir, { recursive: true, force: true });
-  }
-}
-
-export function runGrok(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
-  return retryOnce('grok', signal, (retryNote) => runGrokOnce(request, signal, retryNote));
-}
-
-export const grokBackend: SubscriptionBackend = {
-  name: 'Grok',
-  models: { [MODEL]: MODEL },
-  reservedPrefix: 'grok-',
-  catalog: [
-    {
-      slug: MODEL,
-      displayName: 'Grok 4.7',
-      description: 'Grok 4.7 through your Grok Build subscription (text only)',
-      efforts: EFFORTS,
-      defaultEffort: 'high',
-      inputModalities: ['text'],
+export function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepared {
+  const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
+  const keys = new Map([...byKey].map(([key, descriptor]) => [descriptor.proxyName, key]));
+  const keyFor = (name: string) => keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
+  const tools = Object.entries(definitions).map(([name, tool]) => ({ type: 'function', name, description: tool.description, parameters: tool.inputSchema }));
+  const extra = request as ResponsesRequest & JsonRecord;
+  return {
+    byKey,
+    body: {
+      model: MODEL,
+      instructions: request.instructions,
+      input: grokInput(request, keyFor, replay),
+      ...(tools.length ? { tools, tool_choice: toolChoice(request.tool_choice, keyFor), parallel_tool_calls: true } : {}),
+      reasoning: { effort: request.reasoning?.effort ?? 'high' },
+      max_output_tokens: request.max_output_tokens,
+      // Codex's per-thread key; xAI caches the shared prefix under it.
+      prompt_cache_key: typeof extra.prompt_cache_key === 'string' ? extra.prompt_cache_key : undefined,
+      stream: true,
+      store: false,
     },
-  ],
-  run: runGrok,
-};
+  };
+}
+
+/** xAI's reply as Codex output: text, and calls named and shaped as the Codex tools they stand for. */
+export function grokOutput(output: unknown[], byKey: Map<string, ToolDescriptor>): { text: string; toolCalls: ToolCall[]; reasoning: unknown[] } {
+  let text = '';
+  const toolCalls: ToolCall[] = [];
+  const reasoning: unknown[] = [];
+  for (const item of output) {
+    if (!isRecord(item)) continue;
+    if (item.type === 'reasoning') reasoning.push(item);
+    if (item.type === 'message' && Array.isArray(item.content)) {
+      for (const part of item.content) if (isRecord(part) && typeof part.text === 'string') text += part.text;
+    }
+    if (item.type !== 'function_call' || typeof item.name !== 'string') continue;
+    const raw = typeof item.arguments === 'string' ? item.arguments : JSON.stringify(item.arguments ?? {});
+    const callId = typeof item.call_id === 'string' ? item.call_id : undefined;
+    const descriptor = byKey.get(item.name);
+    if (descriptor?.type === 'custom') {
+      let args: unknown;
+      try { args = JSON.parse(raw); } catch {}
+      // Malformed raw input still reaches Codex as written, which reports it to the model like any tool error.
+      toolCalls.push({ name: descriptor.proxyName, arguments: (isRecord(args) ? rawInput(args) : undefined) ?? raw, callId });
+    } else toolCalls.push({ name: descriptor?.proxyName ?? item.name, arguments: raw, callId });
+  }
+  return { text, toolCalls, reasoning };
+}
+
+/** xAI's own error text, short; it never contains the request. */
+async function errorDetail(response: Response): Promise<string> {
+  const body: unknown = await response.json().catch(() => undefined);
+  const detail = isRecord(body) ? body.error ?? body.message : undefined;
+  return (typeof detail === 'string' ? detail : isRecord(detail) && typeof detail.message === 'string' ? detail.message : '').replace(/\s+/g, ' ').slice(0, 300);
+}
+
+function refusal(status: number, detail: string, home: string): BackendError {
+  if (CONTEXT_OVERFLOW_TEXT.test(detail) || /input_too_large/.test(detail)) return contextOverflowError('Grok');
+  if (status === 401 || status === 403) return signedOut(home);
+  if (status === 503 || status === 529 || OVERLOADED_TEXT.test(detail)) return overloadedError('Grok');
+  if (status === 429) return new GrokError(`Grok usage limit reached${detail ? `: ${detail}` : ''}; no automatic fallback`);
+  return new GrokError(`Grok request refused (xAI HTTP ${status}${detail ? `: ${detail}` : ''})`);
+}
+
+export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
+  const baseUrl = options.baseUrl ?? 'https://cli-chat-proxy.grok.com/v1';
+  const login = new GrokLogin(options.home, options.issuer ?? 'https://auth.x.ai');
+  const replay = new ReasoningReplay();
+  // The chat proxy accepts only current Grok Build clients (HTTP 426 otherwise).
+  let clientVersion = '1.0.46';
+
+  const headers = (token: string) => ({
+    authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'text/event-stream',
+    'user-agent': `xai-grok-workspace/${clientVersion}`, 'x-grok-client-version': clientVersion,
+    'x-xai-token-auth': 'xai-grok-cli', 'x-grok-client-identifier': 'grok-shell', 'x-authenticateresponse': 'authenticate-response',
+  });
+
+  async function currentVersion(): Promise<boolean> {
+    try {
+      const body: unknown = await (await fetch(options.versionUrl ?? 'https://registry.npmjs.org/@xai-official/grok/latest', { signal: AbortSignal.timeout(10_000) })).json();
+      if (isRecord(body) && typeof body.version === 'string' && /^\d+\.\d+\.\d+$/.test(body.version) && body.version !== clientVersion) {
+        logSafe('grok-client-version', { version: body.version });
+        clientVersion = body.version;
+        return true;
+      }
+    } catch {}
+    return false;
+  }
+
+  /** Opens the stream. Nothing has reached Codex yet, so each retry here is safe. */
+  async function open(body: string, signal: AbortSignal): Promise<Response> {
+    let token = await login.token(signal);
+    let refreshed = false, upgraded = false;
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(`${baseUrl}/responses`, { method: 'POST', headers: headers(token), body, signal });
+      if (response.ok) return response;
+      const detail = await errorDetail(response);
+      logSafe('grok-http-refused', { status: response.status, attempt });
+      if (response.status === 401 && !refreshed) { refreshed = true; token = await login.token(signal, token); continue; }
+      if (response.status === 426 && !upgraded) { upgraded = true; if (await currentVersion()) continue; }
+      if (response.status >= 500 && response.status !== 503 && attempt < SERVER_RETRIES) { await sleep(200 * 2 ** attempt, signal); continue; }
+      throw refusal(response.status, detail, options.home);
+    }
+  }
+
+  async function run(request: ResponsesRequest, signal?: AbortSignal): Promise<ProxyOutput> {
+    signal?.throwIfAborted();
+    if (request.model !== MODEL) throw new GrokError('Unsupported Grok model');
+    if (!(EFFORTS as readonly string[]).includes(request.reasoning?.effort ?? 'high')) throw new GrokError('Unsupported Grok reasoning effort');
+    const started = performance.now();
+    const { body, byKey } = grokRequest(request, replay);
+    // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
+    const idleMs = positiveInt('GROK_TIMEOUT_MS', 300_000);
+    const idle = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const touch = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new DOMException('Grok stream idle', 'TimeoutError')), idleMs); };
+    const combined = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
+    touch();
+    let firstEventMs = 0, completed: JsonRecord | undefined, failed: StreamEvent | undefined;
+    try {
+      const response = await open(JSON.stringify(body), combined);
+      if (!response.body) throw new ProxyTransportError();
+      const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
+      await sseEvents(watched, event => {
+        firstEventMs ||= performance.now() - started;
+        if ((event.type === 'response.completed' || event.type === 'response.incomplete') && isRecord(event.response)) completed = event.response;
+        if (event.type === 'response.failed' || event.type === 'error') failed = event;
+      });
+    } finally { clearTimeout(timer); }
+    if (failed) {
+      const error = isRecord(failed.error) ? failed.error : isRecord(failed.response) && isRecord(failed.response.error) ? failed.response.error : {};
+      const detail = String(error.message ?? '').slice(0, 300);
+      if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Grok');
+      // A provider failure after the stream opened: nothing reached Codex, so one fresh attempt is safe.
+      throw new GrokError(`Grok stream failed${detail ? `: ${detail}` : ''}`, true);
+    }
+    // A stream that ended without a terminal event dropped: the router's offline policy retries it.
+    if (!completed) throw new ProxyTransportError();
+    const { text, toolCalls, reasoning } = grokOutput(Array.isArray(completed.output) ? completed.output : [], byKey);
+    if (reasoning.length && toolCalls[0]?.callId) replay.remember(toolCalls[0].callId, reasoning);
+    const usage = isRecord(completed.usage) ? completed.usage : {};
+    const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : estimateVisibleTokens(JSON.stringify(body.input));
+    const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : estimateVisibleTokens(text + JSON.stringify(toolCalls));
+    const cached = isRecord(usage.input_tokens_details) && typeof usage.input_tokens_details.cached_tokens === 'number' ? usage.input_tokens_details.cached_tokens : 0;
+    logSafe('grok-turn', { ms: Math.round(performance.now() - started), first_event_ms: Math.round(firstEventMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: cached, status: String(completed.status ?? '') });
+    return { text, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+  }
+
+  return {
+    name: 'Grok',
+    models: { [MODEL]: MODEL },
+    reservedPrefix: 'grok-',
+    catalog: [{
+      slug: MODEL, displayName: 'Grok 4.7', description: 'Grok 4.7 through your SuperGrok subscription',
+      efforts: EFFORTS, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: 500_000,
+    }],
+    // One fresh attempt for a provider failure mid-stream; the turn has no other retry.
+    run: (request, signal) => run(request, signal).catch((error: unknown) => {
+      if (!(error instanceof GrokError) || !error.retryable || signal?.aborted) throw error;
+      logSafe('backend-retry', { backend: 'grok', reason: error.message, attempt: 1, budget: 1 });
+      return run(request, signal);
+    }),
+    // A chat opening refreshes the login ahead of its first turn.
+    prewarm: () => { void login.token().catch(() => {}); },
+  };
+}
+
+export const grokBackend = createGrokBackend({ home: process.env.GROK_HOME ?? join(homedir(), '.grok') });

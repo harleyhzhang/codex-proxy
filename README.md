@@ -3,15 +3,15 @@
 Use Claude, Grok and optional Cursor models inside [OpenAI Codex](https://github.com/openai/codex), next to GPT, in the same chat.
 
 The proxy sits between Codex and `chatgpt.com`. GPT requests pass straight through. Requests for a
-Claude or Grok model are answered by the official `claude` or `grok` CLI, signed in with your own
-subscription. Codex keeps running every tool, so approvals, sandboxing and history work as usual,
+Claude model are answered by the official `claude` CLI and Grok requests by xAI's Grok endpoint,
+each signed in with your own subscription. Codex keeps running every tool, so approvals, sandboxing and history work as usual,
 and you can switch models mid-chat. An optional pinned Cursor SDK bridge adds Kimi,
 Grok and Claude models from a Cursor subscription without changing the Codex app.
 
 ```
 Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT models)
                            ├──► claude CLI           (claude-*)
-                           ├──► grok CLI             (grok-*)
+                           ├──► xAI Grok endpoint    (grok-*)
                            └──► Cursor SDK bridge    (cursor-*, optional)
 ```
 
@@ -20,7 +20,7 @@ Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT mode
 - [Bun](https://bun.sh) 1.2+
 - Codex (desktop app or CLI), signed in with ChatGPT
 - For Claude: the [Claude Code](https://docs.anthropic.com/claude-code) CLI, signed in (`claude login`)
-- For Grok (optional): the Grok Build CLI, signed in
+- For Grok (optional): a SuperGrok login from the Grok Build CLI (`grok login`); the CLI is not run afterwards
 
 ## Quick start
 
@@ -352,53 +352,34 @@ Everything has a default; set only what you need.
 | `CURSOR_WARM_BRIDGE_IDLE_MS` | `900000` | Idle lifetime of those warm bridges |
 | `CURSOR_SESSION_IDLE_MS` | `900000` | How long a run waiting on Codex tool results holds its bridge |
 | `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
-| `GROK_BIN` | unset | Grok CLI path; Grok is disabled until set |
-| `GROK_CWD` | unset | Empty working directory for Grok |
-| `GROK_HOME` | `~/.grok` | Grok profile directory (use a dedicated one) |
-| `GROK_TIMEOUT_MS` | `300000` | Grok stdout/stderr idle timeout, not a total reasoning deadline |
-| `GROK_KILL_GRACE_MS` | `2000` | Grace before SIGKILL when a Grok process group ignores cancellation |
-| `GROK_BIN_SHA256` | unset | Pause Grok if the binary changes |
-| `GROK_PROFILE_SHA256` | unset | Pause Grok if its config, hooks or plugins change |
+| `GROK_HOME` | `~/.grok` | Grok Build profile holding the login the router uses and refreshes (use a dedicated one) |
+| `GROK_TIMEOUT_MS` | `300000` | Grok stream idle timeout, not a total reasoning deadline |
 
 ### Grok
 
-The bridge disables Grok Build's native session search: it already supplies the
-complete Codex conversation, so rebuilding an index of every stored CLI session
-before each turn only adds work. Existing CLI history is preserved. Cancellation,
-timeout and output overflow stop the request's whole process group, including
-helpers that keep output pipes open. A rejected or expired subscription login is
-terminal and explains how to sign in again using the same isolated `GROK_HOME`.
+Grok turns go straight to xAI's Responses endpoint (`cli-chat-proxy.grok.com`), the
+one Grok Build itself uses with a SuperGrok login, so no CLI process runs. Codex's
+tools are sent as function tools and Grok makes real, parallel tool calls; raw-input
+tools such as `apply_patch` take their input as the string field `input`, and
+namespaced tools are flattened and mapped back. History keeps its structure: calls,
+results (including screenshots), messages and images. Grok's own encrypted reasoning
+is kept in memory and put back before its calls on the next turn; other providers'
+reasoning is dropped.
 
-Use `[skills] ignore = ["~/.agents/skills"]` in that isolated profile if its
-native personal skills should not supplement Codex's supplied instructions.
-Review the profile and recompute its pin after changing this setting.
-The profile pin covers nested hook/plugin files. Symlinks in those folders
-pause the backend for review rather than allowing unverified target contents.
+Sign in once with Grok Build, preferably into a dedicated profile:
 
-Valid JSON argument strings retain their exact semantics; malformed string
-escapes can be repaired, and nested tool contracts are validated before any
-action reaches Codex. Explicit new user rechecks and agent-wait polling are
-not treated as stuck repeated reads.
+```sh
+GROK_HOME=/absolute/private/path/grok grok login
+```
 
-The CLI must receive `--verbatim`: Grok Build 1.0.46 otherwise replaces prompts
-over roughly 100 KB with excerpts and an archive pointer, losing history and
-tool contracts even below the model's context window. The bridge keeps the
-full prompt in a private file and sends it without that offload.
-
-Grok's native tool registry is emptied before generation. The bridge allows
-the recognized `read_file` ID, explicitly denies that same ID, and denies the
-`search_tool`/`use_tool` meta tools the CLI otherwise always retains. Unknown
-allowlist placeholders fail open in this CLI and must not be used. The empty
-finalized registry supplies both model definitions and dispatch handlers, so
-native calls have no executable handler. Validate the active session's
-`tool_definitions_count=0` after CLI upgrades before accepting a new binary pin.
-
-Give Grok a dedicated `GROK_HOME` and pin `GROK_BIN_SHA256` and
-`GROK_PROFILE_SHA256` so changes pause the backend for review. The optional
-[`scripts/grok-deny-native.py`](scripts/grok-deny-native.py) hook is an extra
-defense only when runtime loading is verified: 1.0.46 can list a user hook in
-`inspect` while loading none in real sessions. The execution boundary does
-not depend on that hook being present.
+The router then owns that login. Its access token lasts six hours and every refresh
+rotates the refresh token, so the router refreshes it shortly before expiry (one
+refresh shared by concurrent turns) and writes the new tokens back into the same
+`auth.json`. Do not also run the `grok` CLI against that profile, or the two will
+invalidate each other's refresh token. A rejected refresh is terminal and says how
+to sign in again. The request identifies itself as the current Grok Build client;
+when xAI rejects that version (HTTP 426), the router looks up the latest release
+once and retries.
 
 ### Run at login (macOS)
 
@@ -416,8 +397,9 @@ A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k`
 - Listens on `127.0.0.1` only.
 - Every request must carry the exact ChatGPT token Codex stored in `auth.json`. Requests with an
   `Origin` header (browsers) are rejected.
-- Claude and Grok run with native execution tools and integrations disabled,
-  with API keys stripped from their environment. Codex executes their returned calls.
+- Claude runs with native execution tools and integrations disabled, with API keys stripped from
+  its environment. Grok gets only Codex's tools, as function tools. Codex executes every call.
+- The Grok login token is sent only to `auth.x.ai` (refresh) and xAI's Grok endpoint.
 - Cursor uses its separately stored SDK credential and the no-native-tools policy described above.
 - Logs record event names, sizes and counts, never prompt or response content.
 - Compaction capsules for Claude/Grok chats are sealed with AES-256-GCM using a local key.
@@ -432,8 +414,9 @@ See [AGENTS.md](AGENTS.md) for the layout.
 
 ## Disclaimer
 
-Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It drives official CLIs
-and the optional official Cursor SDK bridge with your own accounts; you are responsible for following each provider's terms.
+Unofficial and not affiliated with OpenAI, Anthropic, xAI or Cursor. It drives the official Claude CLI,
+xAI's Grok Build endpoint and the optional official Cursor SDK bridge with your own accounts; you are
+responsible for following each provider's terms.
 
 ## License
 

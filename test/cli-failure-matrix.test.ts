@@ -1,5 +1,5 @@
-// Real subprocess failure modes for the subscription CLIs, driven through the router on every
-// transport. The Claude CLI and Grok Build binaries are replaced by scripted stand-ins that crash,
+// Real subprocess failure modes for the Claude CLI, driven through the router on every
+// transport. The CLI binary is replaced by a scripted stand-in that crashes,
 // hang, emit garbage, report quota or auth failures, or return malformed turns; every cell asserts
 // the exact status, error code and message Codex receives, and that the router recovers afterwards.
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from 'bun:test';
@@ -9,12 +9,12 @@ import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const INTERNAL = 'Internal router error; Codex will retry.';
 const TIMED_OUT = 'Model connection timed out. Retrying.';
-// Every cell spawns real stand-in processes on three transports (up to six Grok runs per cell), which
-// can exceed bun's 5s default when the full suite runs in parallel.
+// Every cell spawns real stand-in processes on three transports, which can exceed bun's 5s default
+// when the full suite runs in parallel.
 setDefaultTimeout(20_000);
 let scratch = '';
 const saved: Record<string, string | undefined> = {};
-const ENV = ['CLAUDE_BIN', 'CLAUDE_TIMEOUT_MS', 'GROK_BIN', 'GROK_CWD', 'GROK_TIMEOUT_MS', 'OFFLINE_RETRY_BASE_MS'];
+const ENV = ['CLAUDE_BIN', 'CLAUDE_TIMEOUT_MS', 'OFFLINE_RETRY_BASE_MS'];
 
 beforeAll(async () => {
   scratch = await mkdtemp(tmpdir() + '/cli-failure-matrix-');
@@ -44,30 +44,6 @@ done
   await chmod(claude, 0o755);
   process.env.CLAUDE_BIN = claude;
   process.env.CLAUDE_TIMEOUT_MS = '10000';
-  // Grok stand-in: a one-shot CLI keyed on the prompt file, counting invocations per request.
-  const grok = scratch + '/grok';
-  await Bun.write(grok, `#!/usr/bin/env bun
-const args = process.argv; const text = await Bun.file(args[args.indexOf('--prompt-file') + 1]).text();
-const key = (text.match(/GROK_[A-Z]+/) ?? ['GROK_OK'])[0];
-const counter = '${scratch}/grok-' + key + '.count';
-const count = Number(await Bun.file(counter).text().catch(() => '0')) + 1;
-await Bun.write(counter, String(count));
-await Bun.write('${scratch}/grok.pid', String(process.pid));
-if (key === 'GROK_CRASH') { console.error('grok: segmentation fault'); process.exit(7); }
-if (key === 'GROK_AUTH') { console.error('error: unauthorized (401) - please run grok login'); process.exit(1); }
-// Network outage for the first two spawns, then the network is back.
-if (key === 'GROK_NETWORK' && count <= 2) { console.error('TypeError: fetch failed: getaddrinfo ENOTFOUND api.x.ai'); process.exit(1); }
-if (key === 'GROK_QUOTA') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'rate limit exceeded: quota'})); process.exit(0); }
-if (key === 'GROK_OVERFLOW') { console.log(JSON.stringify({type:'result',stopReason:'end_turn',is_error:true,num_turns:1,result:'Prompt is too long: 300000 tokens > 256000 maximum'})); process.exit(0); }
-if (key === 'GROK_GARBAGE') { console.log('<<<not json>>>'); process.exit(0); }
-if (key === 'GROK_HANG') { await new Promise(() => {}); }
-if (key === 'GROK_EMPTY') { process.exit(0); }
-console.log(JSON.stringify({type:'result',stopReason:'end_turn',num_turns:1,structuredOutput:{text:'GROK_OK',tool_calls:[]}}));
-`);
-  await chmod(grok, 0o700);
-  process.env.GROK_BIN = grok;
-  process.env.GROK_CWD = scratch;
-  process.env.GROK_TIMEOUT_MS = '10000';
   process.env.OFFLINE_RETRY_BASE_MS = '20';
 });
 afterAll(async () => {
@@ -131,7 +107,7 @@ const pidAlive = (pid: number) => { try { process.kill(pid, 0); return true; } c
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 // Turns run with a generous timeout so a cold spawn under full-suite load never trips it; only the
 // hang and garbage cells shorten it, since both backends read the timeout per turn.
-async function briefTimeout<T>(key: 'CLAUDE_TIMEOUT_MS' | 'GROK_TIMEOUT_MS', run: () => Promise<T>): Promise<T> {
+async function briefTimeout<T>(key: 'CLAUDE_TIMEOUT_MS', run: () => Promise<T>): Promise<T> {
   const previous = process.env[key];
   process.env[key] = '400';
   try { return await run(); } finally { process.env[key] = previous; }
@@ -247,109 +223,6 @@ describe('Claude CLI subprocess failures through the router', () => {
       await sleep(100);
       expect(pidAlive(pid)).toBe(false);
       expectOk(await everyTransport(app, body(MODEL, 'after-cancel')), 'CLI_OK');
-    } finally { await app.close(); }
-  });
-});
-
-describe('Grok Build subprocess failures through the router', () => {
-  const MODEL = 'grok-4.7';
-  const invocations = async (key: string) => Number(await readFile(scratch + '/grok-' + key + '.count', 'utf8').catch(() => '0'));
-
-  test('the stand-in serves a normal turn on every transport', async () => {
-    const app = await fixtureRouter();
-    try { expectOk(await everyTransport(app, body(MODEL, 'hello')), 'GROK_OK'); } finally { await app.close(); }
-  });
-
-  test('a crash exit is classified, retried once, then refused with the exit code and no stderr', async () => {
-    const app = await fixtureRouter();
-    try {
-      const seen = await everyTransport(app, body(MODEL, 'GROK_CRASH'));
-      expectTerminal(seen, 'invalid_request_error', 'exit 7');
-      for (const cell of seen) expect(cell.message).not.toContain('segmentation');
-      expect(await invocations('GROK_CRASH')).toBe(6);
-    } finally { await app.close(); }
-  });
-
-  test('an auth failure is refused immediately without a retry', async () => {
-    const app = await fixtureRouter();
-    try {
-      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_AUTH')), 'invalid_request_error', 'exit 1');
-      expect(await invocations('GROK_AUTH')).toBe(3);
-    } finally { await app.close(); }
-  });
-
-  test('a quota error reported by the CLI is refused without a retry', async () => {
-    const app = await fixtureRouter();
-    try {
-      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_QUOTA')), 'invalid_request_error', 'no automatic fallback');
-      expect(await invocations('GROK_QUOTA')).toBe(3);
-    } finally { await app.close(); }
-  });
-
-  test('a prompt over the context window is the native context_length_exceeded code and is never retried', async () => {
-    const app = await fixtureRouter();
-    try {
-      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_OVERFLOW')), 'context_length_exceeded', 'context window', 'context_length_exceeded');
-      expect(await invocations('GROK_OVERFLOW')).toBe(3);
-    } finally { await app.close(); }
-  });
-
-  test('garbage or empty output is retried once and then refused as invalid output', async () => {
-    const app = await fixtureRouter();
-    try {
-      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_GARBAGE')), 'invalid_request_error', 'invalid output');
-      expect(await invocations('GROK_GARBAGE')).toBe(6);
-      expectTerminal(await everyTransport(app, body(MODEL, 'GROK_EMPTY')), 'invalid_request_error', 'invalid output');
-      expect(await invocations('GROK_EMPTY')).toBe(6);
-    } finally { await app.close(); }
-  });
-
-  test('a network error on stderr is an outage: plain JSON gets a 503, streams stay pending and complete once the network returns', async () => {
-    const app = await fixtureRouter({ heartbeatMs: 20 });
-    try {
-      const plain = await post(app, body(MODEL, 'GROK_NETWORK'));
-      expect(plain.status).toBe(503);
-      const plainBody = await plain.json() as any;
-      expect(plainBody.error.code).toBe('server_error');
-      expect(plainBody.error.message).toContain('Network connection interrupted');
-      expect(JSON.stringify(plainBody)).not.toContain('ENOTFOUND');
-      expect(await invocations('GROK_NETWORK')).toBe(1);
-      // The second spawn still fails; the stream keeps the turn pending and the third spawn answers.
-      const stream = await post(app, { ...body(MODEL, 'GROK_NETWORK'), stream: true });
-      const text = await stream.text();
-      expect(text).toContain('response.in_progress');
-      const event = terminal(text);
-      expect(event?.type).toBe('response.completed');
-      expect(event?.response?.output?.[0]?.content?.[0]?.text).toBe('GROK_OK');
-      expect(text).not.toContain('ENOTFOUND');
-      expect(await invocations('GROK_NETWORK')).toBe(3);
-    } finally { await app.close(); }
-  });
-
-  test('a hung CLI is killed at the Grok timeout and refused with the timeout message', async () => {
-    const app = await fixtureRouter();
-    try {
-      const seen = await briefTimeout('GROK_TIMEOUT_MS', () => everyTransport(app, body(MODEL, 'GROK_HANG')));
-      expectTerminal(seen, 'invalid_request_error', 'timed out');
-      const pid = Number(await readFile(scratch + '/grok.pid', 'utf8'));
-      await sleep(50);
-      expect(pidAlive(pid)).toBe(false);
-      expectOk(await everyTransport(app, body(MODEL, 'after-hang')), 'GROK_OK');
-    } finally { await app.close(); }
-  });
-
-  test('a client cancel mid-turn kills the Grok process', async () => {
-    const app = await fixtureRouter();
-    try {
-      const controller = new AbortController();
-      const pending = post(app, body(MODEL, 'GROK_HANG'), { signal: controller.signal }).catch(error => error);
-      await sleep(200);
-      const pid = Number(await readFile(scratch + '/grok.pid', 'utf8'));
-      expect(pidAlive(pid)).toBe(true);
-      controller.abort();
-      await pending;
-      await sleep(100);
-      expect(pidAlive(pid)).toBe(false);
     } finally { await app.close(); }
   });
 });
