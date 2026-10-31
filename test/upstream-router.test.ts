@@ -8,6 +8,7 @@ import { join } from 'node:path';
 import { isRecord, type JsonRecord } from '../src/json';
 import { responseObject, streamResponse } from '../src/protocol/output';
 import type { ResponsesBody } from '../src/protocol/types';
+import { withoutItemId } from '../src/router/upstream';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 setDefaultTimeout(10_000);
@@ -145,8 +146,38 @@ test('router model changes reset connection-local continuation and send complete
     await c.turn(body([user('different model')], { previous_response_id: 'upstream-1', model: 'gpt-6-astra' }));
     expect(remote.opens).toBe(2);
     expect(remote.messages[1]).not.toHaveProperty('previous_response_id');
-    expect(remote.messages[1]?.input).toEqual([user('first'), assistant('synthetic-1'), user('different model')]);
+    // OpenAI's own output ids are stripped: with store=false some backends refuse any input item id.
+    expect(remote.messages[1]?.input).toEqual([user('first'), withoutItemId(assistant('synthetic-1')), user('different model')]);
   } finally { c.close(); await router.close(); remote.close(); }
+});
+
+test('a full replay never sends item ids, and the turn after it still continues on the same socket', async () => {
+  const remote = upstream();
+  const router = await fixtureRouter({ upstreamWebSocket: true, upstreamSocket: remote.socket, upstreamFetch: noHttp });
+  const c = await client(router);
+  try {
+    await c.turn(body([user('first')]));
+    await c.turn(body([user('second')], { previous_response_id: 'upstream-1', model: 'gpt-6-astra' }));
+    await c.turn(body([user('third')], { model: 'gpt-6-astra', previous_response_id: 'upstream-2' }));
+    expect(remote.opens).toBe(2);
+    for (const message of remote.messages) {
+      for (const item of message.input as JsonRecord[]) expect(item).not.toHaveProperty('id');
+    }
+    expect(remote.messages[2]).toMatchObject({ previous_response_id: 'upstream-2', input: [user('third')] });
+  } finally { c.close(); await router.close(); remote.close(); }
+});
+
+test('HTTP turns never send item ids to OpenAI except an item_reference', async () => {
+  const http = httpFixture();
+  const router = await fixtureRouter({ upstreamFetch: http.fetch });
+  try {
+    const withIds = [user('a'), { id: 'fc_1', type: 'function_call', call_id: 'call_1', name: 'shell', arguments: '{}' }, { type: 'function_call_output', call_id: 'call_1', output: 'ok' }, assistant('b'), { type: 'item_reference', id: 'msg_kept' }, user('c')];
+    const res = await fetch(router.url('/v1/responses'), { method: 'POST', headers: { ...AUTH_HEADERS, 'content-type': 'application/json' }, body: JSON.stringify({ model: 'gpt-6.1-sol', stream: true, store: false, input: withIds }) });
+    await res.text();
+    const sent = http.requests[0]?.input as JsonRecord[];
+    expect(sent.filter(item => 'id' in item)).toEqual([{ type: 'item_reference', id: 'msg_kept' }]);
+    expect(sent).toHaveLength(6);
+  } finally { await router.close(); }
 });
 
 test('router hides a missing-previous refusal and replays its expanded history once without changing client turns', async () => {
@@ -164,7 +195,7 @@ test('router hides a missing-previous refusal and replays its expanded history o
     expect(response(result.terminal).id).toBe('upstream-3');
     expect(remote.messages).toHaveLength(3);
     expect(remote.messages[1]).toMatchObject({ previous_response_id: 'upstream-1', input: [user('next')] });
-    expect(remote.messages[2]?.input).toEqual([user('first'), assistant('synthetic-1'), user('next')]);
+    expect(remote.messages[2]?.input).toEqual([user('first'), withoutItemId(assistant('synthetic-1')), user('next')]);
     expect(remote.messages[2]).not.toHaveProperty('previous_response_id');
     expect(result.events.some(event => event.type === 'error')).toBe(false);
     expect(result.events.filter(event => event.type === 'response.created').map(event => response(event).id)).toEqual(['upstream-3']);

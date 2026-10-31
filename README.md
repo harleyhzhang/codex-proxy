@@ -45,6 +45,20 @@ model_catalog_json = "/Users/you/.codex-subscription-proxy/models.json"  # absol
 Restart Codex. Claude and Grok now appear in the model picker. Re-run `bun run catalog` after
 Codex updates its own model list.
 
+## Updating
+
+```sh
+cd codex-proxy
+bun run update
+```
+
+That one command pulls the latest code, installs dependencies, rebuilds the model catalog (with your
+service's own settings), restarts the launchd service that runs this checkout and waits until it
+answers. Without a launchd service it tells you to restart `bun start` yourself: new code only runs
+after a restart. Existing chats keep working, and nothing in Codex's config changes. Quit and reopen
+Codex only when it says the model list changed. Run it again after Codex itself updates, so new GPT
+models appear.
+
 ## Connection recovery
 
 GPT WebSocket clients keep their own upstream WebSocket, including Codex's

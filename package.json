@@ -16,6 +16,7 @@
     "start": "bun src/main.ts",
     "catalog": "bun src/catalog.ts",
     "account-cache": "bun scripts/account-cache.ts",
+    "update": "bun scripts/update.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "check": "bun run typecheck && bun test"

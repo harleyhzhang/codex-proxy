@@ -7,7 +7,7 @@ import { isRecord, type JsonRecord } from '../src/json';
 import { sseEvents } from '../src/protocol/stream';
 import { ProxyTransportError } from '../src/transport';
 import { UpstreamSession } from '../src/router/upstream-session';
-import { UpstreamStatusError } from '../src/router/upstream';
+import { UpstreamStatusError, withoutItemId } from '../src/router/upstream';
 import { AccountUpstream } from '../src/router/account-upstream';
 
 const target = 'https://chatgpt.com/backend-api/codex/responses';
@@ -84,10 +84,10 @@ test('wrong response ids or changed history always send the complete input witho
     await collect(await session.fetch(target, init([user('first')])));
     const changed = [user('changed'), assistant('OK'), user('next')];
     await collect(await session.transport('r1')(target, init(changed)));
-    expect(app.messages[1].input).toEqual(changed); expect(app.messages[1]).not.toHaveProperty('previous_response_id');
+    expect(app.messages[1].input).toEqual(changed.map(withoutItemId)); expect(app.messages[1]).not.toHaveProperty('previous_response_id');
     const next = [...changed, assistant('OK'), user('last')];
     await collect(await session.transport('wrong-id')(target, init(next)));
-    expect(app.messages[2].input).toEqual(next); expect(app.messages[2]).not.toHaveProperty('previous_response_id');
+    expect(app.messages[2].input).toEqual(next.map(withoutItemId)); expect(app.messages[2]).not.toHaveProperty('previous_response_id');
   } finally { session.close(); app.close(); }
 });
 
@@ -128,7 +128,7 @@ test('missing connection-local history earns exactly one full replay before visi
     const events = await collect(await session.transport('r1')(target, init(full)));
     expect(app.messages).toHaveLength(3);
     expect(app.messages[1]).toMatchObject({ previous_response_id: 'r1', input: [user('next')] });
-    expect(app.messages[2].input).toEqual(full); expect(app.messages[2]).not.toHaveProperty('previous_response_id');
+    expect(app.messages[2].input).toEqual(full.map(withoutItemId)); expect(app.messages[2]).not.toHaveProperty('previous_response_id');
     expect(events.some(event => event.type === 'error')).toBe(false);
     expect(events.filter(event => event.type === 'response.created').map(event => isRecord(event.response) && event.response.id)).toEqual(['r3']);
     expect(events.some(event => isRecord(event.item) && event.item.id === 'stray')).toBe(false);

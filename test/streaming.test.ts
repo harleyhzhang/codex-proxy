@@ -199,6 +199,6 @@ test('a chat switched to GPT keeps OpenAI reasoning but never sends another mode
       { role: 'user', content: 'continue' },
     ];
     await (await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify({ model: 'gpt-6.1-sol', stream: true, input }) })).text();
-    expect(observed[0].input.filter((item: any) => item.type === 'reasoning').map((item: any) => item.id)).toEqual(['rs_gpt']);
+    expect(observed[0].input.filter((item: any) => item.type === 'reasoning').map((item: any) => item.encrypted_content)).toEqual(['gAAAA-openai']);
   } finally { await app.close(); }
 });

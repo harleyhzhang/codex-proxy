@@ -1,5 +1,6 @@
 // Talking to the ChatGPT Codex backend on the user's behalf, with the user's own credentials.
 import { nonNegativeInt } from '../env';
+import { isRecord } from '../json';
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
 import { reconnectTransport, sleep, transportError } from '../transport';
@@ -54,6 +55,25 @@ export function relay(response: Response): Response {
   headers.delete('content-encoding');
   headers.delete('content-length');
   return new Response(response.body, { status: response.status, headers });
+}
+
+/**
+ * Codex sends `store: false`, so OpenAI keeps no items and an input item's `id` can only name an
+ * item that does not exist. Native Codex never sends them; the router's own history replays do,
+ * because they reuse OpenAI's previous output and other models' output verbatim. Some ChatGPT
+ * backends ignore such ids, others refuse the whole request ("Supplied input item IDs require
+ * persisted-item lookup"), so they never leave the router. `item_reference` is only an id and is
+ * left for OpenAI to judge.
+ */
+export function withoutItemId<T>(item: T): T {
+  if (!isRecord(item) || !('id' in item) || item.type === 'item_reference') return item;
+  const { id: _id, ...rest } = item;
+  return rest as T;
+}
+
+export function withoutItemIds<T extends { input?: unknown; store?: unknown }>(body: T): T {
+  if (body.store === true || !Array.isArray(body.input) || !body.input.some(item => withoutItemId(item) !== item)) return body;
+  return { ...body, input: body.input.map(withoutItemId) };
 }
 
 /**
@@ -148,7 +168,7 @@ export async function postJson(
   body: ResponsesBody,
   signal: AbortSignal,
 ): Promise<Response> {
-  const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(body), signal, redirect: 'error' };
+  const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(withoutItemIds(body)), signal, redirect: 'error' };
   const retries = nonNegativeInt('UPSTREAM_5XX_RETRIES', 4);
   const baseDelayMs = nonNegativeInt('UPSTREAM_RETRY_BASE_MS', 200);
   for (let attempt = 0; ; attempt++) {

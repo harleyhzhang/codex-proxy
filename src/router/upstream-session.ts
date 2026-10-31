@@ -5,7 +5,7 @@ import { responseObject, streamResponse } from '../protocol/output';
 import { EMPTY_OUTPUT } from '../protocol/types';
 import { ProxyTransportError } from '../transport';
 import { requestJson } from './json-request';
-import { UpstreamStatusError, type UpstreamFetch } from './upstream';
+import { UpstreamStatusError, type UpstreamFetch, withoutItemId, withoutItemIds } from './upstream';
 
 type SocketFactory = (url: string, headers: Headers) => WebSocket;
 export type UpstreamSessionOptions = {
@@ -163,7 +163,9 @@ export class UpstreamSession {
     if (this.closed) throw new ProxyTransportError();
     const target = new URL(url);
     if (!this.enabled || target.origin !== 'https://chatgpt.com' || target.pathname !== '/backend-api/codex/responses') return this.options.fallback(url, init);
-    const request = requestJson(init);
+    const parsed = requestJson(init);
+    // Callers normally strip ids already (postJson); the continuation prefix below assumes it.
+    const request = parsed && withoutItemIds(parsed);
     if (!request || typeof request.model !== 'string' || request.background === true) return this.options.fallback(url, init);
     const scope = this.scope(init, request.model);
     if (this.unsupportedScope === scope) return this.fallback(url, init, request);
@@ -258,7 +260,8 @@ export class UpstreamSession {
     if (event.type === 'response.completed' && isRecord(event.response) && event.response.status === 'completed' && typeof event.response.id === 'string') {
       const output = Array.isArray(event.response.output) && event.response.output.length ? event.response.output : active.output;
       const input = Array.isArray(active.request.input) ? active.request.input : typeof active.request.input === 'string' ? [{ role: 'user', content: active.request.input }] : [];
-      this.last = { id: event.response.id, prefix: [...input, ...output] };
+      // OpenAI's output carries item ids that the router strips from every replay, so compare without them.
+      this.last = { id: event.response.id, prefix: [...input, ...output.map(withoutItemId)] };
     } else if (TERMINAL.has(event.type)) this.last = undefined;
     const terminal = TERMINAL.has(event.type);
     if (terminal) active.terminal = event.type;
