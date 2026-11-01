@@ -9,6 +9,7 @@ import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools } from '../protocol/native-tools';
 import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
 import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
@@ -113,7 +114,11 @@ const toolId = (id: unknown) => String(id ?? '').replace(/[^A-Za-z0-9_-]/g, '_')
 function imageBlock(value: JsonRecord, legacy: boolean): JsonRecord[] {
   const url = imageUrl(value, legacy) ?? '';
   const inline = /^data:(image\/(?:png|jpeg|gif|webp));base64,(.*)$/s.exec(url);
-  if (inline) return [{ type: 'image', source: { type: 'base64', media_type: inline[1], data: inline[2]!.replace(/\s/g, '') } }];
+  if (inline) {
+    const fitted = fitImage(inline[1]!, inline[2]!.replace(/\s/g, ''));
+    if ('omitted' in fitted) return text(fitted.omitted);
+    return [{ type: 'image', source: { type: 'base64', media_type: fitted.mediaType, data: fitted.data } }];
+  }
   if (url.startsWith('https://')) return [{ type: 'image', source: { type: 'url', url } }];
   return text('[image omitted: only inline PNG/JPEG/GIF/WebP or web images can be shown]');
 }
