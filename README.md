@@ -225,6 +225,11 @@ Cursor turns go through Cursor's own TypeScript SDK (`@cursor/sdk`, pinned in `b
 the router, so each turn calls Cursor's agent API directly with no helper process in between. Install
 dependencies with `bun install`. The ordinary Cursor CLI is not used.
 
+If a Cursor model emits internal `CallDynamicTool` serialization as assistant text, the router
+blocks it before it reaches Codex, including when its marker is split across streamed tokens.
+It retries once if nothing has streamed and no real tool call was made; otherwise it reports
+the malformed output without replaying actions. Printed markup is never executed as a tool.
+
 Authenticate with the official [SDK browser login](https://cursor.com/docs/sdk/typescript#cursorauth).
 Run this once from the repository:
 

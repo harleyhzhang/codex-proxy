@@ -29,6 +29,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
     sendError: (): Error | undefined => undefined,
     /** Each send's result before it is shaped; tests may replace it. */
     result: (_text: string, model: unknown, final: string): JsonRecord => ({ status: 'finished', result: final, model, usage: { inputTokens: 10, outputTokens: 2 } }),
+    textChunks: (text: string): string[] => [text],
   };
   let next = 0;
   const record = (operation: string, fields: JsonRecord = {}) => events.push({ operation, ...fields });
@@ -66,7 +67,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
             let finished = false, cancelled = false, result: JsonRecord | undefined;
             const push = (value: JsonRecord) => { messages.push(value); for (const wake of waiters.splice(0)) wake(); };
             const delta = (update: JsonRecord) => onDelta?.({ update });
-            const say = (value: string) => { delta({ type: 'text-delta', text: value }); push({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: value }] } }); };
+            const say = (value: string) => { for (const text of state.textChunks(value)) delta({ type: 'text-delta', text }); push({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: value }] } }); };
             const call = async (toolName: string, args: unknown): Promise<Result> => {
               const toolCall = { type: 'mcp', args: { providerIdentifier: 'custom-user-tools', toolName, args } };
               delta({ type: 'tool-call-started', callId: `tc-${toolName}`, toolCall });

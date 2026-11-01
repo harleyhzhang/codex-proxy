@@ -9,9 +9,14 @@ import { imageUrl, isImagePart, type ToolDescriptor } from '../protocol/prompt';
 import { checkToolArguments, fieldName } from '../protocol/tool-schema';
 import { codexCall, type FunctionTool } from '../protocol/native-tools';
 import type { ResponseInputItem, OutputSink, ToolCall } from '../protocol/types';
+import { BackendError } from './contract';
 
 /** The SDK's MCP provider for host-defined tools; every allowed tool call must target it. */
 export const CUSTOM_TOOLS_PROVIDER = 'custom-user-tools';
+
+// Kimi can leak Cursor's internal tool serialization as text instead of a native call. Keep a
+// possible marker suffix out of streamed text until it is unambiguous, even across token boundaries.
+const TOOL_PROTOCOL = '<|open|>toolscall';
 
 type ContentItem = { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string };
 export type ToolResult = { content: ContentItem[]; isError?: boolean };
@@ -75,6 +80,8 @@ export class NativeRun {
   private settled = false;
   private finished = false;
   private failure?: Error;
+  private textTail = '';
+  private called = false;
   private wake?: () => void;
   private sink?: OutputSink;
   closed = false;
@@ -85,6 +92,7 @@ export class NativeRun {
   call(toolName: string, args: unknown): Promise<ToolResult> {
     const descriptor = this.byKey.get(toolName);
     if (this.closed) return Promise.resolve(errorResult('This Codex turn has ended; the tool did not run.'));
+    if (this.failure) return Promise.resolve(errorResult('This Cursor run failed; the tool did not run.'));
     if (!descriptor) return Promise.resolve(errorResult(`Unknown tool ${toolName}; use one of the listed tools.`));
     const callId = randomId('call');
     // Arguments that do not fit the tool go back to the model to fix; Codex never sees them.
@@ -95,6 +103,7 @@ export class NativeRun {
       return Promise.resolve(errorResult(call.error));
     }
     return new Promise<ToolResult>((resolve) => {
+      this.called = true;
       this.held.set(callId, { callId, respond: resolve });
       this.ready.push(call);
       // Codex starts a call as soon as it arrives, while the model may still be writing the next one.
@@ -105,7 +114,21 @@ export class NativeRun {
     });
   }
 
-  appendText(text: string): void { this.text += text; this.sink?.text(text); }
+  appendText(text: string): void {
+    if (this.failure || this.closed) return;
+    const pending = this.textTail + text;
+    if (pending.includes(TOOL_PROTOCOL)) {
+      logSafe('cursor-tool-protocol-refused', { called: this.called });
+      this.textTail = '';
+      this.fail(new BackendError('Cursor emitted tool-call markup instead of a native tool call. No action was executed from that markup; retry or switch models.', { retryable: !this.called }));
+      return;
+    }
+    let tail = Math.min(TOOL_PROTOCOL.length - 1, pending.length);
+    while (tail && !TOOL_PROTOCOL.startsWith(pending.slice(-tail))) tail--;
+    this.textTail = tail ? pending.slice(-tail) : '';
+    this.emitText(tail ? pending.slice(0, -tail) : pending);
+  }
+  private emitText(text: string): void { if (text) { this.text += text; this.sink?.text(text); } }
   /** Thinking is only shown live; a turn that was not waiting for it never sees it. */
   appendReasoning(text: string): void { this.sink?.reasoning?.(text); }
 
@@ -119,7 +142,11 @@ export class NativeRun {
     if (this.text) sink.text(this.text);
     for (const call of this.ready) sink.call?.(call);
   }
-  finish(): void { this.finished = true; clearTimeout(this.settle); this.settled = true; this.wake?.(); }
+  finish(): void {
+    if (!this.failure) this.emitText(this.textTail);
+    this.textTail = '';
+    this.finished = true; clearTimeout(this.settle); this.settled = true; this.wake?.();
+  }
   fail(error: Error): void { this.failure ??= error; this.wake?.(); }
 
   /** Waits for the next yield: settled tool calls, or the end of the run. */
@@ -128,6 +155,8 @@ export class NativeRun {
       signal.throwIfAborted();
       if (this.failure) throw this.failure;
       if ((this.ready.length && this.settled) || this.finished) {
+        this.emitText(this.textTail);
+        this.textTail = '';
         const calls = this.ready;
         this.ready = [];
         for (const call of calls) { const held = this.held.get(call.callId!); if (held) { this.held.delete(held.callId); this.delivered.set(held.callId, held); } }

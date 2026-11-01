@@ -7,6 +7,8 @@ import type { JsonRecord } from '../src/json';
 import { responseObject } from '../src/protocol/output';
 import type { ProxyOutput, ResponseInputItem, ResponsesRequest, ToolCall } from '../src/protocol/types';
 import { scriptedCursor } from './cursor-sdk-fixture';
+import { NativeRun } from '../src/backends/cursor-native';
+import { BackendError } from '../src/backends/contract';
 
 const savedSettle = process.env.CURSOR_TOOL_SETTLE_MS;
 beforeAll(() => { process.env.CURSOR_TOOL_SETTLE_MS = '60'; });
@@ -236,6 +238,79 @@ test('every finished or abandoned agent leaves no working directory behind', () 
   await f.backend.run(request('PLAIN'));
   await f.backend.close();
   expect((await readdir(f.root)).filter(name => name.startsWith('agent-'))).toEqual([]);
+}));
+
+const leakedCall = '<|open|>toolscall tool="CallDynamicTool" index="1"<|sep|><|open|>argument key="namespace" type="string"<|sep|>custom-user-tools';
+
+test('tool protocol never streams, at every split boundary and one character per delta', async () => {
+  const chunks = Array.from({ length: '<|open|>toolscall'.length + 1 }, (_, i) => [leakedCall.slice(0, i), leakedCall.slice(i)]);
+  chunks.push([...leakedCall]);
+  for (const parts of chunks) {
+    const seen: string[] = [];
+    const run = new NativeRun(new Map(), 0);
+    run.attach({ text: text => { seen.push(text); }, get started() { return seen.length > 0; } });
+    for (const part of parts) run.appendText(part);
+    run.finish();
+    const error: unknown = await run.next(new AbortController().signal).catch((error: unknown) => error);
+    expect(error).toBeInstanceOf(BackendError);
+    expect((error as BackendError).retryable).toBe(true);
+    expect(seen.join('')).toBe('');
+    expect(run.text).toBe('');
+  }
+});
+
+test('ordinary text and incomplete marker prefixes are preserved and still stream', async () => {
+  const run = new NativeRun(new Map(), 0);
+  const seen: string[] = [];
+  run.attach({ text: text => { seen.push(text); }, get started() { return seen.length > 0; } });
+  run.appendText('hello <');
+  expect(seen).toEqual(['hello ']);
+  run.appendText('tag> and <|op');
+  run.finish();
+  expect((await run.next(new AbortController().signal)).text).toBe('hello <tag> and <|op');
+  expect(seen.join('')).toBe('hello <tag> and <|op');
+});
+
+test('a raw tool serialization gets one fresh attempt before any text or call reaches Codex', () => fixture(async f => {
+  let attempts = 0;
+  const original = f.state.result;
+  f.state.result = (text, model, final) => original(text, model, ++attempts === 1 ? leakedCall : final);
+  f.state.textChunks = text => [...text];
+  const seen: string[] = [];
+  const output = await f.backend.run(request('PLAIN'), undefined, { text: text => { seen.push(text); }, get started() { return seen.length > 0; } });
+  expect(output.text).toBe('hello');
+  expect(seen.join('')).toBe('hello');
+  expect(f.count('send')).toBe(2);
+  expect(find(f, 'tool-result')).toHaveLength(0);
+  // Normal native calls and their same-run continuation still work after the failed run is closed.
+  const first = request('ONE_TOOL');
+  const calling = await f.backend.run(first);
+  expect((await f.backend.run(nextTurn(first, calling, ['ok']))).text).toBe('got:ok');
+}));
+
+test('persistent tool serialization stops after two attempts and executes no markup', () => fixture(async f => {
+  f.state.result = (_text, model) => ({ status: 'finished', model, result: leakedCall });
+  await expect(f.backend.run(request('PLAIN'))).rejects.toThrow('tool-call markup');
+  expect(f.count('send')).toBe(2);
+  expect(find(f, 'tool-result')).toHaveLength(0);
+}));
+
+test('serialization after already streamed prose is blocked without replaying the turn', () => fixture(async f => {
+  f.state.result = (_text, model) => ({ status: 'finished', model, result: 'Working.\n' + leakedCall });
+  f.state.textChunks = text => [...text];
+  const seen: string[] = [];
+  await expect(f.backend.run(request('PLAIN'), undefined, { text: text => { seen.push(text); }, get started() { return seen.length > 0; } })).rejects.toThrow('tool-call markup');
+  expect(seen.join('')).toBe('Working.\n');
+  expect(f.count('send')).toBe(1);
+}));
+
+test('serialization after a real tool call never replays that action, including without a stream sink', () => fixture(async f => {
+  f.state.result = (_text, model) => ({ status: 'finished', model, result: leakedCall });
+  const first = request('ONE_TOOL');
+  const calling = await f.backend.run(first);
+  await expect(f.backend.run(nextTurn(first, calling, ['ok']))).rejects.toThrow('tool-call markup');
+  expect(f.count('send')).toBe(1);
+  expect(find(f, 'tool-result')).toHaveLength(1);
 }));
 
 test('a router that exits (restart, SIGTERM) leaves no agent folder behind', () => fixture(async f => {

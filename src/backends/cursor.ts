@@ -421,7 +421,9 @@ class CursorRuntime {
       const prepared = preparePrompt(request);
       const images = prepared.images.map(image => ({ data: image.source.data, mimeType: image.source.media_type }));
       if (images.length) logSafe('cursor-images-attached', { count: images.length });
-      const text = [nativeRules(rawInputTools(tools.byKey)), nativeToolList(tools.definitions), prepared.prompt].filter(Boolean).join('\n\n');
+      const text = [nativeRules(rawInputTools(tools.byKey)), nativeToolList(tools.definitions), prepared.prompt,
+        'Use real MCP tool calls for actions. Never print serialized tool calls or CallDynamicTool markup as assistant text; printed markup does not execute a tool.',
+      ].filter(Boolean).join('\n\n');
       const current = session;
       const onDelta = ({ update }: { update: unknown }) => {
         current.lastEvent = performance.now();
