@@ -285,3 +285,19 @@ test('the login is read once and kept; a refused token re-reads the store and us
   expect(anthropic.messages().map(entry => entry.headers.authorization).slice(2)).toEqual(['Bearer access-0', 'Bearer access-new']);
   expect(anthropic.state.refreshes).toBe(0);
 });
+
+test('a tool contract with a top-level anyOf, oneOf or allOf goes out as one object schema Anthropic accepts', async () => {
+  const union = { type: 'object', description: 'Pick one.', $defs: { byId: { type: 'object', properties: { id: { type: 'string' }, mode: { type: 'string' } }, required: ['id', 'mode'] } },
+    anyOf: [{ $ref: '#/$defs/byId' }, { type: 'object', properties: { url: { type: 'string' }, mode: { type: 'string' } }, required: ['url', 'mode'] }] };
+  const merged = { allOf: [{ type: 'object', properties: { a: { type: 'string' } }, required: ['a'] }, { properties: { b: { type: 'number' } }, required: ['b'] }] };
+  await account().account.run(hello({ tools: [
+    { type: 'function', name: 'pick', parameters: union },
+    { type: 'function', name: 'both', parameters: merged },
+  ] }));
+  const [pick, both] = (sent().tools as JsonRecord[]).map(tool => tool.input_schema as JsonRecord);
+  for (const schema of [pick!, both!]) for (const key of ['anyOf', 'oneOf', 'allOf']) expect(schema[key]).toBeUndefined();
+  expect(pick).toMatchObject({ type: 'object', properties: { id: { type: 'string' }, mode: { type: 'string' }, url: { type: 'string' } }, required: ['mode'], $defs: union.$defs });
+  expect(String(pick!.description)).toStartWith('Pick one.');
+  expect(String(pick!.description)).toContain('at least one of these schemas');
+  expect(both).toMatchObject({ type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a', 'b'] });
+});

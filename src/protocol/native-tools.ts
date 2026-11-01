@@ -44,7 +44,45 @@ function inputSchema(descriptor: ToolDescriptor): JsonRecord {
   if (descriptor.type === 'computer') return { type: 'object', additionalProperties: true };
   const contract = isRecord(descriptor.contract) ? descriptor.contract : undefined;
   if (!contract) return { type: 'object', properties: {}, additionalProperties: true };
-  return contract.type === 'object' ? contract : { ...contract, type: 'object' };
+  const object = flattenUnion(contract);
+  return object.type === 'object' ? object : { ...object, type: 'object' };
+}
+
+const UNIONS = ['anyOf', 'oneOf', 'allOf'] as const;
+
+/**
+ * One object schema for a contract with a top-level anyOf/oneOf/allOf, which Anthropic and OpenAI function
+ * tools refuse: the branches' properties merged, required only what every alternative requires (all of
+ * them for allOf), and the alternatives kept verbatim in the description. Codex still checks the call
+ * against the original contract.
+ */
+function flattenUnion(contract: JsonRecord): JsonRecord {
+  if (!UNIONS.some(key => Array.isArray(contract[key]))) return contract;
+  const resolve = (schema: unknown): JsonRecord | undefined => {
+    if (!isRecord(schema) || typeof schema.$ref !== 'string' || !schema.$ref.startsWith('#/')) return isRecord(schema) ? schema : undefined;
+    let target: unknown = contract;
+    for (const part of schema.$ref.slice(2).split('/')) target = isRecord(target) ? target[part.replaceAll('~1', '/').replaceAll('~0', '~')] : undefined;
+    return isRecord(target) ? target : undefined;
+  };
+  const requiredOf = (schema: JsonRecord) => Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === 'string') : [];
+  const flat: JsonRecord = Object.fromEntries(Object.entries(contract).filter(([key]) => !(UNIONS as readonly string[]).includes(key)));
+  const properties: JsonRecord = isRecord(contract.properties) ? { ...contract.properties } : {};
+  const required = new Set(requiredOf(contract));
+  const notes: string[] = [];
+  for (const key of UNIONS) {
+    if (!Array.isArray(contract[key])) continue;
+    const branches = (contract[key] as unknown[]).map(branch => resolve(branch)).filter((branch): branch is JsonRecord => !!branch).map(flattenUnion);
+    for (const branch of branches) if (isRecord(branch.properties)) for (const [name, schema] of Object.entries(branch.properties)) properties[name] ??= schema;
+    if (key === 'allOf') for (const branch of branches) for (const name of requiredOf(branch)) required.add(name);
+    else {
+      const shared = branches.map(requiredOf).reduce<string[] | undefined>((common, list) => common ? common.filter(name => list.includes(name)) : list, undefined) ?? [];
+      for (const name of shared) required.add(name);
+      notes.push(`Arguments must match ${key === 'oneOf' ? 'exactly one' : 'at least one'} of these schemas: ${JSON.stringify(contract[key])}`);
+    }
+  }
+  const description = [typeof contract.description === 'string' ? contract.description : '', ...notes].filter(Boolean).join('\n\n').slice(0, 8_192);
+  delete flat.required; delete flat.description;
+  return { ...flat, type: 'object', properties, ...(required.size ? { required: [...required] } : {}), ...(description ? { description } : {}) };
 }
 
 /** A raw-input tool's string: `input`, or the single string field a model used instead. */
