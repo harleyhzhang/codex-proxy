@@ -1,4 +1,4 @@
-import { Readable, Transform } from 'node:stream';
+import { Readable, Writable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { constants, createZstdDecompress } from 'node:zlib';
 import { isRecord, type JsonRecord } from '../json';
@@ -20,33 +20,54 @@ export async function decodeBody(req: Request, limit = MAX_BODY_BYTES): Promise<
   if (!req.body) throw new Error('Missing request body');
   const encoding = req.headers.get('content-encoding');
   if (encoding && encoding !== 'identity' && encoding !== 'zstd') throw new Error('Unsupported request encoding');
-  const chunks: Buffer[] = [];
+  const chunks: Uint8Array[] = [];
   let wire = 0, decoded = 0;
   const frames = encoding === 'zstd' ? new ZstdFrames(limit) : undefined;
-  const wireLimit = new Transform({ transform(chunk: Buffer, _encoding, done) {
-    wire += chunk.byteLength;
-    if (wire > limit) { done(new Error('Request too large')); return; }
-    try { frames?.feed(chunk); done(null, chunk); } catch (error) { done(error instanceof Error ? error : new Error('Invalid Zstd framing')); }
-  }, flush(done) {
-    try { frames?.finish(); done(); } catch { done(new Error('Invalid Zstd framing')); }
-  } });
-  const collect = new Transform({ transform(chunk: Buffer, _encoding, done) {
+  const collect = (chunk: Uint8Array) => {
     decoded += chunk.byteLength;
-    if (decoded > limit) { done(new Error('Request too large')); return; }
-    chunks.push(chunk); done();
-  } });
-  // Bun and @types/node spell the same WHATWG stream with different convenience methods.
-  const source = Readable.fromWeb(req.body as unknown as Parameters<typeof Readable.fromWeb>[0]);
+    if (decoded > limit) throw new Error('Request too large');
+    chunks.push(chunk);
+  };
+  const reader = req.body.getReader();
+  const abort = () => cancelReader(reader, req.signal.reason);
+  // Own cancellation here: a source's asynchronous cancel hook must not hold the upload open.
+  // Plain JSON stays on the native reader; only compressed bytes cross into Node's async codec.
+  const read = async () => {
+    req.signal.throwIfAborted();
+    const next = await reader.read();
+    req.signal.throwIfAborted();
+    if (next.done) frames?.finish();
+    else {
+      wire += next.value.byteLength;
+      if (wire > limit) throw new Error('Request too large');
+      frames?.feed(next.value);
+    }
+    return next;
+  };
+  req.signal.addEventListener('abort', abort, { once: true });
   try {
     if (encoding === 'zstd') {
+      const source = new Readable({
+        read() {
+          void read().then(next => this.push(next.done ? null : next.value))
+            .catch(error => this.destroy(error instanceof Error ? error : new Error('Invalid request stream')));
+        },
+        // Decoder/output failures interrupt a pending read without waiting on source cleanup.
+        destroy(error, done) { cancelReader(reader, error); done(error); },
+      });
       const decoder = createZstdDecompress({ chunkSize: 16 * 1024, params: { [constants.ZSTD_d_windowLogMax]: 27 } });
-      await pipeline(source, wireLimit, decoder, collect, { signal: req.signal });
-    } else await pipeline(source, wireLimit, collect, { signal: req.signal });
+      const sink = new Writable({
+        write(chunk: Buffer, _encoding, done) {
+          try { collect(chunk); done(); } catch (error) { done(error instanceof Error ? error : new Error('Invalid decoded body')); }
+        },
+      });
+      await pipeline(source, decoder, sink, { signal: req.signal });
+    } else for (;;) { const next = await read(); if (next.done) break; collect(next.value); }
   } catch (error) {
     if (req.signal.aborted) throw req.signal.reason;
     if (error instanceof Error && error.message === 'Request too large') throw error;
     throw new Error('Request body is not valid compressed data');
-  }
+  } finally { req.signal.removeEventListener('abort', abort); cancelReader(reader); }
   let body: unknown;
   try { body = JSON.parse(Buffer.concat(chunks, decoded).toString()); } catch { throw new Error('Request body is not valid JSON'); }
   if (!isRecord(body)) throw new Error('Request body must be a JSON object');

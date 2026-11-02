@@ -87,6 +87,51 @@ async function unknownSizeZstd(value: string): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 
+test('plain JSON reads fragmented UTF-8 with the same exact byte limit as compressed input', async () => {
+  const value = { text: '🍁漢字', nested: [true, null, { answer: 42 }] };
+  const bytes = encoder.encode(JSON.stringify(value));
+  for (const encoding of [undefined, 'identity', 'zstd']) {
+    const wire = encoding === 'zstd' ? Bun.zstdCompressSync(bytes) : bytes;
+    const make = () => new Request('http://localhost/', { method: 'POST', headers: encoding ? { 'content-encoding': encoding } : {}, body: new ReadableStream({
+      start(out) { for (const byte of wire) out.enqueue(Uint8Array.of(byte)); out.close(); },
+    }) });
+    expect(await decodeBody(make(), Math.max(wire.length, bytes.length))).toEqual(value);
+    await expect(decodeBody(make(), bytes.length - 1)).rejects.toThrow('Request too large');
+  }
+  for (const text of ['{', '[]', 'null']) {
+    await expect(decodeBody(new Request('http://localhost/', { method: 'POST', body: text }))).rejects.toThrow(text === '{' ? 'Request body is not valid JSON' : 'Request body must be a JSON object');
+  }
+});
+
+for (const encoding of ['identity', 'zstd']) test(`cancelled ${encoding} uploads release the reader without awaiting source cleanup`, async () => {
+  for (const alreadyAborted of [false, true]) {
+    let cancelled = false;
+    const controller = new AbortController();
+    const reason = new Error('caller cancelled');
+    const body = new ReadableStream<Uint8Array>({
+      start(out) { out.enqueue(encoding === 'zstd' ? Uint8Array.from([0x28, 0xb5]) : encoder.encode('{')); },
+      cancel() { cancelled = true; return new Promise<void>(() => {}); },
+    });
+    if (alreadyAborted) controller.abort(reason);
+    const pending = decodeBody(new Request('http://localhost/', { method: 'POST', headers: { 'content-encoding': encoding }, body, signal: controller.signal })).catch(error => error);
+    if (!alreadyAborted) { await Bun.sleep(5); controller.abort(reason); }
+    expect(await Promise.race([pending, Bun.sleep(100).then(() => 'still pending')])).toBe(reason);
+    expect(cancelled).toBe(true); expect(body.locked).toBe(false);
+  }
+});
+
+test('unknown-size Zstd overflow interrupts an open upload even when its source cleanup stalls', async () => {
+  const compressed = await unknownSizeZstd(JSON.stringify({ text: 'x'.repeat(100_000) }));
+  let cancelled = false;
+  const body = new ReadableStream<Uint8Array>({
+    start(out) { out.enqueue(compressed); },
+    cancel() { cancelled = true; return new Promise<void>(() => {}); },
+  });
+  const pending = decodeBody(post(body), 4096).catch(error => error instanceof Error ? error.message : 'unexpected error');
+  expect(await Promise.race([pending, Bun.sleep(100).then(() => 'still pending')])).toBe('Request too large');
+  expect(cancelled).toBe(true); expect(body.locked).toBe(false);
+});
+
 test('Zstd bounds known-size and unknown-size output before retaining the entire expansion', async () => {
   const text = JSON.stringify({ text: 'x'.repeat(100_000) });
   for (const bytes of [Bun.zstdCompressSync(text), await unknownSizeZstd(text)]) {
