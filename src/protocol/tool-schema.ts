@@ -32,7 +32,7 @@ export function checkToolArguments(args: Record<string, unknown>, contract: unkn
 }
 
 /** Returns the first content-free schema issue. No argument values enter diagnostics. */
-function toolSchemaIssue(value: unknown, contract: unknown): string | undefined {
+export function toolSchemaIssue(value: unknown, contract: unknown): string | undefined {
   let budget = 100_000;
   let exhausted = false;
   const check = (value: unknown, schema: unknown, path: string, depth = 0): string | undefined => {

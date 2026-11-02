@@ -29,14 +29,22 @@ export function rawInputTools(byKey: Map<string, ToolDescriptor>): string[] {
 }
 
 function toolDescription(descriptor: ToolDescriptor): string {
-  const parts = [descriptor.description ?? ''];
+  const parts: string[] = [];
   if (descriptor.type === 'custom') {
     parts.push(RAW_INPUT_NOTE);
     const format = isRecord(descriptor.contract) ? descriptor.contract : undefined;
     if (format && typeof format.definition === 'string') parts.push(`Input format (${String(format.syntax ?? format.type ?? 'grammar')}):\n${format.definition}`);
   }
   if (descriptor.type === 'computer') parts.push('Arguments: one action object such as {"type":"click","x":100,"y":200,"button":"left"}, {"type":"type","text":"..."}, {"type":"keypress","keys":["ENTER"]}, {"type":"scroll","x":0,"y":0,"scroll_x":0,"scroll_y":500}, {"type":"screenshot"}, or {"actions":[...]} for several.');
-  return parts.filter(Boolean).join('\n\n').slice(0, 16_384);
+  const required = parts.filter(Boolean).join('\n\n');
+  if (required.length > 16_384) throw new Error('Unsupported tool contract: required input syntax exceeds the description budget');
+  const prose = (descriptor.description ?? '').slice(0, Math.max(0, 16_384 - required.length - (required ? 2 : 0)));
+  return [prose, required].filter(Boolean).join('\n\n');
+}
+
+/** Check syntax budgets before a foreign-history bridge could spend a generation. */
+export function assertToolDescriptions(descriptors: ToolDescriptor[]): void {
+  for (const descriptor of descriptors) toolDescription(descriptor);
 }
 
 function inputSchema(descriptor: ToolDescriptor): JsonRecord {
@@ -103,7 +111,7 @@ function flattenUnion(contract: JsonRecord, root = contract, seen = new Set<unkn
     }
     notes.push(`Arguments must satisfy the original ${key} contract: ${JSON.stringify(contract[key])}`);
   }
-  const description = [typeof contract.description === 'string' ? contract.description : '', ...notes].filter(Boolean).join('\n\n').slice(0, 8_192);
+  const description = [typeof contract.description === 'string' ? contract.description.slice(0, 8_192) : '', ...notes].filter(Boolean).join('\n\n');
   delete flat.required; delete flat.description;
   return { ...flat, type: 'object', properties, ...(required.size ? { required: [...required] } : {}), ...(description ? { description } : {}) };
 }

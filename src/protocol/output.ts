@@ -3,7 +3,7 @@ import { randomId } from '../json';
 import { COMPUTER_TOOL_NAME, requestTools, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
 import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, StreamEvent, ToolCall } from './types';
 
-type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown; parallel_tool_calls?: boolean; input?: unknown };
+type RequestShape = { model?: unknown; tools?: ResponseTool[]; tool_choice?: unknown; parallel_tool_calls?: boolean; input?: unknown; text?: unknown };
 
 function parseJson(raw: string, what: string): unknown {
   try {
@@ -96,6 +96,7 @@ export function responseObject(request: RequestShape, output: ProxyOutput): Resp
     error: output.error ?? null,
     incomplete_details: output.status === 'incomplete' ? { reason: output.incompleteReason ?? 'max_output_tokens' } : null,
     model: request.model,
+    ...(request.text !== undefined ? { text: request.text } : {}),
     ...(output.finishReason ? { finish_reason: output.finishReason, ...(output.finishReason === 'pause_turn' ? { end_turn: false } : {}) } : {}),
     output: outputItems(request, output),
     parallel_tool_calls: request.parallel_tool_calls ?? true,

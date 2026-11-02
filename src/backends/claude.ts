@@ -11,6 +11,7 @@ import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES,
 import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
+import { claudeOutputFormat } from '../protocol/output-format';
 import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
 import { RetryBudget } from './retries';
@@ -242,7 +243,7 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
       // Anthropic refuses thinking when the tool choice forces a call. Its thinking text stays omitted (the
       // default): asking for a summary delayed the first answer text by about 0.8 s and arrived with it.
       ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive' } }),
-      output_config: { effort: resolveEffort(request) },
+      output_config: { effort: resolveEffort(request), ...(claudeOutputFormat(request) ? { format: claudeOutputFormat(request) } : {}) },
     },
   };
 }
@@ -397,6 +398,7 @@ export class ClaudeAccount {
 
   async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
     validateControls(request);
+    claudeOutputFormat(request);
     const release = await this.admission.acquire(signal, Array.isArray(request.input) && request.input.at(-1)?.type?.endsWith('_output') ? 1 : 0);
     const budget = new RetryBudget('Claude');
     try { return await retryOnce('Claude', signal, () => this.once(request, signal, sink, budget), sink); } finally { release(); }
@@ -508,6 +510,7 @@ export const claudeBackend: SubscriptionBackend = {
   reservedPrefix: 'claude-',
   catalog: [claudeModel('claude-opus-5-5', 'Opus 5.5'), claudeModel('claude-fable-5-1', 'Fable 5.1')],
   assertAvailable: (model) => claudeLimits.assertAvailable(model),
+  assertRequestControls: request => { claudeOutputFormat(request); },
   run: (request, signal, sink) => primaryClaudeAccount.run(request, signal, sink),
   prewarm: () => primaryClaudeAccount.prewarm(),
 };
@@ -531,6 +534,7 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
     name: `Claude (${options.label})`, models, reservedPrefix: `${options.prefix}-claude-`,
     catalog: selected.map(model => claudeModel(`${options.prefix}-${model}`, `${model === 'claude-opus-5-5' ? 'Opus 5.5' : 'Fable 5.1'} (${options.label})`)),
     assertAvailable: model => account.limits.assertAvailable(model),
+    assertRequestControls: request => { claudeOutputFormat(request); },
     run: (request, signal, sink) => account.run(request, signal, sink),
     prewarm: () => account.prewarm(),
   };

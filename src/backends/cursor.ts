@@ -54,6 +54,7 @@ export class CursorError extends BackendError {
 }
 
 function assertCursorControls(request: ResponsesBody): void {
+  if (request.text?.format !== undefined && isRecord(request.text.format) && request.text.format.type !== 'text') throw new CursorError('Unsupported Cursor text.format: the SDK cannot enforce structured output');
   if (request.tool_choice !== undefined && request.tool_choice !== 'auto' && request.tool_choice !== 'none') throw new CursorError('Unsupported Cursor tool_choice: the SDK supports auto or none only');
   if (request.max_output_tokens !== undefined) throw new CursorError('Unsupported Cursor max_output_tokens: the SDK cannot enforce an output token limit');
   if (request.parallel_tool_calls === false && request.tool_choice !== 'none' && requestTools(request).length) throw new CursorError('Unsupported Cursor parallel_tool_calls: the SDK cannot forbid parallel calls');

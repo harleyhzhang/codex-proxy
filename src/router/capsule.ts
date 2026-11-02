@@ -141,7 +141,8 @@ export function restorePortableSummary(text: string): ResponseInputItem[] {
  */
 export function compactRequest(body: ResponsesBody): ResponsesBody {
   const input = (Array.isArray(body.input) ? body.input : []).filter((item) => item.type !== 'compaction_trigger');
-  const { previous_response_id: _previous, context_management: _context, ...rest } = body;
+  // A summary is internal prose, not the caller's final structured answer.
+  const { previous_response_id: _previous, context_management: _context, text: _text, ...rest } = body;
   return { ...rest, input: [...input, developerText(COMPACT_INSTRUCTION)], tool_choice: 'none', stream: true };
 }
 

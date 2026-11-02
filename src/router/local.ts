@@ -3,6 +3,7 @@ import { backendFor } from '../backends/registry';
 import { logSafe } from '../log';
 import { responseObject } from '../protocol/output';
 import { validateRequest } from '../protocol/prompt';
+import { checkOutputFormat } from '../protocol/output-format';
 import { EMPTY_OUTPUT, type ResponseObject, type ResponsesBody, type OutputSink } from '../protocol/types';
 import { ProxyTransportError, reconnectTransport, transportError } from '../transport';
 
@@ -34,7 +35,7 @@ export async function localResponse(body: ResponsesBody, signal?: AbortSignal, o
   const output = options.reconnect === false
     ? await attempt()
     : await reconnectTransport(attempt, signal, { onRetry: (attempts, delayMs) => logSafe('backend-offline-retry', { backend: backend.name, attempt: attempts, delay_ms: delayMs }) });
-  return responseObject(body, output);
+  return responseObject(body, checkOutputFormat(request, output));
 }
 
 /** Lets the backend ready itself for the turn a warmup announces. Never generates and never fails the warmup. */
