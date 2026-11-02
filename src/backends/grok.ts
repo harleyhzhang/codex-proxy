@@ -8,7 +8,7 @@ import { positiveInt } from '../env';
 import { isRecord, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup } from '../protocol/native-tools';
-import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { sseEvents } from '../protocol/stream';
 import type { ProxyOutput, ResponsesRequest, StreamEvent, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
@@ -187,7 +187,7 @@ function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepa
       model: MODEL,
       instructions: request.instructions,
       input: grokInput(request, keyFor, replay),
-      ...(tools.length ? { tools, tool_choice: toolChoice(request.tool_choice, keyFor), parallel_tool_calls: true } : {}),
+      ...(tools.length ? { tools, tool_choice: toolChoice(request.tool_choice, keyFor), parallel_tool_calls: request.parallel_tool_calls ?? true } : {}),
       // `summary` makes xAI stream a readable summary of Grok's thinking, which Codex shows as it thinks.
       reasoning: { effort: request.reasoning?.effort ?? 'high', summary: 'auto' },
       max_output_tokens: request.max_output_tokens,
@@ -336,6 +336,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
       efforts: EFFORTS, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: 500_000,
     }],
     run: async (request, signal, sink) => {
+      validateControls(request);
       const release = await admission.acquire(signal, Array.isArray(request.input) && request.input.at(-1)?.type?.endsWith('_output') ? 1 : 0);
       const budget = new RetryBudget('Grok');
       try { return await retryOnce('Grok', signal, () => run(request, signal, sink, budget), sink); } finally { release(); }

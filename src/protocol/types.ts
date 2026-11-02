@@ -48,6 +48,7 @@ export type ResponsesRequest = {
   input: string | ResponseInputItem[];
   tools?: ResponseTool[];
   tool_choice?: unknown;
+  parallel_tool_calls?: boolean;
   stream?: boolean;
   max_output_tokens?: number;
   reasoning?: { effort?: string };

@@ -86,7 +86,7 @@ test('history charges retained input, bounds independent/shared entries, and exp
     const body = { model: 'fixture', input };
     cache.remember(body, { ...responseObject(body, EMPTY_OUTPUT), id: 'first' });
     expect(cache.retainedBytes).toBeGreaterThan(1000);
-    cache.remember(body, { ...responseObject(body, EMPTY_OUTPUT), id: 'second' });
+    cache.remember({ ...body, input: structuredClone(input) }, { ...responseObject(body, EMPTY_OUTPUT), id: 'second' });
     expect(cache.size).toBe(1);
     expect(cache.retainedBytes).toBeLessThanOrEqual(1800);
     expect(() => cache.expand({ previous_response_id: 'first', input: [] })).toThrow(HistoryMiss);

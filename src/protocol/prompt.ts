@@ -220,6 +220,22 @@ export function preparePrompt(request: ResponsesRequest): PreparedPrompt {
   return { prompt: requestToPrompt(request) + note, images };
 }
 
+/** Explicit controls must never quietly become a different request at a provider boundary. */
+export function validateControls(value: { tools?: ResponseTool[]; input?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown; max_output_tokens?: unknown }): void {
+  if (value.parallel_tool_calls !== undefined && typeof value.parallel_tool_calls !== 'boolean') throw new Error('Unsupported parallel_tool_calls: expected a boolean');
+  if (value.max_output_tokens !== undefined && (typeof value.max_output_tokens !== 'number' || !Number.isSafeInteger(value.max_output_tokens) || value.max_output_tokens <= 0)) throw new Error('Unsupported max_output_tokens: expected a positive integer');
+  const choice = value.tool_choice;
+  if (choice === undefined || choice === 'auto' || choice === 'none') return;
+  const tools = toolDescriptors(requestTools(value));
+  if (choice === 'required') {
+    if (!tools.length) throw new Error('Unsupported tool_choice: required needs at least one available tool');
+    return;
+  }
+  if (!isRecord(choice) || !['function', 'custom'].includes(String(choice.type)) || typeof choice.name !== 'string' || choice.namespace !== undefined && typeof choice.namespace !== 'string') throw new Error('Unsupported tool_choice: use auto, none, required or a named client tool');
+  const name = choice.namespace ? `${String(choice.namespace)}.${choice.name}` : choice.name;
+  if (!tools.some(tool => tool.proxyName === name)) throw new Error('Unsupported tool_choice: the named tool is unavailable');
+}
+
 /** Checks the shape every backend relies on. Throws a plain Error naming the first problem. */
 export function validateRequest(value: unknown): ResponsesRequest {
   if (!isRecord(value)) throw new Error('Request body must be a JSON object');
@@ -233,5 +249,6 @@ export function validateRequest(value: unknown): ResponsesRequest {
     }
   }
   if (value.previous_response_id) throw new Error('previous_response_id is unsupported; replay input instead');
+  validateControls(value);
   return value as ResponsesRequest;
 }

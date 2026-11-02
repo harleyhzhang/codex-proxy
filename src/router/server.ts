@@ -18,11 +18,11 @@ import { failureStream, transportError, transportFailureEvent } from '../transpo
 import { upstreamAdmission } from './admission';
 import { NativeAuth } from './auth';
 import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
-import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages } from './bridge';
+import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages, type BridgeFlight } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { localResponse, prewarmLocal } from './local';
-import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, UpstreamStatusError, watchBody } from './upstream';
+import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, upstreamStreamFailure, UpstreamStatusError, watchBody } from './upstream';
 import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
 
 export type RouterOptions = {
@@ -116,28 +116,6 @@ function errorPrefix(error: unknown, pattern: RegExp): string | undefined {
   return error instanceof Error && pattern.test(error.message) ? error.message : undefined;
 }
 
-const COMPACTION_ERROR_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in_seconds'] as const;
-const QUOTA_CODES = new Set(['usage_limit_reached', 'rate_limit_exceeded', 'insufficient_quota']);
-const REQUEST_FAULT_CODES = new Set(['context_length_exceeded', 'invalid_prompt', 'cyber_policy', 'invalid_request_error']);
-
-/**
- * A compaction stream that OpenAI ended with `response.failed` or `error`. Its reason and
- * classifying fields reach Codex, which retries it unless OpenAI called it a quota or request fault.
- */
-function compactionStreamFailure(event: StreamEvent): UpstreamStatusError {
-  const response = isRecord(event.response) ? event.response : {};
-  const error = isRecord(event.error) ? event.error : isRecord(response.error) ? response.error : {};
-  const fields: UpstreamErrorFields = {};
-  for (const key of COMPACTION_ERROR_FIELDS) {
-    const value = error[key];
-    if (typeof value === 'string' || typeof value === 'number') fields[key] = value;
-  }
-  const code = String(fields.code ?? fields.type ?? '');
-  const status = typeof event.status === 'number' ? event.status : QUOTA_CODES.has(code) ? 429 : REQUEST_FAULT_CODES.has(code) ? 400 : 502;
-  const detail = typeof error.message === 'string' ? error.message.slice(0, 300) : '';
-  return new UpstreamStatusError(`OpenAI compaction failed${detail ? `: ${detail}` : ''}`, status, fields);
-}
-
 function messageText(items: OutputItem[]): string {
   return items
     .filter((item) => item.type === 'message')
@@ -182,7 +160,7 @@ export function startRouter(options: RouterOptions) {
     }
   }
 
-  const bridgeFlights = new Map<string, Promise<string>>();
+  const bridgeFlights = new Map<string, BridgeFlight>();
 
   /** A bridge that reads OpenAI ciphertext with the caller's own credentials. */
   const bridgeFor = (headers: Headers): CompactionBridge | undefined => {
@@ -190,13 +168,13 @@ export function startRouter(options: RouterOptions) {
     const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
     // Only identical effective request contexts share a flight; keep credentials out of its key.
     const scope = sha256(JSON.stringify(Array.from(forwarded.entries()).sort(([a], [b]) => a.localeCompare(b))));
-    const call = (body: ResponsesBody) =>
-      postJson(upstreamFetch, '/responses', forwarded, body, AbortSignal.timeout(BRIDGE_TIMEOUT_MS));
+    const call = (body: ResponsesBody, signal?: AbortSignal) =>
+      postJson(upstreamFetch, '/responses', forwarded, body, signal ? AbortSignal.any([signal, AbortSignal.timeout(BRIDGE_TIMEOUT_MS)]) : AbortSignal.timeout(BRIDGE_TIMEOUT_MS));
     return new CompactionBridge(codec, join(stateDir, 'bridged'), call, options.bridgeModels ?? DEFAULT_BRIDGE_MODELS, { scope, jobs: bridgeFlights });
   };
 
   /** Validates routing, expands history and makes GPT-only content readable for the target model. */
-  async function normalizeBody(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
+  async function normalizeBody(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const body = raw as ResponsesBody;
     assertRoutable(body.model);
     if (options.secondaryAccount && !isLocalModel(body.model)) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
@@ -206,20 +184,21 @@ export function startRouter(options: RouterOptions) {
     }
     const withList = typeof body.input === 'string' ? { ...body, input: [{ role: 'user', content: body.input }] } : body;
     let expanded = normalizeToolSearchIds(normalizeAgentPayloads(history.expand(withList)));
+    if (body.generate !== false) backend?.assertRequestControls?.(expanded);
     if (!isLocalModel(body.model)) expanded = dropForeignReasoning(expanded);
     if (!codec || body.generate === false) return expanded;
 
     const local = isLocalModel(body.model);
     const bridge = bridgeFor(headers);
     if (local && Array.isArray(expanded.input)) {
-      expanded = { ...expanded, input: await restoreAgentMessages(expanded.input, bridge) };
+      expanded = { ...expanded, input: await restoreAgentMessages(expanded.input, bridge, signal) };
     }
-    return codec.unwrap(expanded, local, bridge && ((encrypted) => bridge.summary(encrypted)));
+    return codec.unwrap(expanded, local, bridge && ((encrypted) => bridge.summary(encrypted, signal)));
   }
 
-  async function normalize(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
+  async function normalize(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const started = performance.now();
-    try { return await normalizeBody(raw, headers); }
+    try { return await normalizeBody(raw, headers, signal); }
     finally { logSafe('request-normalized', { ms: Math.round(performance.now() - started), local: isLocalModel(raw.model) }); }
   }
 
@@ -262,7 +241,7 @@ export function startRouter(options: RouterOptions) {
         if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') terminal = event;
       });
       if (terminal && terminal.type !== 'response.incomplete') {
-        const failure = compactionStreamFailure(terminal);
+        const failure = upstreamStreamFailure(terminal, 'compaction');
         log.warn('compact-failed', { terminal: terminal.type, status: failure.status, code: failure.fields.code ?? null });
         throw failure;
       }
@@ -307,7 +286,7 @@ export function startRouter(options: RouterOptions) {
     try {
       const raw = await decodeBody(req);
       streaming = raw.stream === true;
-      const body = await normalize(raw, req.headers);
+      const body = await normalize(raw, req.headers, req.signal);
       if (isCompaction(body)) {
         const pendingCompaction = () => pendingStream(body, signal => compact(body, req.headers, signal, () => {}), req.signal, pendingFailure, response => history.remember(body, response), options.heartbeatMs);
         if (body.stream && isLocalModel(body.model)) return pendingCompaction();
@@ -440,7 +419,7 @@ export function startRouter(options: RouterOptions) {
       if (message.type && message.type !== 'response.create') throw new Error('Unsupported WebSocket command');
       const raw = isRecord(message.response) ? message.response : message;
       const previous = typeof raw.previous_response_id === 'string' ? raw.previous_response_id : undefined;
-      const body = await normalize(raw, ws.data.headers);
+      const body = await normalize(raw, ws.data.headers, AbortSignal.any([controller.signal, interrupt.signal]));
       log.info('request', { model: body.model, warmup: body.generate === false, compaction: isCompaction(body) });
 
       if (options.upstreamWebSocket && !isLocalModel(body.model) && !isCompaction(body)) {

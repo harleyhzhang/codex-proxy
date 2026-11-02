@@ -12,8 +12,8 @@ import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { functionTools, rawInputTools } from '../protocol/native-tools';
 import { responseObject } from '../protocol/output';
-import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors } from '../protocol/prompt';
-import type { OutputSink, ProxyOutput, ResponsesRequest } from '../protocol/types';
+import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, toolDescriptors, validateControls } from '../protocol/prompt';
+import type { OutputSink, ProxyOutput, ResponsesBody, ResponsesRequest } from '../protocol/types';
 import { abortable, ProxyTransportError, transportError } from '../transport';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
 import { Admission } from './admission';
@@ -51,6 +51,12 @@ export type CursorOptions = {
 };
 export class CursorError extends BackendError {
   constructor(message: string, retryable = false) { super(message, { retryable }); this.name = 'CursorError'; }
+}
+
+function assertCursorControls(request: ResponsesBody): void {
+  if (request.tool_choice !== undefined && request.tool_choice !== 'auto' && request.tool_choice !== 'none') throw new CursorError('Unsupported Cursor tool_choice: the SDK supports auto or none only');
+  if (request.max_output_tokens !== undefined) throw new CursorError('Unsupported Cursor max_output_tokens: the SDK cannot enforce an output token limit');
+  if (request.parallel_tool_calls === false && request.tool_choice !== 'none' && requestTools(request).length) throw new CursorError('Unsupported Cursor parallel_tool_calls: the SDK cannot forbid parallel calls');
 }
 
 // Provider-side failures that native Codex would retry with backoff (429/5xx/overload). Matched
@@ -227,7 +233,7 @@ function historyHash(items: unknown[]): string {
   return sha256(JSON.stringify(preparePrompt({ model: '', input: items as ResponsesRequest['input'] })));
 }
 function sessionSignature(request: ResponsesRequest, selection: JsonRecord): string {
-  return JSON.stringify({ selection, instructions: request.instructions, tools: requestTools(request), toolChoice: request.tool_choice, outputLimit: request.max_output_tokens });
+  return JSON.stringify({ selection, instructions: request.instructions, tools: requestTools(request), toolChoice: request.tool_choice, parallel: request.parallel_tool_calls, outputLimit: request.max_output_tokens });
 }
 const TOOL_RESULTS = new Set(['function_call_output', 'custom_tool_call_output', 'computer_call_output', 'tool_search_output']);
 /** Cursor's project folder for a working directory, as the SDK names it. */
@@ -322,6 +328,8 @@ class CursorRuntime {
    * issued its calls (they go to Codex) or the run finishes.
    */
   async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+    validateControls(request);
+    assertCursorControls(request);
     const release = await this.admission.acquire(signal, Array.isArray(request.input) && request.input.some(item => item.call_id && this.heldRuns.has(item.call_id)) ? 1 : 0);
     try { return await this.admittedRun(request, signal, sink); } finally { release(); }
   }
@@ -431,7 +439,7 @@ class CursorRuntime {
       if ((selection.params as Array<{ id: string; value: string }>).some(param => !definitions.some(def => isRecord(def) && def.id === param.id && Array.isArray(def.values) && def.values.some(v => isRecord(v) && v.value === param.value)))) throw new CursorError('Requested Cursor parameters are unavailable');
       // Cursor has no way to forbid calls, so a turn that allows none gets no tools.
       const tools = functionTools(request.tool_choice === 'none' ? [] : toolDescriptors(requestTools(request)));
-      const run = new NativeRun(tools.byKey, nonNegativeInt('CURSOR_TOOL_SETTLE_MS', 350));
+      const run = new NativeRun(tools.byKey, nonNegativeInt('CURSOR_TOOL_SETTLE_MS', 25));
       // Attached before the send, so the first thinking reaches Codex too.
       run.attach(sink);
       session = { run, spare, key, signature, historyHash: '', historyLength: 0, lastEvent: performance.now(), done: false };
@@ -447,6 +455,7 @@ class CursorRuntime {
       ].filter(Boolean).join('\n\n');
       const current = session;
       const onDelta = ({ update }: { update: unknown }) => {
+        if (current.ended || signal.aborted) return;
         current.lastEvent = performance.now();
         if (!isRecord(update)) return;
         if (update.type === 'text-delta' && typeof update.text === 'string') run.appendText(update.text);
@@ -455,8 +464,14 @@ class CursorRuntime {
         else if (update.type === 'summary-started') run.fail(contextOverflowError('Cursor'));
       };
       signal.throwIfAborted();
-      current.sdkRun = await spare.agent.send(images.length ? { text, images } : text, { model: selection, local: { customTools }, onDelta })
-        .catch((error: unknown) => { throw cursorFailure(error); });
+      const sending = spare.agent.send(images.length ? { text, images } : text, { model: selection, local: { customTools }, onDelta })
+        .then(async sdkRun => {
+          current.sdkRun = sdkRun;
+          // The SDK cannot accept an AbortSignal. Own late results even after this waiter left.
+          if (signal.aborted || current.ended) { await this.cancelRun(sdkRun); throw signal.reason ?? new DOMException('Cursor turn ended', 'AbortError'); }
+          return sdkRun;
+        }).catch((error: unknown) => { if (signal.aborted) throw signal.reason; throw cursorFailure(error); });
+      current.sdkRun = await abortable(sending, signal);
       void this.readRun(current, selection);
       return current;
     } catch (error) {
@@ -515,15 +530,19 @@ class CursorRuntime {
   }
 
   /** Ends a run: held callbacks are released, an unfinished run is cancelled, the agent is closed. */
+  private async cancelRun(run: SdkRun): Promise<void> {
+    try { await abortable(Promise.resolve().then(() => run.cancel()), AbortSignal.timeout(positiveInt('CURSOR_CLEANUP_TIMEOUT_MS', 2000))); }
+    catch { logSafe('cursor-cleanup-failed', { stage: 'cancel' }); }
+  }
+
   private endRun(session: RunSession, reason: string): Promise<void> {
     if (session.ended) return session.ended;
     clearTimeout(session.expiry);
     for (const [callId, owner] of this.heldRuns) if (owner === session) this.heldRuns.delete(callId);
     session.run.close(reason);
     session.ended = (async () => {
-      if (!session.done && session.sdkRun) await session.sdkRun.cancel().catch(() => logSafe('cursor-cleanup-failed', { stage: 'cancel' }));
-      await this.dispose(session.spare);
-      this.sessions.delete(session);
+      try { if (!session.done && session.sdkRun) await this.cancelRun(session.sdkRun); }
+      finally { await this.dispose(session.spare); this.sessions.delete(session); }
     })();
     return session.ended;
   }
@@ -542,6 +561,7 @@ export function createCursorBackend(options: CursorOptions): CursorBackend {
     name: `Cursor (${options.label})`, reservedPrefix: `${options.prefix}-`,
     models: Object.fromEntries(exposed.map(model => [`${options.prefix}-${model}`, model])),
     catalog: exposed.map(model => ({ slug: `${options.prefix}-${model}`, displayName: `${CURSOR_MODELS[model].name} (${options.label})`, description: 'Your subscription through Cursor; Codex executes tools.', efforts: CURSOR_MODELS[model].efforts, defaultEffort: 'high', inputModalities: CURSOR_MODELS[model].vision ? ['text', 'image'] : ['text'], contextWindow: CURSOR_MODELS[model].window })),
+    assertRequestControls: assertCursorControls,
     // Transient provider failures (an errored run, a dropped stream) get one fresh attempt.
     run: (request, signal, sink) => retryOnce('Cursor', signal, () => runtime.run(request, signal, sink), sink),
     prewarm: () => runtime.prewarm(),

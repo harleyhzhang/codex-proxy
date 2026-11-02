@@ -283,7 +283,7 @@ router. The model calls them as real tool calls; each call is handed to Codex as
 `function_call`/`custom_tool_call` the moment the model makes it, so Codex starts running it while
 the model may still be writing the next one, and the callback is held. When Codex's next request
 carries the results, the held callbacks are answered and the same Cursor run continues: no new agent,
-no re-prompt and nothing parsed out of model text. Calls written within `CURSOR_TOOL_SETTLE_MS` (350
+no re-prompt and nothing parsed out of model text. Calls written within `CURSOR_TOOL_SETTLE_MS` (25
 ms) of each other end the turn together as one parallel step. The agent's allowed tools are only the
 `mcp` group and its only tools are Codex's, so it has no shell, edit, read, web or subagent tool; any
 other tool event stops the turn. Function arguments that miss a required field or break the schema
@@ -327,8 +327,9 @@ cancelled, and primary and secondary accounts have separate gates. These limits 
 they do not change provider quota or billing settings.
 
 History retention conservatively charges each entry's complete input and output toward a 512-MiB
-payload allowance (512 entries, 12-hour expiry with idle sweeps). Shared prefixes may be charged
-more than once; evicting one entry cannot leave uncharged history behind. An evicted continuation
+payload allowance (512 entries, 12-hour expiry with idle sweeps). Shared immutable items are charged
+once until their last owner is evicted; independent replays and each entry's reference arrays pay
+their own charge. An evicted continuation
 asks Codex to resend the full history. Cursor's continuation signature uses the actual streamed
 message/tool order, including text between parallel calls, rather than rearranging it on replay.
 
@@ -344,6 +345,18 @@ available reasoning-token counts reach Codex. Content-free diagnostics include `
 (text or a completed tool call), `request-normalized`, `provider-admission` queue time,
 `provider-retry` attempts/delays, and structured `cursor-replay` reasons. Missing timing is null,
 not a zero-duration text sample from a tool-only turn. No prompt or response content is recorded.
+
+Foreign history restoration is cached only after an explicitly completed response. Failed,
+incomplete or dropped streams never create a reusable summary. Older unchecked cache files are
+ignored and restored once under this policy. Concurrent restorations share upstream work;
+cancelling the last waiter aborts it, while cancelling one waiter leaves others running.
+
+Claude and Grok preserve explicit parallel-call restrictions, named/required tool choice and
+output-token limits in their provider requests. Cursor's SDK supports `tool_choice: auto` or
+`none`; explicit required/named choice, `parallel_tool_calls: false` with tools enabled, and `max_output_tokens`
+are refused before generation because the SDK cannot enforce them. A cancelled Cursor setup
+releases its local agent and owns any late SDK result; a stalled remote cancel cannot indefinitely
+block local cleanup.
 
 ## Configuration
 
@@ -383,7 +396,8 @@ Everything has a default; set only what you need.
 | `CURSOR_SPARE_AGENTS` | `1` | Agents kept ready per login for the next turn; `0` creates each at its turn |
 | `CURSOR_MAX_HELD_RUNS` | `16` | Runs kept waiting on Codex tool results before the oldest is replayed instead |
 | `CURSOR_SESSION_IDLE_MS` | `900000` | How long a run waiting on Codex tool results is kept |
-| `CURSOR_TOOL_SETTLE_MS` | `350` | Quiet time after a native tool call before the calls so far go to Codex as one step |
+| `CURSOR_TOOL_SETTLE_MS` | `25` | Quiet time after a native tool call before the calls so far go to Codex as one step |
+| `CURSOR_CLEANUP_TIMEOUT_MS` | `2000` | Maximum wait for a remote Cursor cancel before local disposal proceeds |
 | `GROK_HOME` | `~/.grok` | Grok Build profile holding the login the router uses and refreshes (use a dedicated one) |
 | `GROK_TIMEOUT_MS` | `300000` | Grok stream idle timeout, not a total reasoning deadline |
 

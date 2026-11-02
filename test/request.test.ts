@@ -2,6 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { COMPUTER_TOOL_NAME, preparePrompt, requestToPrompt, toolDescriptors, validateRequest } from '../src/protocol/prompt';
 
 describe("Responses request adapter", () => {
+  test('invalid or unavailable explicit controls are refused', () => {
+    const base = { model: 'fixture', input: 'hello' };
+    for (const controls of [{ parallel_tool_calls: 'false' }, { max_output_tokens: 0 }, { max_output_tokens: 1.5 }, { tool_choice: 'required' }, { tool_choice: { type: 'function', name: 'missing' } }, { tool_choice: 'surprise' }]) {
+      expect(() => validateRequest({ ...base, ...controls })).toThrow('Unsupported');
+    }
+    expect(validateRequest({ ...base, parallel_tool_calls: false, max_output_tokens: 123, tool_choice: 'none' })).toMatchObject({ parallel_tool_calls: false, max_output_tokens: 123 });
+  });
   test("preserves conversation items and tool results", () => {
     const prompt = requestToPrompt({
       model: "sonnet",

@@ -28,6 +28,8 @@ export interface SubscriptionBackend {
   readonly catalog: readonly CatalogModel[];
   /** Pre-generation gate, e.g. a known exhausted quota. Throws a BackendError to refuse. */
   assertAvailable?(model: string): void;
+  /** Reject unsupported explicit controls before history restoration can spend a generation. */
+  assertRequestControls?(request: ResponsesBody): void;
   /** `sink`, when given, receives the turn's assistant text as it arrives. */
   run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput>;
   /**

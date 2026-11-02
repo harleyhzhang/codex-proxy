@@ -116,7 +116,7 @@ describe.each(LOCAL.map(({backend,model})=>[model,backend] as const))('%s',(mode
     for(const [cipher,reply,expected] of [['gAAAA-ok',{message:'TASK=READ_ONLY /fixture'},'TASK=READ_ONLY /fixture'],['gAAAA-refused',{message:"I cannot recover the task."},null]] as const){
       let seen:any;
       await withRun(backend,async request=>{seen=request;return output;},async()=>{
-        const app=await server(()=>sse({type:'response.output_text.delta',delta:JSON.stringify(reply)},{type:'response.completed',response:{}}),true);
+        const app=await server(()=>sse({type:'response.output_text.delta',delta:JSON.stringify(reply)},{type:'response.completed',response:{status:'completed'}}),true);
         try{
           const response=await app.post(agent(cipher));
           if(expected){expect(response.status).toBe(200);const text=JSON.stringify(seen.input);expect(text).toContain(expected);expect(text).not.toContain('gAAAA');}

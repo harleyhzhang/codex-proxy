@@ -33,6 +33,16 @@ const TOOLS: ResponsesRequest['tools'] = [
   { type: 'namespace', name: 'mcp__docs', tools: [{ type: 'function', name: 'search', parameters: { type: 'object', properties: { q: { type: 'string' } } } }] },
 ];
 
+test('Claude preserves parallel-call restrictions for automatic and forced tool choices', async () => {
+  const { account: claude } = account();
+  await claude.run(hello({ tools: TOOLS, parallel_tool_calls: false }));
+  expect(sent().tool_choice).toEqual({ type: 'auto', disable_parallel_tool_use: true });
+  await claude.run(hello({ tools: TOOLS, parallel_tool_calls: false, tool_choice: 'required', max_output_tokens: 123 }));
+  expect(sent(1)).toMatchObject({ tool_choice: { type: 'any', disable_parallel_tool_use: true }, max_tokens: 123 });
+  await claude.run(hello({ tools: TOOLS, parallel_tool_calls: false, tool_choice: 'none' }));
+  expect(sent(2).tool_choice).toEqual({ type: 'none' });
+});
+
 test('Codex tools go out as Claude tools with the client identity; calls come back as the Codex tools they stand for', async () => {
   anthropic.state.replies.push(() => anthropicStream([
     { type: 'text', text: 'working' },

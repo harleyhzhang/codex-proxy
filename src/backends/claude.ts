@@ -8,7 +8,7 @@ import { positiveInt } from '../env';
 import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools } from '../protocol/native-tools';
-import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescriptor } from '../protocol/prompt';
+import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
 import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
@@ -227,7 +227,8 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
   // Cache breakpoints at the end of the tools, the system prompt and the newest turn: each turn reads the
   // conversation the previous one wrote.
   cached(tools.at(-1)); cached(system.at(-1)); cached(messages.at(-1)?.content.at(-1));
-  const choice = tools.length ? toolChoice(request.tool_choice, keyFor) : undefined;
+  let choice = tools.length ? toolChoice(request.tool_choice, keyFor) : undefined;
+  if (tools.length && request.parallel_tool_calls === false && choice?.type !== 'none') choice = { ...(choice ?? { type: 'auto' }), disable_parallel_tool_use: true };
   return {
     byKey,
     body: {
@@ -395,6 +396,7 @@ export class ClaudeAccount {
   }
 
   async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+    validateControls(request);
     const release = await this.admission.acquire(signal, Array.isArray(request.input) && request.input.at(-1)?.type?.endsWith('_output') ? 1 : 0);
     const budget = new RetryBudget('Claude');
     try { return await retryOnce('Claude', signal, () => this.once(request, signal, sink, budget), sink); } finally { release(); }

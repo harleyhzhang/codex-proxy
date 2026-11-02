@@ -2,7 +2,7 @@
 import { nonNegativeInt } from '../env';
 import { isRecord } from '../json';
 import { logSafe } from '../log';
-import type { ResponsesBody } from '../protocol/types';
+import type { ResponsesBody, StreamEvent } from '../protocol/types';
 import { reconnectTransport, retryDelayMs, sleep, transportError } from '../transport';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
@@ -113,6 +113,24 @@ export function watchBody(response: Response, idle: { touch(): void; done(): voi
  */
 export type UpstreamErrorFields = Partial<Record<'type' | 'code' | 'plan_type' | 'resets_at' | 'resets_in_seconds', string | number>>;
 const CLASSIFYING_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in_seconds'] as const;
+const QUOTA_CODES = new Set(['usage_limit_reached', 'rate_limit_exceeded', 'insufficient_quota']);
+const REQUEST_FAULT_CODES = new Set(['context_length_exceeded', 'invalid_prompt', 'cyber_policy', 'invalid_request_error']);
+
+/** An error inside a successful HTTP stream still owns its native classification. */
+export function upstreamStreamFailure(event: StreamEvent, operation: string): UpstreamStatusError {
+  const response = isRecord(event.response) ? event.response : {};
+  const error = isRecord(event.error) ? event.error : isRecord(response.error) ? response.error : {};
+  const fields: UpstreamErrorFields = {};
+  for (const key of CLASSIFYING_FIELDS) {
+    const value = error[key];
+    if (typeof value === 'string' || typeof value === 'number') fields[key] = value;
+  }
+  const code = String(fields.code ?? fields.type ?? '');
+  const status = typeof event.status === 'number' && event.status >= 400 && event.status <= 599 ? event.status
+    : QUOTA_CODES.has(code) ? 429 : REQUEST_FAULT_CODES.has(code) ? 400 : 502;
+  const detail = typeof error.message === 'string' ? error.message.slice(0, 300) : '';
+  return new UpstreamStatusError(`OpenAI ${operation} failed${detail ? `: ${detail}` : ''}`, status, fields);
+}
 
 /**
  * Native Codex shows this for a 403 whose body mentions a Cloudflare block (codex-api api_bridge.rs

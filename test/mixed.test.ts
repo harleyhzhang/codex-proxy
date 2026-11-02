@@ -98,7 +98,7 @@ test('OpenAI compaction is bridged once by GPT into a cached sealed summary for 
  const dir=await mkdtemp(tmpdir()+'/mixed-bridge-');const codec=new SummaryCodec(Buffer.alloc(32,7));let calls=0;
  const frame=(event:any)=>'data: '+JSON.stringify(event)+String.fromCharCode(10,10);
  const bridge=new CompactionBridge(codec,dir,async body=>{calls++;expect(items(body)[0]!.encrypted_content).toBe('gAAAA-test');expect(body.store).toBe(false);expect(body.tools).toEqual([]);
-  return new Response(frame({type:'response.output_text.delta',delta:'Remember '})+frame({type:'response.output_text.delta',delta:'CEDAR'})+frame({type:'response.completed',response:{}}));});
+  return new Response(frame({type:'response.output_text.delta',delta:'Remember '})+frame({type:'response.output_text.delta',delta:'CEDAR'})+frame({type:'response.completed',response:{status:'completed'}}));});
  const request=await unwrap(codec,{model:'claude-opus-5-5',previous_response_id:'old',input:[{type:'compaction',encrypted_content:'gAAAA-test'}]},encrypted=>bridge.summary(encrypted));
  expect(firstText(items(request)[0])).toContain('Remember CEDAR');expect(request.previous_response_id).toBeUndefined();
  const files=[...new Bun.Glob('*.cap').scanSync(dir)];expect(files).toHaveLength(1);expect(await Bun.file(dir+'/'+files[0]).text()).not.toContain('CEDAR');

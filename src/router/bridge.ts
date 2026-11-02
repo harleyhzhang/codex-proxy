@@ -7,7 +7,9 @@ import { BackendError } from '../backends/contract';
 import { isRecord, sha256 } from '../json';
 import { log } from '../log';
 import { sseEvents } from '../protocol/stream';
-import type { ResponseContentPart, ResponseInputItem, ResponsesBody } from '../protocol/types';
+import type { ResponseContentPart, ResponseInputItem, ResponsesBody, StreamEvent } from '../protocol/types';
+import { abortable } from '../transport';
+import { upstreamFailure, upstreamStreamFailure, UpstreamStatusError } from './upstream';
 import type { SummaryCodec } from './capsule';
 
 /** OpenAI ciphertext starts with this Fernet-style prefix. */
@@ -98,7 +100,8 @@ function extractAgentMessage(raw: string): string | { reason: string } {
   return message;
 }
 
-type UpstreamCall = (body: ResponsesBody) => Promise<Response>;
+type UpstreamCall = (body: ResponsesBody, signal?: AbortSignal) => Promise<Response>;
+export type BridgeFlight = { promise: Promise<string>; controller: AbortController; users: number; done: boolean };
 
 /** Reads OpenAI ciphertext through GPT once per payload, caching each result sealed on disk. */
 export class CompactionBridge {
@@ -107,42 +110,55 @@ export class CompactionBridge {
     private readonly dir: string,
     private readonly fetchUpstream: UpstreamCall,
     private readonly models: readonly string[] = DEFAULT_BRIDGE_MODELS,
-    private readonly flights: { scope: string; jobs: Map<string, Promise<string>> } = { scope: '', jobs: new Map() },
+    private readonly flights: { scope: string; jobs: Map<string, BridgeFlight> } = { scope: '', jobs: new Map() },
   ) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
 
   /** The text of an OpenAI-encrypted compaction. */
-  summary(encrypted: string): Promise<string> {
-    const key = sha256(encrypted);
-    return this.once(key, () => this.load(key, encrypted));
+  summary(encrypted: string, signal?: AbortSignal): Promise<string> {
+    // Old cache files did not prove successful completion; restore them once under the new policy.
+    const key = sha256(`completed-summary-v2:${encrypted}`);
+    return this.once(key, signal, jobSignal => this.load(key, encrypted, jobSignal));
   }
 
   /** The text of an encrypted message from a GPT subagent. */
-  agentText(item: ResponseInputItem, encrypted: string): Promise<string> {
+  agentText(item: ResponseInputItem, encrypted: string, signal?: AbortSignal): Promise<string> {
     const agentItem = { ...item, content: [{ type: 'encrypted_content', encrypted_content: encrypted }] };
-    const key = sha256(`agent-message-v3${JSON.stringify(agentItem)}`);
-    return this.once(key, () => this.load(key, encrypted, agentItem));
+    const key = sha256(`agent-message-v4${JSON.stringify(agentItem)}`);
+    return this.once(key, signal, jobSignal => this.load(key, encrypted, jobSignal, agentItem));
   }
 
   /** Concurrent requests for the same payload share one upstream call. */
-  private once(key: string, job: () => Promise<string>): Promise<string> {
+  private async once(key: string, signal: AbortSignal | undefined, job: (signal: AbortSignal) => Promise<string>): Promise<string> {
+    signal?.throwIfAborted();
     const flightKey = `${this.flights.scope}:${key}`;
     const jobs = this.flights.jobs;
     let pending = jobs.get(flightKey);
+    if (pending?.controller.signal.aborted) { jobs.delete(flightKey); pending = undefined; }
     if (!pending) {
-      pending = job().finally(() => jobs.delete(flightKey));
+      const controller = new AbortController();
+      const current: BridgeFlight = { controller, users: 0, done: false, promise: Promise.resolve('') };
+      current.promise = job(controller.signal).finally(() => {
+        current.done = true;
+        if (jobs.get(flightKey) === current) jobs.delete(flightKey);
+      });
+      pending = current;
       jobs.set(flightKey, pending);
     }
-    return pending;
+    pending.users++;
+    try { return await abortable(pending.promise, signal); }
+    finally { if (--pending.users === 0 && !pending.done) pending.controller.abort(); }
   }
 
-  private async load(key: string, encrypted: string, agentItem?: ResponseInputItem): Promise<string> {
+  private async load(key: string, encrypted: string, signal: AbortSignal, agentItem?: ResponseInputItem): Promise<string> {
+    signal.throwIfAborted();
     const file = Bun.file(join(this.dir, `${key}.cap`));
     if (await file.exists()) return this.codec.open(await file.text());
 
     let lastStatus = 0;
     for (const model of this.models) {
+      signal.throwIfAborted();
       const response = await this.fetchUpstream({
         model,
         instructions: BRIDGE_INSTRUCTIONS,
@@ -156,18 +172,26 @@ export class CompactionBridge {
         store: false,
         stream: true,
         include: [],
-      });
+      }, signal);
       lastStatus = response.status;
       if (!response.ok) {
-        await response.body?.cancel();
+        const { detail, fields } = await upstreamFailure(response);
         log.warn('bridge-upstream', { model, status: response.status });
+        if (response.status === 401 || response.status === 403 || response.status === 429) throw new UpstreamStatusError('OpenAI history restoration unavailable', response.status, fields);
+        if (response.status >= 500) throw new UpstreamStatusError(`OpenAI history restoration failed${detail ? `: ${detail}` : ''}`, response.status, fields);
         continue;
       }
 
       let text = '';
+      let terminal: StreamEvent | undefined;
       await sseEvents(response, (event) => {
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') text += event.delta;
+        if (['response.completed', 'response.failed', 'response.incomplete', 'error'].includes(event.type)) terminal = event;
       });
+      signal.throwIfAborted();
+      if (!terminal || terminal.type !== 'response.completed' || !isRecord(terminal.response) || terminal.response.status !== 'completed') {
+        throw upstreamStreamFailure(terminal ?? { type: 'error' }, 'history restoration');
+      }
       if (!text.trim()) continue;
       if (agentItem) {
         const verdict = extractAgentMessage(text);
@@ -177,6 +201,7 @@ export class CompactionBridge {
         }
         text = verdict;
       }
+      signal.throwIfAborted();
       await Bun.write(file, this.codec.seal(text));
       log.info('bridge-summary', { model, chars: text.length });
       return text;
@@ -195,6 +220,7 @@ export class CompactionBridge {
 export async function restoreAgentMessages(
   input: ResponseInputItem[],
   bridge: CompactionBridge | undefined,
+  signal?: AbortSignal,
 ): Promise<ResponseInputItem[]> {
   const restored: ResponseInputItem[] = [];
   for (const item of input) {
@@ -206,7 +232,7 @@ export async function restoreAgentMessages(
     for (const part of item.content) {
       if (part?.type === 'encrypted_content' && isOpenAICiphertext(part.encrypted_content)) {
         if (!bridge) throw new BackendError('Encrypted GPT helper task restoration unavailable');
-        content.push({ type: 'input_text', text: await bridge.agentText(item, part.encrypted_content) });
+        content.push({ type: 'input_text', text: await bridge.agentText(item, part.encrypted_content, signal) });
       } else {
         content.push(part);
       }

@@ -27,6 +27,9 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
     /** Called on every Agent.create and send; an error returned is thrown there. */
     createError: (): Error | undefined => undefined,
     sendError: (): Error | undefined => undefined,
+    sendWait: async (): Promise<void> => {},
+    cancelWait: async (): Promise<void> => {},
+    toolGapMs: 20,
     /** Each send's result before it is shaped; tests may replace it. */
     result: (_text: string, model: unknown, final: string): JsonRecord => ({ status: 'finished', result: final, model, usage: { inputTokens: 10, outputTokens: 2 } }),
     textChunks: (text: string): string[] => [text],
@@ -51,6 +54,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
           close() { if (!closed) { closed = true; record('close', { agentId }); } },
           async send(message: unknown, sendOptions: JsonRecord = {}): Promise<SdkRun> {
             record('attempt', { agentId });
+            await state.sendWait();
             const sendFailure = state.sendError();
             if (sendFailure) throw sendFailure;
             const text = typeof message === 'string' ? message : String((message as JsonRecord).text);
@@ -100,7 +104,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
               }
               if (latest.includes('PARALLEL')) {
                 const first = call('echo', { value: 'a' });
-                await Bun.sleep(20);
+                await Bun.sleep(state.toolGapMs);
                 const second = call('echo', { value: 'b' });
                 final = 'got:' + textOf(await first) + '|' + textOf(await second);
               }
@@ -124,7 +128,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
                 }
               },
               async wait() { while (!finished) await new Promise<void>(resolve => waiters.push(resolve)); return result; },
-              async cancel() { record('cancel', { agentId }); cancelled = true; done('cancelled'); },
+              async cancel() { record('cancel', { agentId }); await state.cancelWait(); cancelled = true; done('cancelled'); },
             };
           },
         };

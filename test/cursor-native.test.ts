@@ -49,8 +49,81 @@ test('Codex tools are the only tools: custom tools behind the MCP group alone, o
 }));
 
 test('a turn that forbids calls (compaction) gets no tools', () => fixture(async f => {
-  await f.backend.run({ ...request('PLAIN'), tool_choice: 'none' });
+  await f.backend.run({ ...request('PLAIN'), tool_choice: 'none', parallel_tool_calls: false });
   expect(find(f, 'send')[0]?.tools).toEqual([]);
+}));
+
+test.each([
+  { tool_choice: 'required' },
+  { tool_choice: { type: 'function', name: 'echo' } },
+  { max_output_tokens: 10 },
+  { parallel_tool_calls: false },
+])('unsupported explicit Cursor controls fail before SDK setup: %j', controls => fixture(async f => {
+  await expect(f.backend.run({ ...request('PLAIN'), ...controls })).rejects.toThrow('Unsupported Cursor');
+  expect(f.count('create')).toBe(0); expect(f.count('send')).toBe(0);
+}));
+
+test.each(['cancel', 'timeout'])('a stalled SDK send releases its turn on %s and owns the late run', mode => fixture(async f => {
+  const previousSpare = process.env.CURSOR_SPARE_AGENTS, previousTimeout = process.env.CURSOR_TIMEOUT_MS;
+  process.env.CURSOR_SPARE_AGENTS = '0'; process.env.CURSOR_TIMEOUT_MS = '30';
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }); f.state.sendWait = () => gate;
+  const controller = new AbortController();
+  const pending = f.backend.run(request('PLAIN'), controller.signal).catch((error: unknown) => error);
+  try {
+    for (let i = 0; i < 100 && !f.count('attempt'); i++) await Bun.sleep(2);
+    expect(f.count('attempt')).toBe(1);
+    if (mode === 'cancel') controller.abort(new Error('client stopped'));
+    const error = await Promise.race([pending, Bun.sleep(500).then(() => 'still hanging')]);
+    expect(error).toBeInstanceOf(Error);
+    const attempts = mode === 'timeout' ? 2 : 1;
+    expect(f.count('close')).toBe(attempts);
+    release();
+    for (let i = 0; i < 100 && f.count('cancel') < attempts; i++) await Bun.sleep(2);
+    expect(f.count('cancel')).toBe(attempts);
+    f.state.sendWait = async () => {};
+    expect((await f.backend.run(request('PLAIN'))).text).toBe('hello');
+  } finally {
+    controller.abort(); release(); await pending;
+    if (previousSpare === undefined) delete process.env.CURSOR_SPARE_AGENTS; else process.env.CURSOR_SPARE_AGENTS = previousSpare;
+    if (previousTimeout === undefined) delete process.env.CURSOR_TIMEOUT_MS; else process.env.CURSOR_TIMEOUT_MS = previousTimeout;
+  }
+}));
+
+test('a stalled cancellation RPC cannot prevent local disposal or the next request', () => fixture(async f => {
+  const previous = process.env.CURSOR_CLEANUP_TIMEOUT_MS; process.env.CURSOR_CLEANUP_TIMEOUT_MS = '20';
+  let release!: () => void; const gate = new Promise<void>(resolve => { release = resolve; });
+  f.state.cancelWait = () => gate;
+  const controller = new AbortController(); const pending = f.backend.run(request('HANG'), controller.signal).catch((error: unknown) => error);
+  try {
+    for (let i = 0; i < 100 && !f.count('send'); i++) await Bun.sleep(2);
+    controller.abort(new Error('client stopped'));
+    expect(await Promise.race([pending, Bun.sleep(500).then(() => 'still hanging')])).toBeInstanceOf(Error);
+    expect(f.count('close')).toBeGreaterThanOrEqual(1);
+    f.state.cancelWait = async () => {};
+    expect((await f.backend.run(request('PLAIN'))).text).toBe('hello');
+  } finally { release(); await pending; if (previous === undefined) delete process.env.CURSOR_CLEANUP_TIMEOUT_MS; else process.env.CURSOR_CLEANUP_TIMEOUT_MS = previous; }
+}));
+
+test('the shorter default batches nearby parallel calls and continues delayed calls on the same SDK run', () => fixture(async f => {
+  const previous = process.env.CURSOR_TOOL_SETTLE_MS; delete process.env.CURSOR_TOOL_SETTLE_MS;
+  try {
+    const first = request('PARALLEL');
+    const batched = await f.backend.run(first);
+    expect(batched.toolCalls).toHaveLength(2);
+    expect((await f.backend.run(nextTurn(first, batched, ['a', 'b']))).text).toBe('got:a|b');
+    f.state.toolGapMs = 80;
+    let current = request('PARALLEL'), calls = 0, turns = 0;
+    let out: ProxyOutput;
+    do {
+      out = await f.backend.run(current); calls += out.toolCalls.length; turns++;
+      // A real slow tool can finish after another call has arrived while this turn is detached.
+      if (out.toolCalls.length) await Bun.sleep(100);
+      current = nextTurn(current, out, out.toolCalls.map(() => 'ok'));
+    } while (out.toolCalls.length && turns < 5);
+    expect(out.text).toBe('got:ok|ok'); expect(calls).toBe(2); expect(turns).toBe(3);
+    expect(f.count('send')).toBe(2); // one per independent conversation, never per continuation
+  } finally { if (previous === undefined) delete process.env.CURSOR_TOOL_SETTLE_MS; else process.env.CURSOR_TOOL_SETTLE_MS = previous; }
 }));
 
 test('a tool call reaches Codex as a call and its result continues the same run, with no new agent or prompt', () => fixture(async f => {

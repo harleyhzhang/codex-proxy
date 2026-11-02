@@ -1,5 +1,7 @@
 import { expect, test } from 'bun:test';
 import { claudeBackend } from '../src/backends/claude';
+import { scriptedCursor } from './cursor-sdk-fixture';
+import { rm } from 'node:fs/promises';
 import { isRecord } from '../src/json';
 import { streamResponse, responseObject } from '../src/protocol/output';
 import type { ResponsesBody, StreamEvent } from '../src/protocol/types';
@@ -16,6 +18,42 @@ const body: ResponsesBody = {
   model: 'claude-opus-5-5',
   input: [{ type: 'compaction', encrypted_content: 'gAAAA-shared' }],
 };
+
+test.each(['http', 'websocket'])('disconnecting the sole %s bridge waiter cancels its upstream request', async transport => {
+  const ready = deferred<void>(), cancelled = deferred<void>();
+  const app = await fixtureRouter({ summaryKey: Buffer.alloc(32, 5), upstreamFetch: async (_url, init) => {
+    ready.resolve();
+    return new Promise<Response>((_resolve, reject) => init.signal?.addEventListener('abort', () => { cancelled.resolve(); reject(init.signal?.reason); }, { once: true }));
+  } });
+  const controller = new AbortController(); let ws: WebSocket | undefined;
+  let request: Promise<unknown> = Promise.resolve();
+  try {
+    if (transport === 'http') request = fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(body), signal: controller.signal }).catch((error: unknown) => error);
+    else {
+      const Socket = WebSocket as unknown as { new(url: string, options: { headers: Record<string, string> }): WebSocket };
+      ws = new Socket(app.url('/v1/responses').replace('http:', 'ws:'), { headers: AUTH_HEADERS });
+      await new Promise<void>((resolve, reject) => { ws!.onopen = () => resolve(); ws!.onerror = () => reject(new Error('fixture socket failed')); });
+      ws.send(JSON.stringify({ type: 'response.create', ...body }));
+    }
+    await ready.promise;
+    if (ws) ws.close(); else controller.abort();
+    expect(await Promise.race([cancelled.promise.then(() => true), Bun.sleep(500).then(() => false)])).toBe(true);
+    await request;
+    expect([...new Bun.Glob('bridged/*.cap').scanSync(app.dir)]).toHaveLength(0);
+  } finally { controller.abort(); ws?.close(); await request; await app.close(); }
+});
+
+test('unsupported Cursor controls are refused before a foreign history restoration starts', async () => {
+  const f = await scriptedCursor(); let calls = 0;
+  const original = claudeBackend.assertRequestControls;
+  claudeBackend.assertRequestControls = f.backend.assertRequestControls;
+  const app = await fixtureRouter({ summaryKey: Buffer.alloc(32, 4), upstreamFetch: async () => { calls++; throw new Error('unexpected generation'); } });
+  try {
+    const response = await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify({ ...body, max_output_tokens: 10 }) });
+    expect(response.status).toBe(400); expect(calls).toBe(0); expect(f.count('send')).toBe(0);
+    expect(JSON.stringify(await response.json())).toContain('Unsupported Cursor max_output_tokens');
+  } finally { claudeBackend.assertRequestControls = original; await app.close(); await f.backend.close(); await rm(f.root, { recursive: true, force: true }); }
+});
 
 // Hold the upstream stream open so requests overlap without relying on sleeps or live services.
 test('concurrent HTTP and WebSocket history restoration shares one flight even if one caller cancels', async () => {

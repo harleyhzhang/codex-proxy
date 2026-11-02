@@ -58,6 +58,13 @@ const TOOLS: ResponsesRequest['tools'] = [
   { type: 'namespace', name: 'mcp__docs', tools: [{ type: 'function', name: 'search', parameters: { type: 'object', properties: { q: { type: 'string' } } } }] },
 ];
 
+test('Grok preserves explicit parallel restrictions, named tools and output limits', async () => {
+  const request = hello({ tools: TOOLS, parallel_tool_calls: false, max_output_tokens: 123, tool_choice: { type: 'function', namespace: 'mcp__docs', name: 'search' } });
+  await backend(login(3_600_000)).run(request);
+  expect(responses()[0]!.body).toMatchObject({ parallel_tool_calls: false, max_output_tokens: 123, tool_choice: { type: 'function', name: 'mcp__docs_search' } });
+  expect(responseObject(request, { text: '', toolCalls: [], usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 } }).parallel_tool_calls).toBe(false);
+});
+
 test('Codex tools go out as function tools and history keeps its shape; calls come back as the Codex tools they stand for', async () => {
   replies.push(() => completed([
     { type: 'reasoning', id: 'rs_1', encrypted_content: 'xai-thoughts', summary: [] },
