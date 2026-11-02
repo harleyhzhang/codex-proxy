@@ -10,6 +10,7 @@ import { logSafe } from '../log';
 import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup } from '../protocol/native-tools';
 import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { sseEvents } from '../protocol/stream';
+import { idleDeadline, watchBody } from '../protocol/idle';
 import type { ProxyOutput, ResponsesRequest, StreamEvent, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
 import { RetryBudget } from './retries';
@@ -282,17 +283,12 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
     const started = performance.now();
     const { body, byKey } = grokRequest(request, replay);
     // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
-    const idleMs = positiveInt('GROK_TIMEOUT_MS', 300_000);
-    const idle = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const touch = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new DOMException('Grok stream idle', 'TimeoutError')), idleMs); };
-    const combined = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
-    touch();
+    const idle = idleDeadline(signal ?? new AbortController().signal, positiveInt('GROK_TIMEOUT_MS', 300_000), 'Grok stream idle');
     let firstEventMs = 0, firstUsefulMs: number | undefined, completed: JsonRecord | undefined, failed: StreamEvent | undefined;
     try {
-      const response = await open(JSON.stringify(body), combined, budget);
+      const response = await open(JSON.stringify(body), idle.signal, budget);
       if (!response.body) throw new ProxyTransportError();
-      const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
+      const watched = watchBody(response, idle);
       await sseEvents(watched, event => {
         firstEventMs ||= performance.now() - started;
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') { firstUsefulMs ??= performance.now() - started; sink?.text(event.delta); }
@@ -305,7 +301,7 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
         if ((event.type === 'response.completed' || event.type === 'response.incomplete') && isRecord(event.response)) completed = event.response;
         if (event.type === 'response.failed' || event.type === 'error') failed = event;
       });
-    } finally { clearTimeout(timer); }
+    } finally { idle.done(); }
     if (failed) {
       const error = isRecord(failed.error) ? failed.error : isRecord(failed.response) && isRecord(failed.response.error) ? failed.response.error : {};
       const detail = String(error.message ?? '').slice(0, 300);

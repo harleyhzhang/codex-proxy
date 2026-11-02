@@ -14,6 +14,24 @@ function equalJson(left: unknown, right: unknown, depth = 0): boolean {
 export const fieldName = (name: string) => /^[A-Za-z0-9_.-]{1,64}$/.test(name) ? name : '(field)';
 const field = fieldName;
 
+/** A local JSON Schema reference uses an RFC 6901 URI-fragment pointer. Resolve only own
+ * JSON members, including canonical array indexes; never follow JavaScript's prototypes. */
+export function resolveSchemaRef(root: unknown, reference: string): Record<string, unknown> | boolean | undefined {
+  if (!reference.startsWith('#')) return undefined;
+  let pointer: string;
+  try { pointer = decodeURIComponent(reference.slice(1)); } catch { return undefined; }
+  if (pointer && !pointer.startsWith('/')) return undefined;
+  let target: unknown = root;
+  for (const part of pointer ? pointer.slice(1).split('/') : []) {
+    if (/~(?:[^01]|$)/.test(part)) return undefined;
+    const key = part.replaceAll('~1', '/').replaceAll('~0', '~');
+    if (Array.isArray(target)) {
+      target = /^(?:0|[1-9][0-9]*)$/.test(key) && Object.hasOwn(target, key) ? target[Number(key)] : undefined;
+    } else target = isRecord(target) && Object.hasOwn(target, key) ? target[key] : undefined;
+  }
+  return isRecord(target) || typeof target === 'boolean' ? target : undefined;
+}
+
 /**
  * Checks a function call's arguments against its contract. Models swap a parameter name (`command`
  * for `cmd`), which is reported as missing; undeclared top-level extras (models like adding
@@ -40,14 +58,7 @@ export function toolSchemaIssue(value: unknown, contract: unknown): string | und
     if (schema === false) return `${path} is not allowed by its schema`;
     if (!isRecord(schema)) return undefined;
     if (typeof schema.$ref === 'string') {
-      let referenced: unknown = contract;
-      if (schema.$ref === '#') referenced = contract;
-      else if (schema.$ref.startsWith('#/')) {
-        for (const part of schema.$ref.slice(2).split('/')) {
-          const key = part.replaceAll('~1', '/').replaceAll('~0', '~');
-          referenced = isRecord(referenced) && Object.hasOwn(referenced, key) ? referenced[key] : undefined;
-        }
-      } else referenced = undefined;
+      const referenced = resolveSchemaRef(contract, schema.$ref);
       if (referenced === undefined) return `${path} has an unresolved schema reference`;
       const issue = check(value, referenced, path, depth + 1);
       if (issue) return issue;
@@ -88,7 +99,16 @@ export function toolSchemaIssue(value: unknown, contract: unknown): string | und
     }
     if (typeof value === 'string') {
       if (typeof schema.minLength === 'number' || typeof schema.maxLength === 'number') {
-        const length = Array.from(value).length;
+        // Count Unicode code points without allocating one array entry per character. A valid
+        // surrogate pair counts once; unpaired surrogates still count as individual characters.
+        let length = 0;
+        for (let i = 0; i < value.length; i++, length++) {
+          const first = value.charCodeAt(i);
+          if (first >= 0xd800 && first <= 0xdbff) {
+            const next = value.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) i++;
+          }
+        }
         if (typeof schema.minLength === 'number' && length < schema.minLength) return `${path} is shorter than its minimum length`;
         if (typeof schema.maxLength === 'number' && length > schema.maxLength) return `${path} exceeds its maximum length`;
       }

@@ -11,6 +11,7 @@ import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES,
 import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
+import { idleDeadline, watchBody } from '../protocol/idle';
 import { claudeOutputFormat } from '../protocol/output-format';
 import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
@@ -410,19 +411,14 @@ export class ClaudeAccount {
     const started = performance.now();
     const { body, byKey } = await claudeRequest(request, this.replay, signal);
     // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
-    const idleMs = positiveInt('CLAUDE_TIMEOUT_MS', 300_000);
-    const idle = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const touch = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new DOMException('Claude stream idle', 'TimeoutError')), idleMs); };
-    const combined = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
-    touch();
+    const idle = idleDeadline(signal ?? new AbortController().signal, positiveInt('CLAUDE_TIMEOUT_MS', 300_000), 'Claude stream idle');
     const content: JsonRecord[] = [];
     const usage: JsonRecord = {};
     let stop = '', ended = false, firstTextMs: number | undefined, firstUsefulMs: number | undefined, failure: JsonRecord | undefined;
     try {
-      const response = await this.open(String(body.model), JSON.stringify(body), combined, budget);
+      const response = await this.open(String(body.model), JSON.stringify(body), idle.signal, budget);
       if (!response.body) throw new ProxyTransportError();
-      const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
+      const watched = watchBody(response, idle);
       await sseEvents(watched, event => {
         const block = typeof event.index === 'number' ? content[event.index] : undefined;
         const delta = isRecord(event.delta) ? event.delta : {};
@@ -452,7 +448,7 @@ export class ClaudeAccount {
         } else if (event.type === 'message_stop') ended = true;
         else if (event.type === 'error') failure = isRecord(event.error) ? event.error : {};
       }, new Set(['message_stop', 'error']));
-    } finally { clearTimeout(timer); }
+    } finally { idle.done(); }
     if (failure) {
       const detail = String(failure.message ?? failure.type ?? '').slice(0, 300);
       if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');

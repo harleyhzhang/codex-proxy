@@ -135,6 +135,29 @@ test('large primitive uniqueness checks keep JSON equality without exhausting pa
   expect(output.status).not.toBe('failed');
 });
 
+test('schema string lengths count Unicode code points including lone surrogates', () => {
+  for (const [value, length] of [['', 0], ['abc', 3], ['😀', 1], ['a😀b', 3], ['\ud800', 1], ['\udc00', 1], ['\ud800a', 2], ['\udc00\ud800', 2]] as const) {
+    expect(toolSchemaIssue(value, { type: 'string', minLength: length, maxLength: length })).toBeUndefined();
+    expect(toolSchemaIssue(value, { minLength: length + 1 })).toContain('shorter than its minimum length');
+    if (length) expect(toolSchemaIssue(value, { maxLength: length - 1 })).toContain('exceeds its maximum length');
+  }
+});
+
+test('local schema references resolve URI-fragment pointers through own objects and arrays', () => {
+  const definitions: unknown = JSON.parse('{"a/b~c":{"anyOf":[{"type":"string"},{"type":"number"}]},"foo bar":{"type":"boolean"},"%2F":{"type":"null"},"__proto__":{"type":"integer"}}');
+  const contract = ($ref: string) => ({ $defs: definitions, $ref });
+  const string = contract('#/$defs/a~1b~0c/anyOf/0');
+  expect(toolSchemaIssue('text', string)).toBeUndefined();
+  expect(toolSchemaIssue(1, string)).toContain('wrong value type');
+  expect(toolSchemaIssue(true, contract('#/$defs/foo%20bar'))).toBeUndefined();
+  expect(toolSchemaIssue(null, contract('#/$defs/%252F'))).toBeUndefined();
+  expect(toolSchemaIssue(1, contract('#/$defs/__proto__'))).toBeUndefined();
+  expect(toolSchemaIssue(false, { $defs: { forbidden: false }, $ref: '#/$defs/forbidden' })).toContain('not allowed');
+  for (const reference of ['#/$defs/a~1b~0c/anyOf/01', '#/$defs/a~1b~0c/anyOf/-', '#/$defs/a~1b~0c/anyOf/length', '#/$defs/a~1b~0c/anyOf/2', '#/$defs/toString', '#/$defs/constructor', '#/$defs/bad~2escape', '#/$defs/bad~', '#/$defs/%FF', '#/$defs/%', '#named-anchor', 'https://example.com/schema']) {
+    expect(toolSchemaIssue('text', contract(reference))).toContain('unresolved schema reference');
+  }
+});
+
 for (const stream of [false, true]) test('HTTP GPT history supports same-provider and switched-provider continuations, stream=' + stream, async () => {
   const upstreamBodies: ResponsesBody[] = [], localBodies: ResponsesRequest[] = [];
   const backend = BACKENDS[0]!; const original = backend.run;

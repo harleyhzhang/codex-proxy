@@ -41,6 +41,19 @@ describe('upstream idle deadline (native bounds streams by idle time, not length
     expect((idle.signal.reason as Error).name).toBe('TimeoutError');
   });
 
+  test('provider deadlines preserve their message and parent cancellation reason', async () => {
+    const custom = idleDeadline(new AbortController().signal, 30, 'Claude stream idle');
+    await Bun.sleep(60);
+    expect(custom.signal.reason).toMatchObject({ name: 'TimeoutError', message: 'Claude stream idle' });
+    const parent = new AbortController();
+    const idle = idleDeadline(parent.signal, 40, 'Grok stream idle');
+    const reason = new Error('client left');
+    parent.abort(reason);
+    idle.touch();
+    await Bun.sleep(80);
+    expect(idle.signal.reason).toBe(reason);
+  });
+
   test('cancelled and errored bodies disarm their idle deadlines', async () => {
     const cancelled = idleDeadline(new AbortController().signal, 40);
     let reason: unknown;
@@ -79,9 +92,9 @@ describe('upstream idle deadline (native bounds streams by idle time, not length
     await pending;
     await Bun.sleep(80);
     expect(idle.signal.aborted).toBe(false);
-    cleanup();
     await cancelled;
     expect(source.body!.locked).toBe(false);
+    cleanup();
   });
 });
 

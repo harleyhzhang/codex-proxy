@@ -78,6 +78,25 @@ test('root and nested schema references preserve valid alternative values', () =
   for (const valid of [{ a: 'x' }, { b: 2 }]) expect(checkToolArguments(valid, schema).issue).toBeUndefined();
 });
 
+test('union translation shares local reference resolution for arrays, URI fragments and own properties', () => {
+  const branch = { properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false };
+  for (const contract of [
+    { $defs: { choice: { anyOf: [branch] } }, $ref: '#/$defs/choice/anyOf/0' },
+    { $defs: { 'a/b~ c': branch }, $ref: '#/$defs/a~1b~0%20c' },
+    { $defs: JSON.parse(JSON.stringify({ ['__proto__']: branch })) as unknown, $ref: '#/$defs/__proto__' },
+  ]) {
+    const schema = functionTools([{ type: 'function', proxyName: 'refs', name: 'refs', contract }]).definitions.refs!.inputSchema;
+    expect(schema.properties).toEqual(branch.properties);
+    expect(schema.required).toEqual(['value']);
+    expect(checkToolArguments({ value: 'ok' }, schema).issue).toBeUndefined();
+    expect(checkToolArguments({ value: 1 }, schema).issue).toContain('wrong value type');
+  }
+  const inherited = { $defs: Object.create({ inherited: branch }) as unknown, $ref: '#/$defs/inherited' };
+  const schema = functionTools([{ type: 'function', proxyName: 'refs', name: 'refs', contract: inherited }]).definitions.refs!.inputSchema;
+  expect(schema.properties).toBeUndefined();
+  expect(schema.required).toBeUndefined();
+});
+
 test('history charges retained input, bounds independent/shared entries, and expires without a new request', async () => {
   let now = 0;
   const cache = new HistoryCache({ maxBytes: 1800, maxEntries: 10, ttlMs: 10, sweepMs: 5, now: () => now });

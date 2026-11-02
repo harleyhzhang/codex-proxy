@@ -3,6 +3,7 @@
 // `input`; namespaced names are flattened to identifier-safe keys and mapped back on the way out.
 import { isRecord, type JsonRecord } from '../json';
 import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, type ToolDescriptor } from './prompt';
+import { resolveSchemaRef } from './tool-schema';
 import type { ResponseInputItem, ToolCall } from './types';
 
 export type FunctionTool = { description: string; inputSchema: JsonRecord };
@@ -13,10 +14,17 @@ const RAW_INPUT_NOTE = 'Pass the complete raw input as the string field "input".
 export function functionTools(descriptors: ToolDescriptor[]): { definitions: Record<string, FunctionTool>; byKey: Map<string, ToolDescriptor> } {
   const definitions: Record<string, FunctionTool> = Object.create(null);
   const byKey = new Map<string, ToolDescriptor>();
+  const nextSuffix = new Map<string, number>();
   for (const descriptor of descriptors) {
     const base = descriptor.proxyName.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool';
     let key = base;
-    for (let suffix = 2; byKey.has(key); suffix++) key = `${base.slice(0, 56)}_${suffix}`;
+    if (byKey.has(key)) {
+      // Occupied keys never disappear; bases sharing a truncated stem share its suffix cursor.
+      const stem = base.slice(0, 56);
+      let suffix = nextSuffix.get(stem) ?? 2;
+      do { key = `${stem}_${suffix++}`; } while (byKey.has(key));
+      nextSuffix.set(stem, suffix);
+    }
     byKey.set(key, descriptor);
     definitions[key] = { description: toolDescription(descriptor), inputSchema: inputSchema(descriptor) };
   }
@@ -70,11 +78,7 @@ function flattenUnion(contract: JsonRecord, root = contract, seen = new Set<unkn
   const resolve = (schema: unknown): JsonRecord => {
     if (!isRecord(schema)) return {};
     if (typeof schema.$ref !== 'string') return flattenUnion(schema, root, visited);
-    let target: unknown = root;
-    if (schema.$ref !== '#') {
-      if (!schema.$ref.startsWith('#/')) return {};
-      for (const part of schema.$ref.slice(2).split('/')) target = isRecord(target) ? target[part.replaceAll('~1', '/').replaceAll('~0', '~')] : undefined;
-    }
+    const target = resolveSchemaRef(root, schema.$ref);
     if (!isRecord(target)) return {};
     const { $ref: _ref, ...siblings } = schema;
     const resolved = flattenUnion(target, root, visited);
