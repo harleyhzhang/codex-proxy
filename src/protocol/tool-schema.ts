@@ -105,9 +105,24 @@ export function toolSchemaIssue(value: unknown, contract: unknown): string | und
         const child = tuple ? i < tuple.length ? tuple[i] : Array.isArray(schema.items) ? schema.additionalItems : schema.items : schema.items;
         if (child !== undefined) { const issue = check(value[i], child, `${path}[${i}]`, depth + 1); if (issue) return issue; }
       }
-      if (schema.uniqueItems === true) for (let i = 0; i < value.length; i++) for (let j = 0; j < i; j++) {
-        if (--budget < 0) { exhausted = true; return `${path} exceeds the schema validation budget`; }
-        if (equalJson(value[i], value[j])) return `${path} must contain unique items`;
+      if (schema.uniqueItems === true) {
+        const primitives = new Set<unknown>();
+        const structures: unknown[] = [];
+        for (const item of value) {
+          if (item !== null && typeof item === 'object') {
+            for (const previous of structures) {
+              if (--budget < 0) { exhausted = true; return `${path} exceeds the schema validation budget`; }
+              if (equalJson(item, previous)) return `${path} must contain unique items`;
+            }
+            structures.push(item);
+          } else {
+            if (--budget < 0) { exhausted = true; return `${path} exceeds the schema validation budget`; }
+            // Match equalJson's strict equality (including -0); NaN is never equal to itself.
+            if (typeof item === 'number' && Number.isNaN(item)) continue;
+            if (primitives.has(item)) return `${path} must contain unique items`;
+            primitives.add(item);
+          }
+        }
       }
       if (Object.hasOwn(schema, 'contains')) {
         const count = value.filter(item => !check(item, schema.contains, path, depth + 1)).length;

@@ -16,6 +16,40 @@ for (const ending of ['\n', '\r\n', '\r']) test('SSE survives every byte boundar
   expect(events).toEqual([{ type: 'delta', text: '🍁漢字' }, { type: 'response.completed' }]);
 });
 
+test('SSE strips one leading UTF-8 BOM across every chunk boundary', async () => {
+  const bytes = encoder.encode('\uFEFFdata: {"type":"response.completed"}\n\n');
+  for (let split = 0; split <= bytes.length; split++) {
+    const events: StreamEvent[] = [];
+    const parser = new SseParser(event => events.push(event));
+    parser.feed(bytes.subarray(0, split)); parser.feed(bytes.subarray(split)); parser.finish();
+    expect(events).toEqual([{ type: 'response.completed' }]); expect(parser.ended).toBe(true);
+  }
+  const events: StreamEvent[] = [];
+  const parser = new SseParser(event => events.push(event));
+  parser.feed(encoder.encode(': first line\n\n\uFEFFdata: {"type":"ignored"}\n\ndata: {"type":"response.completed"}\n\n'));
+  expect(events).toEqual([{ type: 'response.completed' }]);
+  expect(() => new SseParser(() => {}, undefined, bytes.length - 1).feed(bytes)).toThrow('Upstream event too large');
+});
+
+test('SSE copies partial bytes before the input buffer is reused', () => {
+  const events: StreamEvent[] = [];
+  const parser = new SseParser(event => events.push(event));
+  const prefix = encoder.encode('data: {"type":');
+  parser.feed(prefix); prefix.fill(0);
+  parser.feed(encoder.encode('"response.completed"}\n\n'));
+  expect(events).toEqual([{ type: 'response.completed' }]);
+});
+
+test('a terminal SSE event releases its reader without waiting on stalled source cleanup', async () => {
+  let cancelled = false;
+  const source = new ReadableStream<Uint8Array>({
+    start(out) { out.enqueue(encoder.encode(frame({ type: 'response.completed' }))); },
+    cancel() { cancelled = true; return new Promise<void>(() => {}); },
+  });
+  await sseEvents(new Response(source), () => {});
+  expect(cancelled).toBe(true); expect(source.locked).toBe(false);
+});
+
 test('complete and unterminated SSE frames are capped before delivery in real UTF-8 bytes', () => {
   for (const suffix of ['\n\n', '']) {
     let delivered = 0;

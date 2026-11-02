@@ -86,19 +86,26 @@ export function portableSummary(summary: string, input: ResponseInputItem[] = []
   }
   receipts.reverse();
   const toolHistory = () => receipts.flatMap((item) => [calls.get(item.call_id), item]);
-  const size = () => Buffer.byteLength(JSON.stringify({ anchors, tool_history: toolHistory() }));
+  let bytes = Buffer.byteLength(JSON.stringify({ anchors, tool_history: toolHistory() }));
 
-  while (size() > PORTABLE_CAPACITY && receipts.length) receipts.shift();
+  while (bytes > PORTABLE_CAPACITY && receipts.length) {
+    const item = receipts.shift()!;
+    // The pair loses its brackets, plus the comma separating it from the next pair.
+    bytes -= Buffer.byteLength(JSON.stringify([calls.get(item.call_id), item])) - 2 + (receipts.length ? 1 : 0);
+  }
   let omitted = 0;
-  while (size() > PORTABLE_CAPACITY && anchors.length > 2) {
-    anchors.splice(1, 1);
+  while (bytes > PORTABLE_CAPACITY && anchors.length - omitted > 2) {
+    // Count each escaped UTF-8 string and its array comma once. Re-serializing the entire
+    // shrinking history here makes long conversations quadratic and stalls every request.
+    bytes -= Buffer.byteLength(JSON.stringify(anchors[omitted + 1])) + 1;
     omitted++;
   }
-  if (size() > PORTABLE_CAPACITY) {
+  if (bytes > PORTABLE_CAPACITY) {
     throw new Error(
       'Compaction verbatim request capacity exceeded; continue with a larger-context model or a new chat retaining these requests',
     );
   }
+  if (omitted) anchors.splice(1, omitted);
   if (omitted) log.warn('compaction-anchors-trimmed', { omitted, kept: anchors.length });
   const note = omitted
     ? `\n\n[${omitted} older verbatim user requests exceeded capsule capacity; they are reflected only in this summary.]`

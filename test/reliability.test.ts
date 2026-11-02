@@ -185,3 +185,35 @@ test('GPT admission remains leased until the body ends, and separate accounts do
     await independent.body?.cancel(); await next.body?.cancel();
   } finally { controller.abort(); restore(); }
 });
+
+test('GPT admission cancels an aborted body and unlocks it before stalled source cleanup finishes', async () => {
+  const restore = env('GPT_MAX_ACTIVE', '1');
+  const controller = new AbortController();
+  let cancelled: unknown, starts = 0;
+  const source = new ReadableStream<Uint8Array>({ cancel(reason) { cancelled = reason; return new Promise<void>(() => {}); } });
+  const fetch = upstreamAdmission()(async () => { starts++; return starts === 1 ? new Response(source) : new Response('next'); });
+  const url = 'https://chatgpt.com/backend-api/codex/responses';
+  const init = { method: 'POST', body: '{}' };
+  try {
+    const first = await fetch(url, { ...init, signal: controller.signal });
+    const next = fetch(url, init);
+    await Bun.sleep(1); expect(starts).toBe(1);
+    const reason = new Error('stop owned stream'); controller.abort(reason);
+    expect(cancelled).toBe(reason); expect(source.locked).toBe(false);
+    expect(await (await next).text()).toBe('next');
+    await first.body!.cancel();
+  } finally { controller.abort(); restore(); }
+});
+
+test('GPT admission discards a transport body arriving after the request was cancelled', async () => {
+  const controller = new AbortController();
+  let resolve!: (response: Response) => void;
+  let cancelled = false;
+  const source = new ReadableStream<Uint8Array>({ cancel() { cancelled = true; } });
+  const fetch = upstreamAdmission()(() => new Promise<Response>(done => { resolve = done; }));
+  const pending = fetch('https://chatgpt.com/backend-api/codex/responses', { body: '{}', signal: controller.signal });
+  await Bun.sleep(1); controller.abort(new Error('late response'));
+  resolve(new Response(source));
+  await expect(pending).rejects.toThrow('late response');
+  expect(cancelled).toBe(true); expect(source.locked).toBe(false);
+});

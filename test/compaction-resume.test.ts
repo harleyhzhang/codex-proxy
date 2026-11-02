@@ -40,6 +40,20 @@ test('fresh explicit user instructions remain after the resume boundary, includi
   }
 });
 
+test('large verbatim histories trim receipts before the oldest middle requests using escaped UTF-8 bytes', () => {
+  const anchors = Array.from({ length: 30 }, (_, index) => `${index}: ${'😀'.repeat(1990)}\n"\\\ud800`);
+  const input = [
+    ...anchors.map(content => ({ role: 'user', content })),
+    { type: 'function_call', call_id: 'c', arguments: { text: '漢' } },
+    { type: 'function_call_output', call_id: 'c', output: 'x'.repeat(1000) },
+  ];
+  const value = JSON.parse(portableSummary('summary', input));
+  expect(value.anchors).toEqual([anchors[0], ...anchors.slice(19)]);
+  expect(value.tool_history).toEqual([]);
+  expect(value.summary).toContain('18 older verbatim user requests');
+  expect(() => restorePortableSummary(JSON.stringify(value))).not.toThrow();
+});
+
 test('GPT compaction and continuation preserve the resume boundary through the HTTP router', async () => {
   const key = Buffer.alloc(32, 5);
   const observed: ResponsesBody[] = [];

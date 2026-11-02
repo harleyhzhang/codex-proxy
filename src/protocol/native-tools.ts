@@ -11,7 +11,7 @@ const RAW_INPUT_NOTE = 'Pass the complete raw input as the string field "input".
 
 /** Each tool under a unique identifier-safe key; `byKey` maps a call back to its Codex tool. */
 export function functionTools(descriptors: ToolDescriptor[]): { definitions: Record<string, FunctionTool>; byKey: Map<string, ToolDescriptor> } {
-  const definitions: Record<string, FunctionTool> = {};
+  const definitions: Record<string, FunctionTool> = Object.create(null);
   const byKey = new Map<string, ToolDescriptor>();
   for (const descriptor of descriptors) {
     const base = descriptor.proxyName.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool';
@@ -84,7 +84,7 @@ function flattenUnion(contract: JsonRecord, root = contract, seen = new Set<unkn
   if (typeof contract.$ref === 'string') return resolve(contract);
   const requiredOf = (schema: JsonRecord) => Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === 'string') : [];
   const flat: JsonRecord = Object.fromEntries(Object.entries(contract).filter(([key]) => !(UNIONS as readonly string[]).includes(key)));
-  const properties: JsonRecord = isRecord(contract.properties) ? { ...contract.properties } : {};
+  const properties: JsonRecord = Object.assign(Object.create(null), isRecord(contract.properties) ? contract.properties : {});
   const required = new Set(requiredOf(contract));
   const notes: string[] = [];
   const combine = (key: 'anyOf' | 'allOf', schemas: unknown[]): unknown => {

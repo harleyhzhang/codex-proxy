@@ -1,4 +1,5 @@
 import { enqueueBounded, byteStrategy } from './buffer';
+import { cancelReader } from './stream';
 import { randomId } from '../json';
 import { logSafe } from '../log';
 import { itemEvents, responseObject, toolCallRenderer } from './output';
@@ -202,20 +203,37 @@ export function pendingRelay(request: ResponsesBody,
       const frame = (event: Event) => enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
       const done = () => enqueue(encoder.encode('data: [DONE]\n\n'));
       const stop = startHeartbeat(frame, pendingEnvelope(request), heartbeatMs);
+      let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+      const release = (reason?: unknown) => {
+        const owned = reader; reader = undefined;
+        if (!owned) return;
+        // Cancellation may itself be asynchronous. Release ownership before waiting for cleanup.
+        cancelReader(owned, reason);
+      };
+      const abort = () => {
+        stop(); release(combined.reason);
+        try { outgoing.error(combined.reason); } catch {}
+      };
+      combined.addEventListener('abort', abort, { once: true });
       void (async () => {
         try {
+          combined.throwIfAborted();
           const upstream = await connect(combined);
           stop();
+          if (combined.aborted) {
+            void upstream.body?.cancel(combined.reason).catch(() => {});
+            throw combined.reason;
+          }
           if (!upstream.ok) { frame(await refused(upstream)); done(); return; }
-          const reader = upstream.body?.getReader();
+          reader = upstream.body?.getReader();
           if (!reader) { frame(failure(new Error('Missing upstream response'))); done(); return; }
-          try {
-            for (;;) { const { value, done: ended } = await reader.read(); if (ended) break; if (value) enqueue(value); }
-          } finally { await reader.cancel().catch(() => {}); }
+          for (;;) { const { value, done: ended } = await reader.read(); if (ended) break; if (value) enqueue(value); }
         } catch (error) {
-          stop();
           if (combined.aborted) throw combined.reason;
           frame(failure(error)); done();
+        } finally {
+          stop(); release(combined.reason);
+          combined.removeEventListener('abort', abort);
         }
       })().then(
         () => { if (!combined.aborted) outgoing.close(); else { try { outgoing.error(combined.reason); } catch {} } },

@@ -1,6 +1,7 @@
 import { Admission } from '../backends/admission';
 import { positiveInt } from '../env';
 import { requestJson } from './json-request';
+import { cancelReader } from '../protocol/stream';
 import type { UpstreamFetch } from './upstream';
 
 /** Native HTTP and WebSocket transports use the same account gates. The lease lasts through
@@ -15,20 +16,26 @@ export function upstreamAdmission(): (transport: UpstreamFetch) => UpstreamFetch
     const body = requestJson(init);
     const input = body?.input;
     const continued = typeof body?.previous_response_id === 'string' || Array.isArray(input) && typeof input.at(-1)?.type === 'string' && String(input.at(-1).type).endsWith('_output');
-    const release = await gate.acquire(init.signal ?? undefined, continued ? 1 : 0);
-    const done = () => { init.signal?.removeEventListener('abort', done); release(); };
-    init.signal?.addEventListener('abort', done, { once: true });
+    const signal = init.signal ?? undefined;
+    const release = await gate.acquire(signal, continued ? 1 : 0);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const done = () => { signal?.removeEventListener('abort', abort); release(); };
+    const abort = () => { done(); if (reader) void cancelReader(reader, signal?.reason); };
+    signal?.addEventListener('abort', abort, { once: true });
     try {
-      init.signal?.throwIfAborted();
+      signal?.throwIfAborted();
       const response = await transport(url, init);
+      // Injected transports may resolve after cancellation instead of rejecting like fetch.
+      if (signal?.aborted) { void response.body?.cancel(signal.reason).catch(() => {}); signal.throwIfAborted(); }
       if (!response.body) { done(); return response; }
-      const reader = response.body.getReader();
+      const source = response.body.getReader();
+      reader = source;
       const stream = new ReadableStream<Uint8Array>({
         async pull(out) {
-          try { const next = await reader.read(); if (next.done) { done(); out.close(); } else out.enqueue(next.value); }
-          catch (error) { done(); out.error(error); }
+          try { const next = await source.read(); if (next.done) { done(); source.releaseLock(); out.close(); } else out.enqueue(next.value); }
+          catch (error) { done(); source.releaseLock(); out.error(error); }
         },
-        async cancel(reason) { done(); await reader.cancel(reason).catch(() => {}); },
+        cancel(reason) { done(); cancelReader(source, reason); },
       });
       return new Response(stream, { status: response.status, statusText: response.statusText, headers: response.headers });
     } catch (error) { done(); throw error; }

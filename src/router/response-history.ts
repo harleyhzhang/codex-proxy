@@ -1,5 +1,5 @@
 import { isRecord } from '../json';
-import { MAX_BODY_BYTES, SseParser } from '../protocol/stream';
+import { cancelReader, MAX_BODY_BYTES, SseParser } from '../protocol/stream';
 import type { OutputItem, ResponseObject, StreamEvent } from '../protocol/types';
 
 /** Items can finish in a different order than their position in the response. Keep malformed
@@ -58,14 +58,14 @@ export function observeResponse(response: Response, remember: (response: Respons
             try { parsed = JSON.parse(Buffer.concat(chunks, bytes).toString()); } catch {}
             if (isRecord(parsed)) observe({ type: 'response.completed', response: parsed });
           }
-          out.close(); return;
+          reader.releaseLock(); out.close(); return;
         }
         if (sse) sse.feed(next.value);
         else { bytes += next.value.byteLength; if (bytes > MAX_BODY_BYTES) throw new Error('Upstream response too large'); chunks.push(next.value); }
         out.enqueue(next.value);
-      } catch (error) { await reader.cancel(error).catch(() => {}); out.error(error); }
+      } catch (error) { void cancelReader(reader, error); out.error(error); }
     },
-    async cancel(reason) { await reader.cancel(reason).catch(() => {}); },
+    cancel(reason) { cancelReader(reader, reason); },
   });
   return new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
 }

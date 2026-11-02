@@ -1,6 +1,6 @@
 import { test, expect } from 'bun:test';
 import { reconnectTransport, ProxyTransportError } from '../src/transport';
-import { pendingResponse, pendingStream } from '../src/protocol/pending';
+import { pendingRelay, pendingResponse, pendingStream } from '../src/protocol/pending';
 import { responseObject } from '../src/protocol/output';
 import type { ResponsesBody } from '../src/protocol/types';
 
@@ -74,4 +74,43 @@ test('closing a pending HTTP reader cancels generation and stops progress', asyn
   await reader.read();
   await reader.cancel();
   expect(backendSignal?.aborted).toBe(true);
+});
+
+for (const parentAbort of [false, true]) test('pending relay releases a stalled reader on ' + (parentAbort ? 'parent abort' : 'client cancellation'), async () => {
+  const controller = new AbortController();
+  let cancelled: unknown;
+  const source = new ReadableStream<Uint8Array>({
+    start(out) { out.enqueue(new TextEncoder().encode('data: {}\n\n')); },
+    cancel(reason) { cancelled = reason; return new Promise<void>(() => {}); },
+  });
+  const response = pendingRelay({}, async () => new Response(source), controller.signal,
+    () => ({ type: 'error' }), async () => ({ type: 'error' }), 100_000);
+  const reader = response.body!.getReader();
+  await reader.read();
+  const reason = new Error('caller stopped');
+  if (parentAbort) {
+    const pending = reader.read(); controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+  } else await reader.cancel(reason);
+  expect(cancelled).toBe(reason); expect(source.locked).toBe(false);
+  reader.releaseLock();
+});
+
+test('a cancelled pending relay disposes a response that connects late', async () => {
+  let resolve!: (response: Response) => void;
+  let cancelled: unknown;
+  const source = new ReadableStream<Uint8Array>({ cancel(reason) { cancelled = reason; } });
+  const response = pendingRelay({}, () => new Promise<Response>(done => { resolve = done; }), new AbortController().signal,
+    () => ({ type: 'error' }), async () => ({ type: 'error' }), 100_000);
+  const reason = new Error('caller stopped');
+  await response.body!.cancel(reason);
+  resolve(new Response(source)); await Bun.sleep(0);
+  expect(cancelled).toBe(reason); expect(source.locked).toBe(false);
+});
+
+test('a finished pending relay releases its upstream reader', async () => {
+  const source = new ReadableStream<Uint8Array>({ start(out) { out.enqueue(new TextEncoder().encode('data: [DONE]\n\n')); out.close(); } });
+  const response = pendingRelay({}, async () => new Response(source), new AbortController().signal,
+    () => ({ type: 'error' }), async () => ({ type: 'error' }));
+  expect(await response.text()).toBe('data: [DONE]\n\n'); expect(source.locked).toBe(false);
 });

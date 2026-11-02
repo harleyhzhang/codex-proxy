@@ -10,6 +10,7 @@ import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
 import { BackendError } from '../src/backends/contract';
 import { claudeOutputFormat, checkOutputFormat, outputFormat } from '../src/protocol/output-format';
 import { functionTools } from '../src/protocol/native-tools';
+import { toolSchemaIssue } from '../src/protocol/tool-schema';
 import { responseObject, streamResponse } from '../src/protocol/output';
 import { EMPTY_OUTPUT, type ResponsesRequest, type ResponsesBody, type ProxyOutput } from '../src/protocol/types';
 import { observeResponse } from '../src/router/response-history';
@@ -109,6 +110,31 @@ test('required raw syntax survives long prose, and an unrepresentable grammar is
   expect(String(union.inputSchema.description)).toContain('original oneOf contract');
 });
 
+test('prototype-named tools and union properties remain declared data', () => {
+  const properties: unknown = JSON.parse('{"__proto__":{"type":"string"}}');
+  const { definitions, byKey } = functionTools([{ type: 'function', proxyName: '__proto__', name: '__proto__', contract: { type: 'object', anyOf: [{ properties, required: ['__proto__'], additionalProperties: false }] } }]);
+  expect([...byKey.keys()]).toEqual(['__proto__']);
+  expect(Object.keys(definitions)).toEqual(['__proto__']);
+  expect(Object.getPrototypeOf(definitions)).toBeNull();
+  const wire: unknown = JSON.parse(JSON.stringify(definitions));
+  expect(isRecord(wire) && isRecord(wire.__proto__) && wire.__proto__.inputSchema).toMatchObject({ properties: JSON.parse('{"__proto__":{"type":"string"}}'), required: ['__proto__'] });
+  expect(Object.getPrototypeOf(definitions.__proto__!.inputSchema.properties)).toBeNull();
+});
+
+test('large primitive uniqueness checks keep JSON equality without exhausting pairwise work', () => {
+  const schema = { type: 'array', uniqueItems: true };
+  const values = Array.from({ length: 1000 }, (_, i) => i);
+  expect(toolSchemaIssue(values, schema)).toBeUndefined();
+  expect(toolSchemaIssue([...values, 0], schema)).toContain('must contain unique items');
+  expect(toolSchemaIssue([0, '0', false, null, true, 'false'], schema)).toBeUndefined();
+  expect(toolSchemaIssue([0, -0], schema)).toContain('must contain unique items');
+  expect(toolSchemaIssue([{ a: 1, b: [2] }, { b: [2], a: 1 }], schema)).toContain('must contain unique items');
+  expect(toolSchemaIssue([1, '1', [1], { 0: 1 }, null], schema)).toBeUndefined();
+  expect(toolSchemaIssue(Array.from({ length: 1000 }, (_, i) => ({ i })), schema)).toContain('schema validation budget');
+  const output = checkOutputFormat({ text: { format: { type: 'json_schema', schema } } }, answer(JSON.stringify(values)));
+  expect(output.status).not.toBe('failed');
+});
+
 for (const stream of [false, true]) test('HTTP GPT history supports same-provider and switched-provider continuations, stream=' + stream, async () => {
   const upstreamBodies: ResponsesBody[] = [], localBodies: ResponsesRequest[] = [];
   const backend = BACKENDS[0]!; const original = backend.run;
@@ -146,6 +172,20 @@ test('failed HTTP terminals and bare DONE do not create successful history', asy
   for (const event of [{ type: 'response.failed', response: { id: 'failed', status: 'failed', output: [] } }, { type: 'response.incomplete', response: { id: 'cut', status: 'incomplete', output: [] } }]) await observeResponse(new Response(frame(event), { headers: { 'content-type': 'text/event-stream' } }), response => seen.push(response)).text();
   await observeResponse(new Response('data: [DONE]\n\n', { headers: { 'content-type': 'text/event-stream' } }), response => seen.push(response)).text();
   expect(seen).toEqual([]);
+});
+
+test('HTTP history observation releases upstream locks at EOF, error and cancellation', async () => {
+  for (const outcome of ['eof', 'error', 'cancel']) {
+    const source = new ReadableStream<Uint8Array>({ start(out) {
+      if (outcome === 'eof') out.close();
+      if (outcome === 'error') out.error(new Error('source error'));
+    }, cancel() { return new Promise<void>(() => {}); } });
+    const observed = observeResponse(new Response(source, { headers: { 'content-type': 'text/event-stream' } }), () => {});
+    if (outcome === 'cancel') await observed.body!.cancel();
+    else if (outcome === 'error') await expect(observed.text()).rejects.toThrow('source error');
+    else await observed.text();
+    expect(source.locked).toBe(false);
+  }
 });
 
 test('sparse completion history follows output indexes when parallel items finish out of order', async () => {

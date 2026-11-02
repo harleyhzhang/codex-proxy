@@ -62,15 +62,38 @@ export class SseParser {
   private skipLf = false;
   private lineBuffer = Buffer.allocUnsafe(16 * 1024);
   private used = 0;
+  private firstLine = true;
   ended = false;
   constructor(private readonly consume: (event: StreamEvent) => void,
     private readonly terminal: ReadonlySet<string> = TERMINAL_EVENTS, private readonly limit = MAX_EVENT_BYTES) {}
 
   feed(chunk: Uint8Array): void {
     if (this.ended) return;
+    const bytes = chunk;
     let start = 0;
-    for (let i = 0; i < chunk.length; i++) {
-      const byte = chunk[i]!;
+    if (this.skipLf && bytes.length) {
+      this.skipLf = false;
+      if (bytes[0] === 10) {
+        if (this.bytes && ++this.bytes > this.limit) throw new Error('Upstream event too large');
+        start = 1;
+      }
+    }
+    // The usual LF-only chunks use native delimiter search and decode complete lines in place.
+    // Partial lines still copy their bytes: callers may reuse an input buffer after feed returns.
+    if (bytes.length >= 64 && bytes.indexOf(13, start) === -1) {
+      for (let end = bytes.indexOf(10, start); end !== -1; end = bytes.indexOf(10, start)) {
+        this.bytes += end - start + 1;
+        if (this.bytes > this.limit) throw new Error('Upstream event too large');
+        this.line(bytes.subarray(start, end)); start = end + 1;
+        if (this.ended) return;
+      }
+      this.bytes += bytes.length - start;
+      if (this.bytes > this.limit) throw new Error('Upstream event too large');
+      if (start < bytes.length) this.append(bytes.subarray(start));
+      return;
+    }
+    for (let i = start; i < bytes.length; i++) {
+      const byte = bytes[i]!;
       if (this.skipLf) {
         this.skipLf = false;
         if (byte === 10) {
@@ -81,19 +104,24 @@ export class SseParser {
       }
       if (++this.bytes > this.limit) throw new Error('Upstream event too large');
       if (byte !== 10 && byte !== 13) continue;
-      this.append(chunk.subarray(start, i)); start = i + 1;
-      this.line(); this.skipLf = byte === 13;
+      this.line(bytes.subarray(start, i)); start = i + 1;
+      this.skipLf = byte === 13;
       if (this.ended) return;
     }
-    if (start < chunk.length) this.append(chunk.subarray(start));
+    if (start < bytes.length) this.append(bytes.subarray(start));
   }
   finish(): void {
     if (this.ended) return;
     if (this.parts.length || this.used) this.line();
     if (!this.ended) this.dispatch();
   }
-  private line(): void {
-    const line = Buffer.concat([...this.parts, this.lineBuffer.subarray(0, this.used)]).toString('utf8'); this.parts = []; this.used = 0;
+  private line(tail: Uint8Array = new Uint8Array()): void {
+    const bytes = this.parts.length || this.used
+      ? Buffer.concat([...this.parts, this.lineBuffer.subarray(0, this.used), tail])
+      : Buffer.from(tail.buffer, tail.byteOffset, tail.byteLength);
+    let line = bytes.toString('utf8'); this.parts = []; this.used = 0;
+    // An SSE stream may start with one UTF-8 BOM, including one split across input chunks.
+    if (this.firstLine) { this.firstLine = false; if (line.charCodeAt(0) === 0xfeff) line = line.slice(1); }
     if (!line) { this.dispatch(); this.bytes = 0; return; }
     if (line.startsWith('data:')) this.data.push(line.slice(5).replace(/^ /, ''));
   }
@@ -118,6 +146,12 @@ export class SseParser {
   }
 }
 
+/** Stop reading immediately, even when the source's asynchronous cleanup remains pending. */
+export function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>, reason?: unknown): void {
+  void reader.cancel(reason).catch(() => {});
+  reader.releaseLock();
+}
+
 /** Stops on the first terminal event; a dropped stream remains a transport failure. */
 export async function sseEvents(response: Response, consume: (event: StreamEvent) => void, terminal: ReadonlySet<string> = TERMINAL_EVENTS): Promise<void> {
   if (!response.body) throw new Error('Missing upstream response');
@@ -130,5 +164,5 @@ export async function sseEvents(response: Response, consume: (event: StreamEvent
       parser.feed(value);
     }
     if (!parser.ended) throw new ProxyTransportError();
-  } finally { await reader.cancel().catch(() => {}); }
+  } finally { cancelReader(reader); }
 }
