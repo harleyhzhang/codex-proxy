@@ -428,6 +428,13 @@ tools, the system prompt and the newest turn, so each turn reads what the previo
 Quota comes from Anthropic's rate-limit headers on every reply. A compaction keeps the tools and system prompt
 (with calls forbidden), so it reads the whole conversation from the cache too.
 
+Claude inline images are checked for both encoded size (5 MiB) and dimensions
+(3,000 pixels per axis), including screenshots inside replayed tool results.
+The dimension ceiling applies from the first turn, so crossing 20 images in
+a growing conversation cannot invalidate earlier screenshots. Images above
+either ceiling are fitted asynchronously with macOS `sips` and cached; when
+conversion is unavailable or fails, a text note replaces the image.
+
 The router owns the login while it runs: it refreshes the access token shortly before expiry
 (one refresh shared by concurrent turns) and writes the rotated tokens back where Claude Code
 keeps them. Running the `claude` CLI on the same profile at the same time can invalidate the
