@@ -12,9 +12,9 @@ export const log = {
 };
 
 /**
- * Logs fields that may have been derived from untrusted text. Numbers, booleans and null pass
- * through; strings are reduced to short word-like hints, so prompts, commands and model text can
- * never leak into a log line. Anything else is dropped.
+ * Logs scalar metadata, reducing strings to short word-like hints and dropping nested values.
+ * This formatting does not redact unquoted private text: callers must use counts or fixed
+ * categories rather than prompt/response content or freeform diagnostics.
  */
 export function logSafe(event: string, fields: LogFields = {}): void {
   const safe: LogFields = {};

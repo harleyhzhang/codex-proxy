@@ -293,25 +293,29 @@ test('router closing a client socket aborts and closes only that client\'s upstr
 });
 
 test('router interrupt completes as incomplete and the next request replays history on a fresh upstream socket', async () => {
+  const first = { id: 'finished-first', type: 'function_call', call_id: 'call-first', name: 'one', arguments: '{}' };
+  const second = { id: 'finished-second', type: 'function_call', call_id: 'call-second', name: 'two', arguments: '{}' };
   const remote = upstream((peer, request, count) => {
     if (count !== 1) return complete(peer, request, count);
     emit(peer, { type: 'response.created', response: { id: 'partial-1', object: 'response', status: 'in_progress', output: [] } });
     emit(peer, { type: 'response.output_item.added', output_index: 0, item: { id: 'unfinished-message', type: 'message', role: 'assistant', content: [] } });
     emit(peer, { type: 'response.output_text.delta', response_id: 'partial-1', item_id: 'unfinished-message', delta: 'partial synthetic text' });
+    emit(peer, { type: 'response.output_item.done', output_index: 2, item: second });
+    emit(peer, { type: 'response.output_item.done', output_index: 1, item: first });
   });
   const router = await fixtureRouter({ upstreamWebSocket: true, upstreamSocket: remote.socket, upstreamFetch: noHttp });
   const c = await client(router);
   try {
     c.send({ type: 'response.create', ...body() });
-    await c.wait(event => event.type === 'response.output_text.delta');
+    await c.wait(event => event.type === 'response.output_item.done' && isRecord(event.item) && event.item.id === first.id);
     c.send({ type: 'response.interrupt', response_id: 'partial-1' });
     const incomplete = await c.wait(event => event.type === 'response.incomplete');
-    expect(response(incomplete)).toMatchObject({ id: 'partial-1', status: 'incomplete', incomplete_details: { reason: 'interrupted' }, output: [] });
+    expect(response(incomplete)).toMatchObject({ id: 'partial-1', status: 'incomplete', incomplete_details: { reason: 'interrupted' }, output: [first, second] });
     expect(c.events.some(event => event.type === 'response.output_item.interrupted')).toBe(true);
     await c.turn(body([user('resume')], { previous_response_id: 'partial-1' }));
     expect(remote.opens).toBe(2);
     expect(remote.messages[1]).not.toHaveProperty('previous_response_id');
-    expect(remote.messages[1]?.input).toEqual([user('first'), user('resume')]);
+    expect(remote.messages[1]?.input).toEqual([user('first'), withoutItemId(first), withoutItemId(second), user('resume')]);
   } finally { c.close(); await router.close(); remote.close(); }
 });
 

@@ -94,6 +94,56 @@ test('concurrent expired requests share native refresh and re-read the renewed i
   expect(calls).toBe(5);
 });
 
+test('an already-cancelled secondary request starts no credential refresh or upstream request', async () => {
+  const { options } = await fixture(0);
+  let refreshes = 0, calls = 0;
+  options.refresh = async () => { refreshes++; };
+  const router = new AccountUpstream(options, async () => { calls++; return new Response('{}'); });
+  const controller = new AbortController();
+  const reason = new Error('cancelled before routing'); controller.abort(reason);
+  await expect(router.fetch(target, { ...request('secondary-gpt-6-astra'), signal: controller.signal })).rejects.toBe(reason);
+  expect(refreshes).toBe(0); expect(calls).toBe(0);
+});
+
+test.each(['refresh', 'catalog', '401'] as const)('a cancelled %s waiter leaves shared account work running for another request', async mode => {
+  const { home, options, write } = await fixture(mode === 'refresh' ? 0 : undefined);
+  let release!: () => void, started!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const working = new Promise<void>(resolve => { started = resolve; });
+  let refreshes = 0, calls = 0, generations = 0, discarded = 0;
+  const original = await Bun.file(home + '/auth.json').json() as { tokens: { access_token: string } };
+  const work = async () => { refreshes++; started(); await held; };
+  if (mode === 'catalog') {
+    await Bun.write(home + '/models_cache.json', JSON.stringify({ models: [] }));
+    options.catalog = async () => { await work(); await Bun.write(home + '/models_cache.json', JSON.stringify({ models: [{ slug: 'gpt-6-astra', visibility: 'list' }] })); };
+  } else options.refresh = async () => { await work(); await write(Date.now() / 1000 + 7200); };
+  const router = new AccountUpstream(options, async (_url, init) => {
+    init.signal?.throwIfAborted(); calls++;
+    if (mode === '401' && new Headers(init.headers).get('authorization') === `Bearer ${original.tokens.access_token}`) {
+      return new Response(new ReadableStream<Uint8Array>({ cancel() { discarded++; } }), { status: 401 });
+    }
+    generations++; return new Response('{}');
+  });
+  const controller = new AbortController();
+  const reason = new Error('cancelled while shared account work is pending');
+  const cancelled = router.fetch(target, { ...request('secondary-gpt-6-astra'), signal: controller.signal }).catch((error: unknown) => error);
+  await working;
+  const survivor = router.fetch(target, request('secondary-gpt-6-astra'));
+  try {
+    // Let the second request finish its local profile read and join the held shared operation.
+    await Bun.sleep(10);
+    controller.abort(reason);
+    const result = await Promise.race([cancelled, Bun.sleep(100).then(() => 'still waiting')]);
+    expect(result).toBe(reason);
+    expect(generations).toBe(0);
+    if (mode === '401') expect(discarded).toBe(1);
+  } finally { release(); }
+  expect((await survivor).status).toBe(200);
+  expect(refreshes).toBe(1); expect(generations).toBe(1);
+  expect(calls).toBe(mode === '401' ? 3 : 1);
+  if (mode === '401') expect(discarded).toBe(2);
+});
+
 test('secondary routing keeps the inspected JSON snapshot if a caller replaces its body during refresh', async () => {
   const { options, write } = await fixture(0);
   let release!: () => void;

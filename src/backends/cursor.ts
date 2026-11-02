@@ -86,12 +86,19 @@ const isInlineImage = (value: JsonRecord, legacyComputerOutput: boolean): boolea
  * than refusing the whole turn (which breaks mid-thread model switches from a GPT backend), drop the opaque
  * history items and replace unsupported media parts with a short text placeholder so the model knows
  * something was omitted. Inline images survive untouched. Returns the sanitized input plus a count of what
- * changed for logging.
+ * changed for logging. Copy only changed branches: replaying a long history must not clone all its tool data.
  */
 export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: number; replaced: number } {
   const stats = { dropped: 0, replaced: 0 };
   const walk = (value: unknown, legacyComputerOutput = false): unknown => {
-    if (Array.isArray(value)) return value.map(item => walk(item, legacyComputerOutput));
+    if (Array.isArray(value)) {
+      let out: unknown[] | undefined;
+      for (let index = 0; index < value.length; index++) {
+        const child = walk(value[index], legacyComputerOutput);
+        if (child !== value[index]) { out ??= value.slice(); out[index] = child; }
+      }
+      return out ?? value;
+    }
     if (!isRecord(value)) return value;
     if (isImagePart(value, legacyComputerOutput)) {
       if (isInlineImage(value, legacyComputerOutput)) return value;
@@ -99,17 +106,23 @@ export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: 
     }
     if (MEDIA_PART_TYPES.has(String(value.type))) { stats.replaced++; return OMITTED_MEDIA; }
     if (isOpaque(value)) { stats.replaced++; return { type: 'input_text', text: '[encrypted or compacted content from a previous model; unreadable here]' }; }
-    const out: JsonRecord = {};
-    for (const [key, child] of Object.entries(value)) out[key] = walk(child, value.type === 'computer_call_output' && key === 'output');
-    return out;
+    let out: JsonRecord | undefined;
+    for (const key of Object.keys(value)) {
+      const child = walk(value[key], value.type === 'computer_call_output' && key === 'output');
+      if (child !== value[key]) { out ??= { ...value }; out[key] = child; }
+    }
+    return out ?? value;
   };
   if (!Array.isArray(input)) return { input: walk(input), ...stats };
-  const items: unknown[] = [];
-  for (const item of input) {
-    if (isRecord(item) && isOpaque(item)) { stats.dropped++; continue; }
-    items.push(walk(item));
+  let items: unknown[] | undefined;
+  for (let index = 0; index < input.length; index++) {
+    const item: unknown = input[index];
+    if (isRecord(item) && isOpaque(item)) { stats.dropped++; items ??= input.slice(0, index); continue; }
+    const child = walk(item);
+    if (child !== item) items ??= input.slice(0, index);
+    items?.push(child);
   }
-  return { input: items, ...stats };
+  return { input: items ?? input, ...stats };
 }
 
 // Native tool calls: Codex's tools are the only callable tools, so the prompt only says who runs them.

@@ -64,26 +64,27 @@ function plainText(content: ResponseInputItem['content']): string {
  */
 export function portableSummary(summary: string, input: ResponseInputItem[] = []): string {
   const anchors: string[] = [];
+  const seen = new Set<string>();
   for (const item of input) {
     if (item?.role !== 'user') continue;
     let text = plainText(item.content);
     if (text.startsWith(SUMMARY_PREFIX)) continue;
     if (text.startsWith(ANCHOR_PREFIX)) text = text.slice(ANCHOR_PREFIX.length);
     // Large pasted documents still rely on the summary; short instructions stay exact.
-    if (text && text.length <= MAX_ANCHOR_CHARS && !anchors.includes(text)) anchors.push(text);
+    if (text && text.length <= MAX_ANCHOR_CHARS && !seen.has(text)) { seen.add(text); anchors.push(text); }
   }
 
   const calls = new Map(
     input.filter((item) => CALL_TYPES.has(item?.type ?? '') && item.call_id).map((item) => [item.call_id, item]),
   );
-  const receipts = input
-    .filter(
-      (item) =>
-        OUTPUT_TYPES.has(item?.type ?? '') &&
-        calls.has(item.call_id) &&
-        Buffer.byteLength(JSON.stringify([calls.get(item.call_id), item])) <= MAX_RECEIPT_BYTES,
-    )
-    .slice(-MAX_RECEIPTS);
+  // Only the newest fitting receipts survive. Do not serialize old tool output that cannot be kept.
+  const receipts: ResponseInputItem[] = [];
+  for (let i = input.length - 1; i >= 0 && receipts.length < MAX_RECEIPTS; i--) {
+    const item = input[i]!;
+    if (OUTPUT_TYPES.has(item?.type ?? '') && calls.has(item.call_id)
+      && Buffer.byteLength(JSON.stringify([calls.get(item.call_id), item])) <= MAX_RECEIPT_BYTES) receipts.push(item);
+  }
+  receipts.reverse();
   const toolHistory = () => receipts.flatMap((item) => [calls.get(item.call_id), item]);
   const size = () => Buffer.byteLength(JSON.stringify({ anchors, tool_history: toolHistory() }));
 

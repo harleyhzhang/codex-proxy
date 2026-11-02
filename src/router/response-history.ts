@@ -2,21 +2,36 @@ import { isRecord } from '../json';
 import { MAX_BODY_BYTES, SseParser } from '../protocol/stream';
 import type { OutputItem, ResponseObject, StreamEvent } from '../protocol/types';
 
+/** Items can finish in a different order than their position in the response. Keep malformed
+ * unindexed events too; assigning a synthetic index could overwrite a later explicit one. */
+export class CompletedItems {
+  private readonly indexed = new Map<number, OutputItem>();
+  private readonly unindexed: OutputItem[] = [];
+  add(item: OutputItem, index: unknown): void {
+    if (typeof index === 'number' && Number.isSafeInteger(index) && index >= 0) this.indexed.set(index, item);
+    else this.unindexed.push(item);
+  }
+  snapshot(): OutputItem[] {
+    return [...this.indexed].sort(([a], [b]) => a - b).map(([, item]) => item).concat(this.unindexed);
+  }
+}
+
 /** One completion observer for HTTP and WS. Never cache a failed/incomplete turn or an
  * unverified DONE marker. Completed item events fill sparse native terminal envelopes. */
 export function completionObserver(remember: (response: ResponseObject) => void): (event: StreamEvent) => void {
-  const items: OutputItem[] = [];
+  const items = new CompletedItems();
   let bytes = 0;
   return event => {
     if (event.type === 'response.output_item.done' && isRecord(event.item)) {
       bytes += Buffer.byteLength(JSON.stringify(event.item));
       if (bytes > MAX_BODY_BYTES) throw new Error('Upstream response too large');
-      items.push(event.item as OutputItem);
+      items.add(event.item as OutputItem, event.output_index);
     }
     if (event.type !== 'response.completed' || !isRecord(event.response)) return;
     const response = event.response;
     if (typeof response.id !== 'string' || response.status !== 'completed') return;
-    remember({ ...response, output: Array.isArray(response.output) && response.output.length ? response.output as OutputItem[] : items } as ResponseObject);
+    remember({ ...response, output: Array.isArray(response.output) && response.output.length
+      ? response.output as OutputItem[] : items.snapshot() } as ResponseObject);
   };
 }
 

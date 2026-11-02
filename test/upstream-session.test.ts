@@ -61,6 +61,25 @@ test('native upstream sessions are disabled by default and preserve the HTTP ini
   session.close();
 });
 
+test('out-of-order sparse completion items retain native WebSocket continuation', async () => {
+  const first = assistant('first'), second = assistant('second');
+  const app = fixture((peer, _request, count) => {
+    if (count !== 1) { complete(peer, 'next'); return; }
+    emit(peer, { type: 'response.output_item.done', output_index: 1, item: second });
+    emit(peer, { type: 'response.output_item.done', output_index: 0, item: first });
+    emit(peer, { type: 'response.completed', response: { id: 'sparse-order', status: 'completed', output: [] } });
+  });
+  const session = new UpstreamSession({ enabled: true, socket: app.socket, fallback: async () => { throw new Error('unexpected HTTP fallback'); } });
+  try {
+    const original = user('start'), next = user('next');
+    await collect(await session.fetch(target, init([original])));
+    await collect(await session.fetch(target, init([original, withoutItemId(first), withoutItemId(second), next], { previous_response_id: 'sparse-order' })));
+    expect(app.messages[1]?.previous_response_id).toBe('sparse-order');
+    expect(app.messages[1]?.input).toEqual([next]);
+    expect(app.opens).toBe(1);
+  } finally { session.close(); app.close(); }
+});
+
 test('same completed response and matching full history reuse a socket and send only new input', async () => {
   const app = fixture((peer, _request, count) => complete(peer, 'r' + count, count === 1 ? 'FIRST' : 'SECOND'));
   const session = new UpstreamSession({ enabled: true, socket: app.socket, fallback: async () => { throw new Error('no HTTP fallback'); } });

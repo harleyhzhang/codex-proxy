@@ -74,7 +74,7 @@ export class BackendError extends Error {
 export async function retryOnce(backend: string, signal: AbortSignal | undefined, attempt: () => Promise<ProxyOutput>, sink?: OutputSink): Promise<ProxyOutput> {
   try { return await attempt(); } catch (error) {
     if (!(error instanceof BackendError) || !error.retryable || signal?.aborted || sink?.started) throw error;
-    logSafe('backend-retry', { backend, reason: error.message });
+    logSafe('backend-retry', { backend, retryable: true, message_chars: error.message.length });
   }
   return attempt();
 }

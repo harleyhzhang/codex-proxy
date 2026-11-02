@@ -55,15 +55,24 @@ function outputItems(request: RequestShape, output: ProxyOutput): OutputItem[] {
       content: [{ type: 'output_text', annotations: [], text: output.text }],
     });
   }
-  const descriptors = toolDescriptors(requestTools(request));
-  for (const call of output.toolCalls) {
-    const descriptor = descriptors.find((tool) => tool.proxyName === call.name);
+  if (!output.toolCalls.length) return items;
+  const render = toolCallRenderer(request);
+  for (const call of output.toolCalls) items.push(render(call));
+  return items;
+}
+
+/** Resolve request tools once for all streamed calls in a turn, using the same renderer as
+ * buffered output. Building another response envelope for every call would rescan full history. */
+export function toolCallRenderer(request: RequestShape): (call: ToolCall) => OutputItem {
+  const descriptors = new Map(toolDescriptors(requestTools(request)).map(tool => [tool.proxyName, tool]));
+  return call => {
+    const descriptor = descriptors.get(call.name);
     if (call.name === TOOL_SEARCH_NAME || descriptor?.type === 'tool_search') {
-      items.push(toolSearchItem(call));
+      return toolSearchItem(call);
     } else if (call.name === COMPUTER_TOOL_NAME || descriptor?.type === 'computer') {
-      items.push(computerItem(call));
+      return computerItem(call);
     } else if (descriptor?.type === 'custom') {
-      items.push({
+      return {
         id: randomId('ctc'),
         type: 'custom_tool_call',
         status: 'completed',
@@ -71,9 +80,9 @@ function outputItems(request: RequestShape, output: ProxyOutput): OutputItem[] {
         name: descriptor.name,
         namespace: descriptor.namespace,
         input: call.arguments,
-      });
+      };
     } else {
-      items.push({
+      return {
         id: randomId('fc'),
         type: 'function_call',
         status: 'completed',
@@ -81,10 +90,9 @@ function outputItems(request: RequestShape, output: ProxyOutput): OutputItem[] {
         name: descriptor?.name ?? call.name,
         namespace: descriptor?.namespace,
         arguments: call.arguments,
-      });
+      };
     }
-  }
-  return items;
+  };
 }
 
 export function responseObject(request: RequestShape, output: ProxyOutput): ResponseObject {

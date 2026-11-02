@@ -148,6 +148,33 @@ test('failed HTTP terminals and bare DONE do not create successful history', asy
   expect(seen).toEqual([]);
 });
 
+test('sparse completion history follows output indexes when parallel items finish out of order', async () => {
+  const first = { type: 'function_call', call_id: 'first', name: 'one', arguments: '{}' };
+  const second = { type: 'function_call', call_id: 'second', name: 'two', arguments: '{}' };
+  const seen: unknown[] = [];
+  const raw = frame({ type: 'response.output_item.done', output_index: 1, item: second })
+    + frame({ type: 'response.output_item.done', output_index: 0, item: first })
+    + frame({ type: 'response.completed', response: { id: 'ordered', status: 'completed', output: [] } });
+  const response = observeResponse(new Response(raw, { headers: { 'content-type': 'text/event-stream' } }), value => seen.push(value));
+  expect(await response.text()).toBe(raw);
+  expect(seen).toEqual([{ id: 'ordered', status: 'completed', output: [first, second] }]);
+});
+
+test('unindexed completed items cannot overwrite sparse or later indexed output', async () => {
+  const known = { type: 'function_call', call_id: 'known', name: 'one', arguments: '{}' };
+  const unknown = { type: 'function_call', call_id: 'unindexed', name: 'two', arguments: '{}' };
+  for (const events of [
+    [{ output_index: 1, item: known }, { item: unknown }],
+    [{ item: unknown }, { output_index: 0, item: known }],
+  ]) {
+    const seen: unknown[] = [];
+    const raw = events.map(event => frame({ type: 'response.output_item.done', ...event })).join('')
+      + frame({ type: 'response.completed', response: { id: 'mixed', status: 'completed', output: [] } });
+    await observeResponse(new Response(raw, { headers: { 'content-type': 'text/event-stream' } }), value => seen.push(value)).text();
+    expect(seen).toEqual([{ id: 'mixed', status: 'completed', output: [known, unknown] }]);
+  }
+});
+
 test('malformed text controls are refused consistently', () => {
   const malformed: unknown = { text: [] };
   expect(isRecord(malformed)).toBe(true);

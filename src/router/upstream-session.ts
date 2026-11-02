@@ -3,9 +3,10 @@ import { enqueueBounded, byteStrategy } from '../protocol/buffer';
 import { isRecord, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
-import { EMPTY_OUTPUT } from '../protocol/types';
+import { EMPTY_OUTPUT, type OutputItem } from '../protocol/types';
 import { ProxyTransportError } from '../transport';
 import { requestJson } from './json-request';
+import { CompletedItems } from './response-history';
 import { UpstreamStatusError, type UpstreamFetch, withoutItemId, withoutItemIds } from './upstream';
 
 type SocketFactory = (url: string, headers: Headers) => WebSocket;
@@ -25,7 +26,7 @@ type Connection = { socket: WebSocket; scope: string; model: string; openedAt: n
 type Active = {
   id: number; started: number; connectedMs: number; reused: boolean;
   request: JsonRecord; continued: boolean; replayed: boolean; meaningful: boolean; firstOutputMs?: number;
-  output: unknown[]; out: ReadableStreamDefaultController<Uint8Array>;
+  output: CompletedItems; out: ReadableStreamDefaultController<Uint8Array>;
   signal?: AbortSignal; abort: () => void;
   provisional: Uint8Array[]; provisionalBytes: number; published: boolean; deferMetadata: boolean;
   provisionalTimer?: ReturnType<typeof setTimeout>;
@@ -201,7 +202,7 @@ export class UpstreamSession {
       start(out) {
         const abort = () => session.reset(signal?.reason ?? new ProxyTransportError());
         session.active = { id: ++nextRequest, started, connectedMs: performance.now() - started, reused: opened.reused,
-          request, continued, replayed: false, meaningful: false, output: [], out, signal, abort,
+          request, continued, replayed: false, meaningful: false, output: new CompletedItems(), out, signal, abort,
           provisional: [], provisionalBytes: 0, published: false, deferMetadata: continued,
           headersSettled: false, resolveHeaders, rejectHeaders, sentBytes: 0, sentItems: 0 };
         signal?.addEventListener('abort', abort, { once: true });
@@ -235,7 +236,7 @@ export class UpstreamSession {
     if (!isRecord(event) || typeof event.type !== 'string') { this.reset(new ProxyTransportError()); return; }
     active.firstEventMs ??= performance.now() - active.started;
     if (missingPrevious(event) && active.continued && !active.meaningful && !active.published && !active.replayed) {
-      active.replayed = true; active.continued = false; active.output = []; this.last = undefined;
+      active.replayed = true; active.continued = false; active.output = new CompletedItems(); this.last = undefined;
       clearTimeout(active.provisionalTimer); active.provisionalTimer = undefined;
       active.provisional = []; active.provisionalBytes = 0;
       try { this.write(active); } catch (error) { this.reset(error); }
@@ -257,9 +258,9 @@ export class UpstreamSession {
       active.meaningful = true;
       active.firstOutputMs ??= performance.now() - active.started;
     }
-    if (event.type === 'response.output_item.done' && isRecord(event.item)) active.output.push(event.item);
+    if (event.type === 'response.output_item.done' && isRecord(event.item)) active.output.add(event.item as OutputItem, event.output_index);
     if (event.type === 'response.completed' && isRecord(event.response) && event.response.status === 'completed' && typeof event.response.id === 'string') {
-      const output = Array.isArray(event.response.output) && event.response.output.length ? event.response.output : active.output;
+      const output = Array.isArray(event.response.output) && event.response.output.length ? event.response.output : active.output.snapshot();
       const input = Array.isArray(active.request.input) ? active.request.input : typeof active.request.input === 'string' ? [{ role: 'user', content: active.request.input }] : [];
       // OpenAI's output carries item ids that the router strips from every replay, so compare without them.
       this.last = { id: event.response.id, prefix: [...input, ...output.map(withoutItemId)] };

@@ -6,6 +6,7 @@ import type { UpstreamFetch } from './upstream';
 import { logSafe } from '../log';
 import { isRecord, type JsonRecord } from '../json';
 import { requestJson, requestOptions, rewriteJson } from './json-request';
+import { abortable } from '../transport';
 
 export type AccountOptions = {
   home: string;
@@ -177,14 +178,17 @@ export class AccountUpstream {
     // Keep the body inspected for routing even if an external caller replaces init.body while
     // credential/catalog I/O is pending. The original implementation parsed this snapshot too.
     const snapshot = requestOptions(init);
+    const signal = snapshot.signal ?? undefined;
+    signal?.throwIfAborted();
     // The credentials must never be forwarded to any destination other than Codex's backend.
     const target = new URL(url);
     if (target.origin !== 'https://chatgpt.com' || !target.pathname.startsWith('/backend-api/codex/')) {
       throw new BackendError('Secondary credentials require the native Codex backend');
     }
     let identity: Identity;
-    try { identity = await this.ready(); }
-    catch { throw new BackendError('Secondary Codex login unavailable; sign in again to its isolated profile. Primary account was not used.'); }
+    try { identity = await abortable(this.ready(), signal); }
+    catch { signal?.throwIfAborted(); throw new BackendError('Secondary Codex login unavailable; sign in again to its isolated profile. Primary account was not used.'); }
+    signal?.throwIfAborted();
     const authorized = (current: Identity) => {
       const headers = new Headers(init.headers);
       headers.set('authorization', `Bearer ${current.token}`);
@@ -192,7 +196,8 @@ export class AccountUpstream {
       headers.delete('content-length');
       return headers;
     };
-    const { readable, row } = await this.catalogRowWithRefresh(native);
+    const { readable, row } = await abortable(this.catalogRowWithRefresh(native), signal);
+    signal?.throwIfAborted();
     if (!readable) throw new BackendError('Secondary model cache unavailable; refresh its native model catalog');
     if (!row) throw new BackendError('Unsupported secondary Codex model; refresh its native model catalog');
     let tier = body.service_tier;
@@ -205,8 +210,12 @@ export class AccountUpstream {
     const response = await upstream(url, requestOptions(outbound, { headers: authorized(identity) }));
     if (response.status !== 401) return response;
     // Like native Codex, a 401 earns one forced refresh and one retry; a failed refresh keeps the original 401.
-    try { identity = await this.ready(true); }
-    catch { logSafe('account-unauthorized', { account: this.options.prefix, refreshed: false }); return response; }
+    try { identity = await abortable(this.ready(true), signal); }
+    catch {
+      if (signal?.aborted) { await response.body?.cancel().catch(() => {}); throw signal.reason; }
+      logSafe('account-unauthorized', { account: this.options.prefix, refreshed: false }); return response;
+    }
+    if (signal?.aborted) { await response.body?.cancel().catch(() => {}); throw signal.reason; }
     logSafe('account-unauthorized', { account: this.options.prefix, refreshed: true });
     await response.body?.cancel();
     return upstream(url, requestOptions(outbound, { headers: authorized(identity) }));

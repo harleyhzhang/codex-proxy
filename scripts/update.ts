@@ -48,7 +48,7 @@ const after = (await $`git rev-parse --short HEAD`.quiet()).stdout.toString().tr
 console.log(before === after ? `  already up to date (${after})` : `  ${before} → ${after}`);
 
 console.log('→ Installing dependencies');
-if ((await $`bun install`).exitCode !== 0) fail('bun install failed; see the output above.');
+if ((await $`bun install --frozen-lockfile`).exitCode !== 0) fail('bun install failed; see the output above.');
 
 const service = await findService();
 const env = { ...process.env, ...service?.env };

@@ -40,6 +40,49 @@ describe('upstream idle deadline (native bounds streams by idle time, not length
     expect(idle.signal.aborted).toBe(true);
     expect((idle.signal.reason as Error).name).toBe('TimeoutError');
   });
+
+  test('cancelled and errored bodies disarm their idle deadlines', async () => {
+    const cancelled = idleDeadline(new AbortController().signal, 40);
+    let reason: unknown;
+    const source = new Response(new ReadableStream<Uint8Array>({ cancel(value) { reason = value; } }));
+    await watchBody(source, cancelled).body!.cancel('client left');
+    expect(reason).toBe('client left');
+    expect(source.body!.locked).toBe(false);
+
+    const failed = idleDeadline(new AbortController().signal, 40);
+    const error = new Error('upstream closed');
+    const broken = new Response(new ReadableStream<Uint8Array>({ start(out) { out.error(error); } }));
+    await expect(watchBody(broken, failed).text()).rejects.toThrow('upstream closed');
+    expect(broken.body!.locked).toBe(false);
+    await Bun.sleep(80);
+    expect(cancelled.signal.aborted).toBe(false);
+    expect(failed.signal.aborted).toBe(false);
+  });
+
+  test('a failed connection disarms the deadline and completed timers cannot be revived', async () => {
+    const idle = idleDeadline(new AbortController().signal, 40);
+    await expect(watchBody(Promise.reject(new Error('connection failed')), idle)).rejects.toThrow('connection failed');
+    idle.touch();
+    await Bun.sleep(80);
+    expect(idle.signal.aborted).toBe(false);
+  });
+
+  test('cancelling a pending read disarms the deadline without waiting for source cleanup', async () => {
+    const idle = idleDeadline(new AbortController().signal, 40);
+    let cleanup!: () => void;
+    const source = new Response(new ReadableStream<Uint8Array>({
+      cancel() { return new Promise<void>(resolve => { cleanup = resolve; }); },
+    }));
+    const reader = watchBody(source, idle).body!.getReader();
+    const pending = reader.read();
+    const cancelled = reader.cancel();
+    await pending;
+    await Bun.sleep(80);
+    expect(idle.signal.aborted).toBe(false);
+    cleanup();
+    await cancelled;
+    expect(source.body!.locked).toBe(false);
+  });
 });
 
 const dir = mkdtempSync(join(tmpdir(), 'csp-units-'));

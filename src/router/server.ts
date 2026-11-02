@@ -23,7 +23,7 @@ import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOption
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages, type BridgeFlight } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
-import { completionObserver, observeResponse } from './response-history';
+import { CompletedItems, completionObserver, observeResponse } from './response-history';
 import { localResponse, prewarmLocal } from './local';
 import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, upstreamStreamFailure, UpstreamStatusError, watchBody } from './upstream';
 import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
@@ -60,7 +60,6 @@ const HTTP_VISIBLE = /^(Request too large|Request body|Unsupported|Previous|Miss
 // Faults in the request itself are 400 (never retried); faults bridging to OpenAI stay 502 so Codex retries.
 const CLIENT_FAULT = /^(Request |Missing request|Unsupported)/;
 const WS_VISIBLE = /^(OpenAI-encrypted history|OpenAI compaction|Compaction produced|Unsupported|Previous)/;
-const WS_LOGGED = /^(Unsupported|Previous|OpenAI-encrypted history|OpenAI compaction|Compaction produced|model is required|Request|tools must)/;
 /** Native Codex treats its own internal errors as retryable; so does the router (a 500 is retried, a 400 is not). */
 const INTERNAL_FAILURE = 'Internal router error; Codex will retry.';
 
@@ -224,7 +223,7 @@ export function startRouter(options: RouterOptions) {
     const request = compactRequest(body);
 
     let response: ResponseObject | undefined;
-    const streamedItems: OutputItem[] = [];
+    const streamedItems = new CompletedItems();
     let streamedText = '';
     let terminal: StreamEvent | undefined;
     if (isLocalModel(body.model)) {
@@ -234,23 +233,23 @@ export function startRouter(options: RouterOptions) {
       // Streamed like other turns, so bound silence rather than total time; native allows long compactions.
       const idle = idleDeadline(signal, timeoutMs);
       const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
-      const upstream = watchBody(offline
-        ? await connectUpstream(upstreamFetch, '/responses', forwarded, clean, idle, signal, offline)
-        : await postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal), idle);
+      const upstream = await watchBody(offline
+        ? connectUpstream(upstreamFetch, '/responses', forwarded, clean, idle, signal, offline)
+        : postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal), idle);
       if (!upstream.ok) {
         const { detail, fields } = await upstreamFailure(upstream);
-        log.warn('compact-upstream', { status: upstream.status, detail });
+        log.warn('compact-upstream', { status: upstream.status, detail_chars: detail.length });
         throw new UpstreamStatusError(`OpenAI compaction request failed HTTP ${upstream.status}${detail ? `: ${detail}` : ''}`, upstream.status, fields);
       }
       await sseEvents(upstream, (event) => {
-        if (event.type === 'response.output_item.done' && isRecord(event.item)) streamedItems.push(event.item as OutputItem);
+        if (event.type === 'response.output_item.done' && isRecord(event.item)) streamedItems.add(event.item as OutputItem, event.output_index);
         if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') streamedText += event.delta;
         if (event.type === 'response.completed' && isRecord(event.response)) response = event.response as ResponseObject;
         if (event.type === 'response.failed' || event.type === 'response.incomplete' || event.type === 'error') terminal = event;
       });
       if (terminal && terminal.type !== 'response.incomplete') {
         const failure = upstreamStreamFailure(terminal, 'compaction');
-        log.warn('compact-failed', { terminal: terminal.type, status: failure.status, code: failure.fields.code ?? null });
+        log.warn('compact-failed', { terminal: terminal.type, status: failure.status, classified: failure.fields.code !== undefined });
         throw failure;
       }
       // An incomplete summary (e.g. the output cap) still carries the work so far, and the capsule keeps
@@ -259,16 +258,16 @@ export function startRouter(options: RouterOptions) {
     }
 
     signal.throwIfAborted();
-    const items = response?.output?.length ? response.output : streamedItems;
+    const items = response?.output?.length ? response.output : streamedItems.snapshot();
     const summary = messageText(items) || streamedText;
     if (!response || !summary) {
-      log.warn('compact-output', { types: items.map((item) => item.type), terminal: terminal?.type ?? 'response.completed' });
+      log.warn('compact-output', { items: items.length, terminal: terminal?.type ?? 'response.completed' });
       // An empty reply is a model hiccup, not a fault in the request: 502 so Codex retries it.
       throw new UpstreamStatusError('Compaction produced no continuation summary; Codex will retry', 502);
     }
     if (terminal) {
       const details = isRecord(response.incomplete_details) ? response.incomplete_details : {};
-      log.warn('compact-incomplete', { reason: typeof details.reason === 'string' ? details.reason.slice(0, 40) : null, chars: summary.length });
+      log.warn('compact-incomplete', { output_limit: details.reason === 'max_output_tokens', interrupted: details.reason === 'interrupted', chars: summary.length });
     }
     const compacted: ResponseObject = {
       ...response,
@@ -284,7 +283,7 @@ export function startRouter(options: RouterOptions) {
     if (error instanceof BackendError) return terminalEvent(error);
     if (error instanceof UpstreamStatusError) return upstreamFailedEvent(error.status, error.message, error.fields);
     // An unexpected router/backend exception mid-stream: retryable, like native Codex's own internal errors.
-    logSafe('pending-internal-error', { name: error instanceof Error ? error.name : typeof error });
+    logSafe('pending-internal-error', { error: error instanceof Error });
     return { type: 'response.failed', sequence_number: 0, response: { id: randomId('resp'), status: 'failed', error: { code: 'server_error', message: INTERNAL_FAILURE } } };
   };
 
@@ -324,7 +323,7 @@ export function startRouter(options: RouterOptions) {
       const idle = idleDeadline(req.signal, timeoutMs);
       const upstreamPath = path.slice(3);
       try {
-        return relay(observeResponse(watchBody(await postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle), response => history.remember(body, response)));
+        return relay(observeResponse(await watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle), response => history.remember(body, response)));
       } catch (error) {
         // Offline before any upstream byte: keep this request pending with progress frames instead of
         // spending one of Codex's five stream reconnects on every outage retry. The first attempt
@@ -334,10 +333,10 @@ export function startRouter(options: RouterOptions) {
         log.warn('upstream-offline', { path: upstreamPath });
         return pendingRelay(body, (signal) => {
           const pendingIdle = idleDeadline(signal, timeoutMs);
-          return connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal).then(response => observeResponse(watchBody(response, pendingIdle), response => history.remember(body, response)));
+          return watchBody(connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal), pendingIdle).then(response => observeResponse(response, response => history.remember(body, response)));
         }, req.signal, pendingFailure, async (response) => {
           const { detail, fields } = await upstreamFailure(response);
-          log.warn('upstream', { status: response.status, detail });
+          log.warn('upstream', { status: response.status, detail_chars: detail.length });
           return upstreamFailedEvent(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields);
         }, options.heartbeatMs);
       }
@@ -359,8 +358,8 @@ export function startRouter(options: RouterOptions) {
         path,
         compaction: path.includes('compact'),
         cancelled: req.signal.aborted,
-        name: error instanceof Error ? error.name : typeof error,
-        hint: error instanceof Error ? error.message.slice(0, 60) : '',
+        error: error instanceof Error,
+        message_chars: error instanceof Error ? error.message.length : 0,
       });
       const visible = errorPrefix(error, HTTP_VISIBLE);
       if (visible) return invalidRequest(visible, CLIENT_FAULT.test(visible) ? 400 : 502);
@@ -374,14 +373,14 @@ export function startRouter(options: RouterOptions) {
     if (req.method !== 'POST') return invalidRequest('Unsupported method', 405);
     try {
       const idle = idleDeadline(req.signal, timeoutMs);
-      const response = await upstreamFetch(UPSTREAM_URL + url.pathname.slice(3) + url.search, {
+      const response = await watchBody(upstreamFetch(UPSTREAM_URL + url.pathname.slice(3) + url.search, {
         method: 'POST',
         headers: upstreamHeaders(req.headers),
         body: req.body,
         signal: idle.signal,
         redirect: 'error',
-      });
-      return relay(watchBody(response, idle));
+      }), idle);
+      return relay(response);
     } catch {
       return invalidRequest('OpenAI tool request failed; retry', 503);
     }
@@ -429,7 +428,7 @@ export function startRouter(options: RouterOptions) {
       const raw = isRecord(message.response) ? message.response : message;
       const previous = typeof raw.previous_response_id === 'string' ? raw.previous_response_id : undefined;
       const body = await normalize(raw, ws.data.headers, AbortSignal.any([controller.signal, interrupt.signal]));
-      log.info('request', { model: body.model, warmup: body.generate === false, compaction: isCompaction(body) });
+      log.info('request', { local: isLocalModel(body.model), warmup: body.generate === false, compaction: isCompaction(body) });
 
       if (options.upstreamWebSocket && !isLocalModel(body.model) && !isCompaction(body)) {
         ws.data.upstream ??= new UpstreamSession({
@@ -488,11 +487,11 @@ export function startRouter(options: RouterOptions) {
         log.warn('history-miss');
         ws.close(1011, 'history unavailable');
       } else if (error instanceof UpstreamStatusError) {
-        log.warn('failed', { cancelled: !live(), category: error.message });
+        log.warn('failed', { cancelled: !live(), category: 'upstream', status: error.status });
         if (live()) send({ type: 'error', status: error.status, error: upstreamFailureBody(error.status, error.message, error.fields) });
       } else {
         const visible = errorPrefix(error, WS_VISIBLE);
-        log.warn('failed', { cancelled: !live(), category: errorPrefix(error, WS_LOGGED) ?? 'internal', name: error instanceof Error ? error.name : typeof error });
+        log.warn('failed', { cancelled: !live(), category: visible ? 'request' : 'internal', error: error instanceof Error });
         if (!live()) return;
         // Router-visible refusals are terminal (400). Anything else is an internal fault: 500 so Codex retries.
         send(visible
@@ -529,11 +528,11 @@ export function startRouter(options: RouterOptions) {
     let stop: (() => void) | undefined;
     let response: Response;
     try {
-      response = watchBody(await connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+      response = await watchBody(connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
     } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
-      log.warn('upstream', { status: response.status, detail });
+      log.warn('upstream', { status: response.status, detail_chars: detail.length });
       // Native reads `headers` on a wrapped socket error (responses_websocket.rs) for rate-limit
       // windows, promo copy and request ids; forward the ones it parses.
       const relayed: Record<string, string> = {};
@@ -541,7 +540,7 @@ export function startRouter(options: RouterOptions) {
       send({ type: 'error', status: response.status, error: upstreamFailureBody(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields), ...(Object.keys(relayed).length ? { headers: relayed } : {}) });
       return;
     }
-    const items: OutputItem[] = [];
+    const items = new CompletedItems();
     const rememberCompletion = completionObserver(response => history.remember(body, response));
     const open = new Map<unknown, unknown>();
     let created: ResponseObject | undefined;
@@ -549,7 +548,7 @@ export function startRouter(options: RouterOptions) {
       await sseEvents(response, (event) => {
         if (event.type === 'response.created' && isRecord(event.response)) created = event.response as ResponseObject;
         if (event.type === 'response.output_item.added' && isRecord(event.item)) open.set(event.item.id, event.output_index);
-        if (event.type === 'response.output_item.done' && isRecord(event.item)) { items.push(event.item as OutputItem); open.delete(event.item.id); }
+        if (event.type === 'response.output_item.done' && isRecord(event.item)) { items.add(event.item as OutputItem, event.output_index); open.delete(event.item.id); }
         rememberCompletion(event);
         forward(event);
       });
@@ -557,7 +556,7 @@ export function startRouter(options: RouterOptions) {
       if (!interrupt.aborted || signal.aborted || !created) throw error;
       idle.done();
       for (const [item_id, output_index] of open) forward({ type: 'response.output_item.interrupted', response_id: created.id, item_id, output_index });
-      const stopped = interruptedResponse(created, items);
+      const stopped = interruptedResponse(created, items.snapshot());
       history.remember(body, stopped);
       forward({ type: 'response.incomplete', response: stopped });
     }
@@ -575,7 +574,7 @@ export function startRouter(options: RouterOptions) {
       if (url.pathname === '/v1/models' && req.method === 'GET') return Response.json(await Bun.file(options.catalog).json());
       if (PASSTHROUGH_PATHS.has(url.pathname)) return passthrough(req, url);
       if (!RESPONSE_PATHS.has(url.pathname)) {
-        log.warn('unsupported-endpoint', { method: req.method, path: url.pathname.slice(0, 160) });
+        log.warn('unsupported-endpoint', { path_chars: url.pathname.length });
         return invalidRequest('Not found', 404);
       }
       if (url.pathname === '/v1/responses' && server.upgrade(req, { data: { headers: new Headers(req.headers), busy: false } })) {

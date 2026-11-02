@@ -1,7 +1,7 @@
 import { enqueueBounded, byteStrategy } from './buffer';
 import { randomId } from '../json';
 import { logSafe } from '../log';
-import { itemEvents, responseObject } from './output';
+import { itemEvents, responseObject, toolCallRenderer } from './output';
 import { EMPTY_OUTPUT, type OutputItem, type OutputSink, type ResponsesBody, type ResponseObject, type ToolCall } from './types';
 type Event = Record<string, unknown>;
 
@@ -62,6 +62,7 @@ export async function pendingResponse(request: ResponsesBody,
   const streamed: Streamed[] = [];
   let open: Streamed | undefined;
   let reached = false;
+  let renderCall: ReturnType<typeof toolCallRenderer> | undefined;
   const at = (entry: Streamed) => ({ item_id: entry.item.id, output_index: entry.index });
   const close = () => {
     const entry = open;
@@ -114,10 +115,9 @@ export async function pendingResponse(request: ResponsesBody,
       send({ type: 'response.reasoning_summary_text.delta', ...at(entry), summary_index: 0, delta });
     }),
     call: guarded((call: ToolCall) => {
-      let item: OutputItem | undefined;
+      let item: OutputItem;
       // A call the router cannot render (bad computer or search arguments) waits for the final output, which reports it.
-      try { item = responseObject(request, { ...EMPTY_OUTPUT, toolCalls: [call] }).output[0]; } catch { return; }
-      if (!item) return;
+      try { item = (renderCall ??= toolCallRenderer(request))(call); } catch { return; }
       close();
       const entry: Streamed = { index: streamed.length, kind: 'call', item, text: '' };
       streamed.push(entry);
