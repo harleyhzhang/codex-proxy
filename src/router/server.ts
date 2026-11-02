@@ -13,6 +13,8 @@ import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
 import { pendingEnvelope, pendingRelay, pendingResponse, pendingStream, startHeartbeat } from '../protocol/pending';
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
+import { validateControls, requestTools, toolDescriptors } from '../protocol/prompt';
+import { assertToolDescriptions } from '../protocol/native-tools';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
 import { upstreamAdmission } from './admission';
@@ -21,6 +23,7 @@ import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOption
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages, type BridgeFlight } from './bridge';
 import { compactRequest, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
+import { completionObserver, observeResponse } from './response-history';
 import { localResponse, prewarmLocal } from './local';
 import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, upstreamStreamFailure, UpstreamStatusError, watchBody } from './upstream';
 import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
@@ -184,7 +187,11 @@ export function startRouter(options: RouterOptions) {
     }
     const withList = typeof body.input === 'string' ? { ...body, input: [{ role: 'user', content: body.input }] } : body;
     let expanded = normalizeToolSearchIds(normalizeAgentPayloads(history.expand(withList)));
-    if (body.generate !== false) backend?.assertRequestControls?.(expanded);
+    if (body.generate !== false && backend) {
+      validateControls(expanded);
+      assertToolDescriptions(toolDescriptors(requestTools(expanded)));
+      backend.assertRequestControls?.(expanded);
+    }
     if (!isLocalModel(body.model)) expanded = dropForeignReasoning(expanded);
     if (!codec || body.generate === false) return expanded;
 
@@ -210,6 +217,7 @@ export function startRouter(options: RouterOptions) {
    * decides itself whether to go pending.
    */
   async function compact(body: ResponsesBody, headers: Headers, signal: AbortSignal, offline?: () => void): Promise<ResponseObject> {
+    signal.throwIfAborted();
     if (!codec) throw new Error('Local compaction key unavailable');
     const input = Array.isArray(body.input) ? body.input : [];
     portableSummary('', input); // Fail before spending a generation if the requests cannot fit.
@@ -250,6 +258,7 @@ export function startRouter(options: RouterOptions) {
       if (terminal && isRecord(terminal.response)) response = terminal.response as ResponseObject;
     }
 
+    signal.throwIfAborted();
     const items = response?.output?.length ? response.output : streamedItems;
     const summary = messageText(items) || streamedText;
     if (!response || !summary) {
@@ -266,7 +275,6 @@ export function startRouter(options: RouterOptions) {
       status: 'completed',
       output: [{ id: randomId('cmp'), type: 'compaction', encrypted_content: codec.seal(portableSummary(summary, input)) }],
     };
-    history.remember(body, compacted);
     return compacted;
   }
 
@@ -293,7 +301,7 @@ export function startRouter(options: RouterOptions) {
         if (body.stream) {
           // GPT compaction keeps OpenAI's real status on the first attempt; only an outage before any
           // answer switches the same request to the pending stream, where it waits for the network.
-          try { return streamResponse(await compact(body, req.headers, req.signal)); }
+          try { const response = await compact(body, req.headers, req.signal); history.remember(body, response); return streamResponse(response); }
           catch (error) {
             if (!transportError(error)?.reconnectable || req.signal.aborted) throw error;
             log.warn('upstream-offline', { path: 'compact' });
@@ -301,6 +309,7 @@ export function startRouter(options: RouterOptions) {
           }
         }
         const response = await compact(body, req.headers, req.signal);
+        history.remember(body, response);
         return Response.json(response);
       }
       if (isLocalModel(body.model)) {
@@ -315,7 +324,7 @@ export function startRouter(options: RouterOptions) {
       const idle = idleDeadline(req.signal, timeoutMs);
       const upstreamPath = path.slice(3);
       try {
-        return relay(watchBody(await postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle));
+        return relay(observeResponse(watchBody(await postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle), response => history.remember(body, response)));
       } catch (error) {
         // Offline before any upstream byte: keep this request pending with progress frames instead of
         // spending one of Codex's five stream reconnects on every outage retry. The first attempt
@@ -325,7 +334,7 @@ export function startRouter(options: RouterOptions) {
         log.warn('upstream-offline', { path: upstreamPath });
         return pendingRelay(body, (signal) => {
           const pendingIdle = idleDeadline(signal, timeoutMs);
-          return connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal).then(response => watchBody(response, pendingIdle));
+          return connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal).then(response => observeResponse(watchBody(response, pendingIdle), response => history.remember(body, response)));
         }, req.signal, pendingFailure, async (response) => {
           const { detail, fields } = await upstreamFailure(response);
           log.warn('upstream', { status: response.status, detail });
@@ -442,16 +451,18 @@ export function startRouter(options: RouterOptions) {
         history.remember(body, warm);
         await sseEvents(streamResponse(warm), send);
       } else if (isCompaction(body)) {
-        if (isLocalModel(body.model)) await pendingResponse(body, signal => compact(body, ws.data.headers, signal, () => {}), controller.signal, send, response => history.remember(body, response), options.heartbeatMs);
-        else {
-          // The socket can carry progress frames at any time, so an outage starts heartbeats in place.
-          let stop: (() => void) | undefined;
-          try {
-            const compacted = await compact(body, ws.data.headers, controller.signal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); });
-            stop?.(); stop = undefined;
-            await sseEvents(streamResponse(compacted), send);
-          } finally { stop?.(); }
-        }
+        await pendingResponse(body, async signal => {
+          const combined = AbortSignal.any([signal, interrupt.signal]);
+          try { const result = await compact(body, ws.data.headers, combined, () => {}); combined.throwIfAborted(); return result; }
+          catch (error) {
+            if (!interrupt.signal.aborted || signal.aborted) throw error;
+            return interruptedResponse(responseObject(body, EMPTY_OUTPUT), []);
+          }
+        }, controller.signal, send, response => {
+          // The trigger is maintenance for this request only. An interrupted response must
+          // continue from the original conversation, not re-trigger compaction forever.
+          history.remember({ ...body, input: Array.isArray(body.input) ? body.input.filter(item => item.type !== 'compaction_trigger') : body.input }, response);
+        }, options.heartbeatMs);
       } else if (isLocalModel(body.model)) {
         await pendingResponse(body, async (signal, sink) => {
           // An interrupt ends the turn: streamed text is closed as interrupted and no tool call is exposed.
@@ -531,6 +542,7 @@ export function startRouter(options: RouterOptions) {
       return;
     }
     const items: OutputItem[] = [];
+    const rememberCompletion = completionObserver(response => history.remember(body, response));
     const open = new Map<unknown, unknown>();
     let created: ResponseObject | undefined;
     try {
@@ -538,10 +550,7 @@ export function startRouter(options: RouterOptions) {
         if (event.type === 'response.created' && isRecord(event.response)) created = event.response as ResponseObject;
         if (event.type === 'response.output_item.added' && isRecord(event.item)) open.set(event.item.id, event.output_index);
         if (event.type === 'response.output_item.done' && isRecord(event.item)) { items.push(event.item as OutputItem); open.delete(event.item.id); }
-        if (event.type === 'response.completed' && isRecord(event.response)) {
-          const completed = event.response as ResponseObject;
-          history.remember(body, { ...completed, output: completed.output?.length ? completed.output : items });
-        }
+        rememberCompletion(event);
         forward(event);
       });
     } catch (error) {

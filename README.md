@@ -20,7 +20,7 @@ Codex ──► 127.0.0.1:3468 ──┬──► chatgpt.com          (GPT mode
 
 ## Requirements
 
-- [Bun](https://bun.sh) 1.2+
+- [Bun](https://bun.sh) 1.4.2+ (including streaming Zstd decoding)
 - Codex (desktop app or CLI), signed in with ChatGPT
 - For Claude: a Claude subscription login from the [Claude Code](https://docs.anthropic.com/claude-code) CLI (`claude auth login`); the CLI is not run afterwards
 - For Grok (optional): a SuperGrok login from the Grok Build CLI (`grok login`); the CLI is not run afterwards
@@ -357,6 +357,20 @@ output-token limits in their provider requests. Cursor's SDK supports `tool_choi
 are refused before generation because the SDK cannot enforce them. A cancelled Cursor setup
 releases its local agent and owns any late SDK result; a stalled remote cancel cannot indefinitely
 block local cleanup.
+
+Structured output is explicit too: Claude translates `text.format: json_schema` to its native
+`output_config.format`; Grok forwards Responses JSON-schema/JSON-object formats unchanged.
+Cursor rejects structured-output requests before generation, and Claude rejects arbitrary
+JSON-object mode (use a schema). Provider schema enforcement remains authoritative; the router
+also rejects malformed JSON and supported structural violations in a completed final answer,
+without replaying the turn or any tool action. Internal compaction uses prose rather than the
+final-answer schema, and a compaction interrupt aborts its work while keeping the original history.
+
+HTTP GPT JSON and SSE replies now populate the same bounded continuation history as WebSockets.
+SSE framing is incremental, supports LF/CRLF/CR and bounds complete events in UTF-8 bytes.
+Compressed requests use asynchronous streaming Zstd decoding with bounded wire/output bytes and
+decoder windows; incomplete frames and trailing garbage are refused. Custom-tool grammar is
+reserved before explanatory prose is shortened; syntax that cannot fit is explicitly refused.
 
 ## Configuration
 

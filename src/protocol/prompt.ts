@@ -2,6 +2,7 @@
 // conversation as one text prompt plus image blocks (how Cursor receives it).
 import { isRecord } from '../json';
 import type { ResponseInputItem, ResponsesRequest, ResponseTool } from './types';
+import { outputFormat } from './output-format';
 
 export const COMPUTER_TOOL_NAME = '__codex_computer_use';
 export const TOOL_SEARCH_NAME = '__codex_tool_search';
@@ -221,7 +222,8 @@ export function preparePrompt(request: ResponsesRequest): PreparedPrompt {
 }
 
 /** Explicit controls must never quietly become a different request at a provider boundary. */
-export function validateControls(value: { tools?: ResponseTool[]; input?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown; max_output_tokens?: unknown }): void {
+export function validateControls(value: { tools?: ResponseTool[]; input?: unknown; tool_choice?: unknown; parallel_tool_calls?: unknown; max_output_tokens?: unknown; text?: unknown }): void {
+  outputFormat(value);
   if (value.parallel_tool_calls !== undefined && typeof value.parallel_tool_calls !== 'boolean') throw new Error('Unsupported parallel_tool_calls: expected a boolean');
   if (value.max_output_tokens !== undefined && (typeof value.max_output_tokens !== 'number' || !Number.isSafeInteger(value.max_output_tokens) || value.max_output_tokens <= 0)) throw new Error('Unsupported max_output_tokens: expected a positive integer');
   const choice = value.tool_choice;

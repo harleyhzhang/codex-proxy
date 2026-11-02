@@ -4,6 +4,8 @@ import { describe, expect, test } from 'bun:test';
 import type { SubscriptionBackend } from '../src/backends/contract';
 import { BACKENDS } from '../src/backends/registry';
 import type { ResponsesBody } from '../src/protocol/types';
+import { EMPTY_OUTPUT } from '../src/protocol/types';
+import { responseObject, streamResponse } from '../src/protocol/output';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const GPT = 'gpt-6.1-sol';
@@ -50,6 +52,43 @@ async function socket(app: Awaited<ReturnType<typeof fixtureRouter>>) {
 }
 
 describe('response.interrupt', () => {
+  for (const local of [true, false]) for (const lateSuccess of [true, false]) test(`compaction interruption preserves original continuable history: local=${local}, lateSuccess=${lateSuccess}`, async () => {
+    const backend = BACKENDS[0]!; const original = backend.run;
+    const model = local ? Object.keys(backend.models)[0]! : GPT;
+    const bodies: ResponsesBody[] = [];
+    let aborted = false;
+    const summary = { ...EMPTY_OUTPUT, text: 'This summary must never replace the original history.' };
+    backend.run = async (body, signal) => {
+      bodies.push(body);
+      if (bodies.length > 1) return { ...EMPTY_OUTPUT, text: 'continued' };
+      return new Promise((resolve, reject) => {
+        signal?.addEventListener('abort', () => { aborted = true; if (lateSuccess) resolve(summary); else reject(signal.reason); }, { once: true });
+      });
+    };
+    const app = await fixtureRouter({ summaryKey: Buffer.alloc(32, 3), upstreamFetch: async (_url, init) => {
+      const body = JSON.parse(String(init.body)) as ResponsesBody; bodies.push(body);
+      if (bodies.length > 1) return streamResponse(responseObject(body, { ...EMPTY_OUTPUT, text: 'continued' }));
+      return new Promise((resolve, reject) => {
+        init.signal?.addEventListener('abort', () => { aborted = true; if (lateSuccess) resolve(streamResponse(responseObject(body, summary))); else reject(init.signal?.reason); }, { once: true });
+      });
+    } });
+    const { ws, next } = await socket(app);
+    try {
+      ws.send(JSON.stringify(request(model, { input: [{ role: 'user', content: 'ORIGINAL_HISTORY' }, { type: 'compaction_trigger' }] })));
+      const created = await next('response.created');
+      ws.send(JSON.stringify({ type: 'response.interrupt', response_id: created.response.id }));
+      await next('response.interrupt.accepted');
+      const incomplete = await next('response.incomplete');
+      expect(aborted).toBe(true);
+      expect(incomplete.response).toMatchObject({ id: created.response.id, status: 'incomplete', incomplete_details: { reason: 'interrupted' }, output: [] });
+      ws.send(JSON.stringify(request(model, { previous_response_id: created.response.id, input: [{ role: 'user', content: 'continue original' }] })));
+      await next('response.completed');
+      expect(bodies).toHaveLength(2);
+      const replay = JSON.stringify(bodies[1]?.input);
+      expect(replay).toContain('ORIGINAL_HISTORY'); expect(replay).toContain('continue original');
+      expect(replay).not.toContain('compaction_trigger'); expect(replay).not.toContain('This summary must never'); expect(replay).not.toContain('encrypted_content');
+    } finally { backend.run = original; ws.close(); await app.close(); }
+  });
   test('a GPT turn stops, keeps finished items and continues from its id', async () => {
     const bodies: ResponsesBody[] = [];
     const app = await fixtureRouter({ upstreamFetch: async (_url, init) => {

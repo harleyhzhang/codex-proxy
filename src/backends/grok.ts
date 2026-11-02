@@ -191,6 +191,7 @@ function grokRequest(request: ResponsesRequest, replay?: ReasoningReplay): Prepa
       // `summary` makes xAI stream a readable summary of Grok's thinking, which Codex shows as it thinks.
       reasoning: { effort: request.reasoning?.effort ?? 'high', summary: 'auto' },
       max_output_tokens: request.max_output_tokens,
+      text: request.text,
       // Codex's per-thread key; xAI caches the shared prefix under it.
       prompt_cache_key: typeof extra.prompt_cache_key === 'string' ? extra.prompt_cache_key : undefined,
       stream: true,

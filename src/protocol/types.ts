@@ -52,6 +52,7 @@ export type ResponsesRequest = {
   stream?: boolean;
   max_output_tokens?: number;
   reasoning?: { effort?: string };
+  text?: { format?: unknown; [key: string]: unknown };
 };
 
 /** A body as Codex sends it. Fields the router does not understand are forwarded untouched. */
