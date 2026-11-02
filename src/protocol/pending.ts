@@ -1,3 +1,4 @@
+import { enqueueBounded, byteStrategy } from './buffer';
 import { randomId } from '../json';
 import { logSafe } from '../log';
 import { itemEvents, responseObject } from './output';
@@ -104,6 +105,7 @@ export async function pendingResponse(request: ResponsesBody,
   };
   const sink: OutputSink = {
     get started() { return reached; },
+    snapshot() { close(); return streamed.map(entry => entry.item); },
     text: guarded((delta: string) => { if (delta) appendText(delta); }),
     reasoning: guarded((delta: string) => {
       if (!delta) return;
@@ -149,7 +151,7 @@ export async function pendingResponse(request: ResponsesBody,
     const response = { ...generated, output, id: empty.id, created_at: empty.created_at };
     remember?.(response);
     for (let index = streamed.length; index < output.length; index++) for (const event of itemEvents(output[index]!, index)) send(event);
-    send({ type: response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
+    send({ type: response.status === 'failed' ? 'response.failed' : response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
     return response;
   } finally {
     clearInterval(timer);
@@ -166,16 +168,17 @@ export function pendingStream(request: ResponsesBody,
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(outgoing) {
-      const emit = (event: Event) => outgoing.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+      const enqueue = (bytes: Uint8Array) => enqueueBounded(outgoing, bytes, error => { controller.abort(error); outgoing.error(error); });
+      const emit = (event: Event) => enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
       void pendingResponse(request, generate, combined, emit, remember, heartbeatMs)
         .catch(error => { if (!combined.aborted) emit(failure(error)); })
         .finally(() => {
-          if (!combined.aborted) { outgoing.enqueue(encoder.encode('data: [DONE]\n\n')); outgoing.close(); }
+          if (!combined.aborted) { enqueue(encoder.encode('data: [DONE]\n\n')); outgoing.close(); }
           else { try { outgoing.error(combined.reason); } catch {} }
         }).catch(error => controller.abort(error));
     },
     cancel(reason) { controller.abort(reason); },
-  });
+  }, byteStrategy());
   return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' } });
 }
 
@@ -195,8 +198,9 @@ export function pendingRelay(request: ResponsesBody,
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
     start(outgoing) {
-      const frame = (event: Event) => outgoing.enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
-      const done = () => outgoing.enqueue(encoder.encode('data: [DONE]\n\n'));
+      const enqueue = (bytes: Uint8Array) => enqueueBounded(outgoing, bytes, error => { controller.abort(error); outgoing.error(error); });
+      const frame = (event: Event) => enqueue(encoder.encode(`event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`));
+      const done = () => enqueue(encoder.encode('data: [DONE]\n\n'));
       const stop = startHeartbeat(frame, pendingEnvelope(request), heartbeatMs);
       void (async () => {
         try {
@@ -206,7 +210,7 @@ export function pendingRelay(request: ResponsesBody,
           const reader = upstream.body?.getReader();
           if (!reader) { frame(failure(new Error('Missing upstream response'))); done(); return; }
           try {
-            for (;;) { const { value, done: ended } = await reader.read(); if (ended) break; if (value) outgoing.enqueue(value); }
+            for (;;) { const { value, done: ended } = await reader.read(); if (ended) break; if (value) enqueue(value); }
           } finally { await reader.cancel().catch(() => {}); }
         } catch (error) {
           stop();
@@ -219,6 +223,6 @@ export function pendingRelay(request: ResponsesBody,
       );
     },
     cancel(reason) { controller.abort(reason); },
-  });
+  }, byteStrategy());
   return new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' } });
 }

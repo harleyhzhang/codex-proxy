@@ -13,6 +13,8 @@ import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
 import type { ProxyOutput, ResponsesRequest, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
+import { RetryBudget } from './retries';
+import { Admission } from './admission';
 import { claudeLimits, ClaudeUsageLimitError, ClaudeUsageLimits, rateLimitInfo } from './claude-limits';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
@@ -111,11 +113,11 @@ const TEXT_PARTS = new Set(['input_text', 'output_text', 'text']);
 const text = (value: string): JsonRecord[] => (value ? [{ type: 'text', text: value }] : []);
 const toolId = (id: unknown) => String(id ?? '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 128) || 'call';
 
-function imageBlock(value: JsonRecord, legacy: boolean): JsonRecord[] {
+async function imageBlock(value: JsonRecord, legacy: boolean, signal?: AbortSignal): Promise<JsonRecord[]> {
   const url = imageUrl(value, legacy) ?? '';
   const inline = /^data:(image\/(?:png|jpeg|gif|webp));base64,(.*)$/s.exec(url);
   if (inline) {
-    const fitted = fitImage(inline[1]!, inline[2]!.replace(/\s/g, ''));
+    const fitted = await fitImage(inline[1]!, inline[2]!.replace(/\s/g, ''), undefined, undefined, signal);
     if ('omitted' in fitted) return text(fitted.omitted);
     return [{ type: 'image', source: { type: 'base64', media_type: fitted.mediaType, data: fitted.data } }];
   }
@@ -124,11 +126,11 @@ function imageBlock(value: JsonRecord, legacy: boolean): JsonRecord[] {
 }
 
 /** Message or tool-output content as Claude blocks: text and images keep their kind, anything else is JSON text. */
-function blocks(value: unknown, legacy = false): JsonRecord[] {
+async function blocks(value: unknown, legacy = false, signal?: AbortSignal): Promise<JsonRecord[]> {
   if (typeof value === 'string') return text(value);
-  if (Array.isArray(value)) return value.flatMap(part => blocks(part, legacy));
+  if (Array.isArray(value)) return (await Promise.all(value.map(part => blocks(part, legacy, signal)))).flat();
   if (!isRecord(value)) return value === undefined || value === null ? [] : text(JSON.stringify(value));
-  if (isImagePart(value, legacy)) return imageBlock(value, legacy);
+  if (isImagePart(value, legacy)) return imageBlock(value, legacy, signal);
   if (TEXT_PARTS.has(String(value.type)) && typeof value.text === 'string') return text(value.text);
   if (value.type === 'encrypted_content') return text('[encrypted content from a GPT agent; unreadable here]');
   return text(JSON.stringify(value));
@@ -141,7 +143,7 @@ type Turn = { role: 'user' | 'assistant'; content: JsonRecord[] };
  * one saying it did not finish, and a result with no call becomes text, since Anthropic requires every
  * tool_use to be answered in the next user turn and every tool_result to answer one.
  */
-export function claudeMessages(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ThinkingReplay): Turn[] {
+export async function claudeMessages(request: ResponsesRequest, keyFor: (name: string) => string, replay?: ThinkingReplay, signal?: AbortSignal): Promise<Turn[]> {
   const turns: Turn[] = [];
   const add = (role: Turn['role'], content: JsonRecord[]) => {
     if (!content.length) return;
@@ -156,17 +158,17 @@ export function claudeMessages(request: ResponsesRequest, keyFor: (name: string)
       try { input = JSON.parse(historyCallArguments(item)); } catch { input = {}; }
       add('assistant', [{ type: 'tool_use', id: toolId(item.call_id), name: keyFor(historyToolName(item)), input: isRecord(input) ? input : { value: input } }]);
     } else if (HISTORY_OUTPUT_TYPES.has(type)) {
-      const content = type === 'tool_search_output' ? text(JSON.stringify(item.tools ?? [])) : blocks(item.output, type === 'computer_call_output');
+      const content = type === 'tool_search_output' ? text(JSON.stringify(item.tools ?? [])) : await blocks(item.output, type === 'computer_call_output', signal);
       add('user', [{ type: 'tool_result', tool_use_id: toolId(item.call_id), content: content.length ? content : text('(no output)') }]);
     } else if (type === 'agent_message') {
-      const body = blocks(item.content).map(block => block.text ?? '').join('\n');
+      const body = (await blocks(item.content, false, signal)).map(block => block.text ?? '').join('\n');
       add('user', text(`<agent_message author=${JSON.stringify(item.author ?? 'unknown')} recipient=${JSON.stringify(item.recipient ?? 'unknown')}>\n${body}\n</agent_message>`));
     } else if (type === 'message') {
-      if (item.role === 'assistant') add('assistant', blocks(item.content).filter(block => block.type === 'text'));
+      if (item.role === 'assistant') add('assistant', (await blocks(item.content, false, signal)).filter(block => block.type === 'text'));
       else if (item.role === 'developer' || item.role === 'system') {
-        const body = blocks(item.content).map(block => block.text ?? '').join('\n');
+        const body = (await blocks(item.content, false, signal)).map(block => block.text ?? '').join('\n');
         add('user', text(body && `<${item.role}>\n${body}\n</${item.role}>`));
-      } else add('user', blocks(item.content));
+      } else add('user', await blocks(item.content, false, signal));
     } else if (type !== 'reasoning' && !item.encrypted_content) {
       // Reasoning and other encrypted items belong to another provider; anything else readable stays as text.
       add('user', text(JSON.stringify(item)));
@@ -214,14 +216,14 @@ function toolChoice(choice: unknown, keyFor: (name: string) => string): JsonReco
 
 const cached = (block: JsonRecord | undefined) => { if (block && block.type !== 'thinking' && block.type !== 'redacted_thinking') block.cache_control = { type: 'ephemeral' }; };
 
-function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay): { body: JsonRecord; byKey: Map<string, ToolDescriptor> } {
+async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay, signal?: AbortSignal): Promise<{ body: JsonRecord; byKey: Map<string, ToolDescriptor> }> {
   const { definitions, byKey } = functionTools(toolDescriptors(requestTools(request)));
   const keyFor = keyLookup(byKey);
   const tools: JsonRecord[] = Object.entries(definitions).map(([name, tool]) => ({ name, description: tool.description, input_schema: tool.inputSchema }));
   const raw = rawInputTools(byKey);
   const note = `You are running inside a Codex agent loop. The provided tools are Codex's tools: Codex executes each call on the user's machine and returns its result. Call them directly.${raw.length ? ` ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} the whole raw input as the string field "input".` : ''}`;
   const system: JsonRecord[] = [{ type: 'text', text: IDENTITY }, { type: 'text', text: request.instructions ? `${note}\n\n${request.instructions}` : note }];
-  const messages = claudeMessages(request, keyFor, replay);
+  const messages = await claudeMessages(request, keyFor, replay, signal);
   // Cache breakpoints at the end of the tools, the system prompt and the newest turn: each turn reads the
   // conversation the previous one wrote.
   cached(tools.at(-1)); cached(system.at(-1)); cached(messages.at(-1)?.content.at(-1));
@@ -256,6 +258,7 @@ async function errorDetail(response: Response): Promise<string> {
 
 /** Each login owns its token, identity check, thinking replay, quota snapshot and usage sink. */
 export class ClaudeAccount {
+  private readonly admission = new Admission('Claude', positiveInt('CLAUDE_MAX_ACTIVE', 8), positiveInt('PROVIDER_MAX_QUEUED', 64));
   rateLimitSink?: (info: unknown) => void;
   readonly options: Readonly<ClaudeAccountOptions>;
   private readonly store: LoginStore;
@@ -369,10 +372,11 @@ export class ClaudeAccount {
   }
 
   /** Opens the stream. Nothing has reached Codex yet, so each retry here is safe. */
-  private async open(model: string, body: string, signal: AbortSignal): Promise<Response> {
+  private async open(model: string, body: string, signal: AbortSignal, budget: RetryBudget): Promise<Response> {
     let token = await this.authorize(signal);
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
+      budget.take();
       const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream' }), body, signal });
       this.track(response.headers);
       if (response.ok) return response;
@@ -381,24 +385,26 @@ export class ClaudeAccount {
       if (response.status === 401 && !refreshed) { refreshed = true; token = await this.authorize(signal, token); continue; }
       if (response.status === 429) throw this.limits.blocked(model) ?? new ClaudeUsageLimitError();
       if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');
-      if (response.status >= 500 && attempt < SERVER_RETRIES) { await sleep(200 * 2 ** attempt, signal); continue; }
+      if (response.status >= 500 && attempt < SERVER_RETRIES && budget.remaining) { await sleep(budget.delay(response.headers), signal); continue; }
       if (response.status === 529 || OVERLOADED_TEXT.test(detail)) throw overloadedError('Claude');
       if (response.status === 401 || response.status === 403) throw signedOut(this.options.configDir);
-      // A server error that outlasted native Codex's retries stays a server error, which Codex retries itself.
-      if (response.status >= 500) throw new Error(`Claude API HTTP ${response.status}`);
+      // This request already spent its online budget; keep native Codex from multiplying it.
+      if (response.status >= 500) throw new BackendError('Claude remained unavailable after its retry budget; try again later', { code: 'server_is_overloaded' });
       throw new ClaudeError(`Claude request refused (HTTP ${response.status}${detail ? `: ${detail}` : ''})`);
     }
   }
 
-  run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
-    return retryOnce('Claude', signal, () => this.once(request, signal, sink), sink);
+  async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+    const release = await this.admission.acquire(signal, Array.isArray(request.input) && request.input.at(-1)?.type?.endsWith('_output') ? 1 : 0);
+    const budget = new RetryBudget('Claude');
+    try { return await retryOnce('Claude', signal, () => this.once(request, signal, sink, budget), sink); } finally { release(); }
   }
 
-  private async once(request: ResponsesRequest, signal: AbortSignal | undefined, sink: OutputSink | undefined): Promise<ProxyOutput> {
+  private async once(request: ResponsesRequest, signal: AbortSignal | undefined, sink: OutputSink | undefined, budget: RetryBudget): Promise<ProxyOutput> {
     signal?.throwIfAborted();
     this.limits.assertAvailable(request.model);
     const started = performance.now();
-    const { body, byKey } = claudeRequest(request, this.replay);
+    const { body, byKey } = await claudeRequest(request, this.replay, signal);
     // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
     const idleMs = positiveInt('CLAUDE_TIMEOUT_MS', 300_000);
     const idle = new AbortController();
@@ -408,9 +414,9 @@ export class ClaudeAccount {
     touch();
     const content: JsonRecord[] = [];
     const usage: JsonRecord = {};
-    let stop = '', ended = false, firstTextMs = 0, failure: JsonRecord | undefined;
+    let stop = '', ended = false, firstTextMs: number | undefined, firstUsefulMs: number | undefined, failure: JsonRecord | undefined;
     try {
-      const response = await this.open(String(body.model), JSON.stringify(body), combined);
+      const response = await this.open(String(body.model), JSON.stringify(body), combined, budget);
       if (!response.body) throw new ProxyTransportError();
       const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
       await sseEvents(watched, event => {
@@ -420,7 +426,7 @@ export class ClaudeAccount {
         else if (event.type === 'content_block_start' && typeof event.index === 'number' && isRecord(event.content_block)) content[event.index] = { ...event.content_block, partial: '' };
         else if (event.type === 'content_block_delta' && block) {
           if (delta.type === 'text_delta' && typeof delta.text === 'string') {
-            firstTextMs ||= performance.now() - started;
+            firstTextMs ??= performance.now() - started; firstUsefulMs ??= performance.now() - started;
             block.text = String(block.text ?? '') + delta.text;
             sink?.text(delta.text);
           } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') block.partial += delta.partial_json;
@@ -433,6 +439,7 @@ export class ClaudeAccount {
           // A finished call goes to Codex now, so it starts running while Claude writes the next one.
           if (block.type === 'tool_use' && typeof block.name === 'string') {
             block.call = codexToolCall(byKey, block.name, String(block.partial || '{}'), typeof block.id === 'string' ? block.id : undefined);
+            firstUsefulMs ??= performance.now() - started;
             sink?.call?.(block.call as ToolCall);
           }
         } else if (event.type === 'message_delta') {
@@ -461,7 +468,7 @@ export class ClaudeAccount {
       else if (block.type === 'redacted_thinking') thinking.push({ type: 'redacted_thinking', data: block.data });
       else if (block.type === 'tool_use' && typeof block.name === 'string') {
         // A call cut off by the output limit is not runnable.
-        if (!block.done) throw new ClaudeError('Claude reached its output limit in the middle of a tool call; that call was not run', true);
+        if (!block.done) { if (stop === 'max_tokens' || stop === 'model_context_window_exceeded') continue; throw new ClaudeError('Claude stream ended in the middle of a tool call; that call was not run', true); }
         toolCalls.push(block.call as ToolCall);
       }
     }
@@ -470,8 +477,11 @@ export class ClaudeAccount {
     // The prompt the model held is uncached input plus cache writes and reads; Codex compacts on this number.
     const inputTokens = count('input_tokens') + count('cache_creation_input_tokens') + count('cache_read_input_tokens');
     const outputTokens = count('output_tokens');
-    logSafe('claude-turn', { model: String(body.model), ms: Math.round(performance.now() - started), first_text_ms: Math.round(firstTextMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: count('cache_read_input_tokens'), stop });
-    return { text: textOut, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+    logSafe('claude-turn', { model: String(body.model), ms: Math.round(performance.now() - started), first_text_ms: firstTextMs === undefined ? null : Math.round(firstTextMs), first_useful_ms: firstUsefulMs === undefined ? null : Math.round(firstUsefulMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: count('cache_read_input_tokens'), stop });
+    const status: Pick<ProxyOutput, 'status' | 'incompleteReason' | 'error'> = stop === 'model_context_window_exceeded'
+      ? { status: 'failed', error: { code: 'context_length_exceeded', message: 'Claude reached its context window; compact the conversation to continue.' } }
+      : stop === 'max_tokens' || stop === 'refusal' ? { status: 'incomplete', incompleteReason: stop === 'refusal' ? 'content_filter' : 'max_output_tokens' } : {};
+    return { text: textOut, toolCalls, ...status, finishReason: stop, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: count('cache_read_input_tokens'), ...(typeof usage.reasoning_tokens === 'number' ? { reasoningTokens: count('reasoning_tokens') } : {}) } };
   }
 
 

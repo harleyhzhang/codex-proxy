@@ -21,32 +21,32 @@ function png(width: number, height: number): Buffer {
   return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', header), chunk('IDAT', deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }
 
-test('an image within the limit passes through untouched', () => {
-  expect(fitImage('image/png', 'AAAA')).toEqual({ mediaType: 'image/png', data: 'AAAA' });
+test('an image within the limit passes through untouched', async () => {
+  expect(await fitImage('image/png', 'AAAA')).toEqual({ mediaType: 'image/png', data: 'AAAA' });
 });
 
-test('an oversized image is shrunk to the first size that fits, or left out with a note', () => {
+test('an oversized image is shrunk to the first size that fits, or left out with a note', async () => {
   const data = 'A'.repeat(400);
   const edges: number[] = [];
-  const fitted = fitImage('image/png', data, 100, (_bytes, edge) => { edges.push(edge); return new Uint8Array(edge === 1568 ? 60 : 300); });
+  const fitted = await fitImage('image/png', data, 100, (_bytes, edge) => { edges.push(edge); return new Uint8Array(edge === 1568 ? 60 : 300); });
   expect(edges).toEqual([2576, 1568]);
   expect(fitted).toMatchObject({ mediaType: 'image/jpeg' });
   expect('data' in fitted && fitted.data.length <= 100).toBe(true);
-  expect(fitImage('image/png', 'B'.repeat(400), 100, () => undefined)).toMatchObject({ omitted: expect.stringContaining('image omitted') });
+  expect(await fitImage('image/png', 'B'.repeat(400), 100, () => undefined)).toMatchObject({ omitted: expect.stringContaining('image omitted') });
 });
 
-test.if(process.platform === 'darwin')('sips really shrinks a large PNG to a JPEG Claude accepts', () => {
+test.if(process.platform === 'darwin')('sips really shrinks a large PNG to a JPEG Claude accepts', async () => {
   const data = png(3200, 2400).toString('base64');
-  const fitted = fitImage('image/png', data, data.length - 1);
+  const fitted = await fitImage('image/png', data, data.length - 1);
   expect(fitted).toMatchObject({ mediaType: 'image/jpeg' });
   const bytes = Buffer.from('data' in fitted ? fitted.data : '', 'base64');
   expect([bytes[0], bytes[1]]).toEqual([0xff, 0xd8]);
   expect(bytes.length).toBeLessThan(Buffer.from(data, 'base64').length);
 });
 
-test('Claude history carries a fitted image instead of an oversized one', () => {
+test('Claude history carries a fitted image instead of an oversized one', async () => {
   const huge = 'A'.repeat(IMAGE_FIT_BASE64_LIMIT + 4);
-  const turns = claudeMessages({ model: 'claude-opus-5-5', input: [
+  const turns = await claudeMessages({ model: 'claude-opus-5-5', input: [
     { role: 'user', content: [{ type: 'input_image', image_url: `data:image/png;base64,${huge}` }] },
   ] } as ResponsesRequest, name => name);
   const block = turns[0]!.content[0]!;

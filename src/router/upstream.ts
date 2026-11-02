@@ -3,7 +3,7 @@ import { nonNegativeInt } from '../env';
 import { isRecord } from '../json';
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
-import { reconnectTransport, sleep, transportError } from '../transport';
+import { reconnectTransport, retryDelayMs, sleep, transportError } from '../transport';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
@@ -151,9 +151,7 @@ export async function upstreamErrorDetail(response: Response): Promise<string> {
  * (codex-rs core/src/util.rs `backoff`), each delay jittered by 0.9-1.1 so concurrent turns do not
  * retry in lockstep.
  */
-export function retryDelayMs(baseDelayMs: number, attempt: number, random = Math.random): number {
-  return Math.floor(baseDelayMs * 2 ** attempt * (0.9 + 0.2 * random()));
-}
+export { retryDelayMs } from '../transport';
 
 /**
  * Native Codex retries 5xx responses and dropped connections 4 times with a 200ms doubling backoff

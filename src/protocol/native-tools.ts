@@ -45,7 +45,7 @@ function inputSchema(descriptor: ToolDescriptor): JsonRecord {
   const contract = isRecord(descriptor.contract) ? descriptor.contract : undefined;
   if (!contract) return { type: 'object', properties: {}, additionalProperties: true };
   const object = flattenUnion(contract);
-  return object.type === 'object' ? object : { ...object, type: 'object' };
+  return { ...(isRecord(contract.$defs) ? { $defs: contract.$defs } : {}), ...(isRecord(contract.definitions) ? { definitions: contract.definitions } : {}), ...object, type: 'object' };
 }
 
 const UNIONS = ['anyOf', 'oneOf', 'allOf'] as const;
@@ -56,29 +56,52 @@ const UNIONS = ['anyOf', 'oneOf', 'allOf'] as const;
  * them for allOf), and the alternatives kept verbatim in the description. Codex still checks the call
  * against the original contract.
  */
-function flattenUnion(contract: JsonRecord): JsonRecord {
-  if (!UNIONS.some(key => Array.isArray(contract[key]))) return contract;
-  const resolve = (schema: unknown): JsonRecord | undefined => {
-    if (!isRecord(schema) || typeof schema.$ref !== 'string' || !schema.$ref.startsWith('#/')) return isRecord(schema) ? schema : undefined;
-    let target: unknown = contract;
-    for (const part of schema.$ref.slice(2).split('/')) target = isRecord(target) ? target[part.replaceAll('~1', '/').replaceAll('~0', '~')] : undefined;
-    return isRecord(target) ? target : undefined;
+function flattenUnion(contract: JsonRecord, root = contract, seen = new Set<unknown>()): JsonRecord {
+  if (seen.has(contract) || seen.size > 64) return {};
+  const visited = new Set(seen).add(contract);
+  const resolve = (schema: unknown): JsonRecord => {
+    if (!isRecord(schema)) return {};
+    if (typeof schema.$ref !== 'string') return flattenUnion(schema, root, visited);
+    let target: unknown = root;
+    if (schema.$ref !== '#') {
+      if (!schema.$ref.startsWith('#/')) return {};
+      for (const part of schema.$ref.slice(2).split('/')) target = isRecord(target) ? target[part.replaceAll('~1', '/').replaceAll('~0', '~')] : undefined;
+    }
+    if (!isRecord(target)) return {};
+    const { $ref: _ref, ...siblings } = schema;
+    const resolved = flattenUnion(target, root, visited);
+    return Object.keys(siblings).length ? flattenUnion({ allOf: [resolved, siblings] }, root, visited) : resolved;
   };
+  if (!UNIONS.some(key => Array.isArray(contract[key])) && typeof contract.$ref !== 'string') return contract;
+  if (typeof contract.$ref === 'string') return resolve(contract);
   const requiredOf = (schema: JsonRecord) => Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === 'string') : [];
   const flat: JsonRecord = Object.fromEntries(Object.entries(contract).filter(([key]) => !(UNIONS as readonly string[]).includes(key)));
   const properties: JsonRecord = isRecord(contract.properties) ? { ...contract.properties } : {};
   const required = new Set(requiredOf(contract));
   const notes: string[] = [];
+  const combine = (key: 'anyOf' | 'allOf', schemas: unknown[]): unknown => {
+    const unique = [...new Map(schemas.map(schema => [JSON.stringify(schema), schema])).values()];
+    return unique.length === 1 ? unique[0] : { [key]: unique };
+  };
   for (const key of UNIONS) {
     if (!Array.isArray(contract[key])) continue;
-    const branches = (contract[key] as unknown[]).map(branch => resolve(branch)).filter((branch): branch is JsonRecord => !!branch).map(flattenUnion);
-    for (const branch of branches) if (isRecord(branch.properties)) for (const [name, schema] of Object.entries(branch.properties)) properties[name] ??= schema;
+    const branches = (contract[key] as unknown[]).map(resolve);
+    const names = new Set(branches.flatMap(branch => isRecord(branch.properties) ? Object.keys(branch.properties) : []));
+    for (const name of names) {
+      const schemas = branches.flatMap(branch => {
+        if (isRecord(branch.properties) && Object.hasOwn(branch.properties, name)) return [branch.properties[name]];
+        // An alternative permitting arbitrary properties must not narrow this field to another branch.
+        return key !== 'allOf' && branch.additionalProperties !== false ? [isRecord(branch.additionalProperties) ? branch.additionalProperties : {}] : [];
+      });
+      const merged = combine(key === 'allOf' ? 'allOf' : 'anyOf', schemas);
+      properties[name] = Object.hasOwn(properties, name) ? combine('allOf', [properties[name], merged]) : merged;
+    }
     if (key === 'allOf') for (const branch of branches) for (const name of requiredOf(branch)) required.add(name);
     else {
       const shared = branches.map(requiredOf).reduce<string[] | undefined>((common, list) => common ? common.filter(name => list.includes(name)) : list, undefined) ?? [];
       for (const name of shared) required.add(name);
-      notes.push(`Arguments must match ${key === 'oneOf' ? 'exactly one' : 'at least one'} of these schemas: ${JSON.stringify(contract[key])}`);
     }
+    notes.push(`Arguments must satisfy the original ${key} contract: ${JSON.stringify(contract[key])}`);
   }
   const description = [typeof contract.description === 'string' ? contract.description : '', ...notes].filter(Boolean).join('\n\n').slice(0, 8_192);
   delete flat.required; delete flat.description;

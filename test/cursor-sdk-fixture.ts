@@ -30,6 +30,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
     /** Each send's result before it is shaped; tests may replace it. */
     result: (_text: string, model: unknown, final: string): JsonRecord => ({ status: 'finished', result: final, model, usage: { inputTokens: 10, outputTokens: 2 } }),
     textChunks: (text: string): string[] => [text],
+    beforeToolText: '',
   };
   let next = 0;
   const record = (operation: string, fields: JsonRecord = {}) => events.push({ operation, ...fields });
@@ -69,6 +70,7 @@ export function scriptedSdk(options: { email?: string; userId?: string; models?:
             const delta = (update: JsonRecord) => onDelta?.({ update });
             const say = (value: string) => { for (const text of state.textChunks(value)) delta({ type: 'text-delta', text }); push({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: value }] } }); };
             const call = async (toolName: string, args: unknown): Promise<Result> => {
+              if (state.beforeToolText) say(state.beforeToolText);
               const toolCall = { type: 'mcp', args: { providerIdentifier: 'custom-user-tools', toolName, args } };
               delta({ type: 'tool-call-started', callId: `tc-${toolName}`, toolCall });
               push({ type: 'tool_call', name: 'mcp', status: 'running', args: toolCall.args });

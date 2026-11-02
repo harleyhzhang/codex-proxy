@@ -63,10 +63,16 @@ export type ResponsesBody = Partial<ResponsesRequest> & {
 
 export type ToolCall = { name: string; arguments: string; callId?: string };
 
-type Usage = { inputTokens: number; outputTokens: number; totalTokens: number };
+type Usage = { inputTokens: number; outputTokens: number; totalTokens: number; cachedTokens?: number; reasoningTokens?: number };
 
 /** What a subscription backend returns for one turn. */
-export type ProxyOutput = { text: string; toolCalls: ToolCall[]; usage: Usage };
+export type ProxyOutput = {
+  text: string; toolCalls: ToolCall[]; usage: Usage;
+  status?: 'completed' | 'incomplete' | 'failed';
+  error?: { code: string; message: string };
+  incompleteReason?: string;
+  finishReason?: string;
+};
 
 /**
  * Where a backend streams the turn it is running into Codex as it is written: assistant text, its
@@ -80,6 +86,8 @@ export type OutputSink = {
   reasoning?(delta: string): void;
   call?(call: ToolCall): void;
   readonly started: boolean;
+  /** Finalize and snapshot the exact ordered items exposed to the client, for continuation identity. */
+  snapshot?(): OutputItem[];
 };
 
 export type OutputItem = { type: string; id?: string; [key: string]: unknown };

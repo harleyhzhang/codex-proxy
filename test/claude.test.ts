@@ -62,7 +62,7 @@ test('Codex tools go out as Claude tools with the client identity; calls come ba
     { name: 'mcp__docs.search', arguments: '{"q":"boron"}', callId: 'toolu_2' },
   ]);
   // The prompt Claude held: uncached input plus cache writes and reads.
-  expect(output.usage).toEqual({ inputTokens: 125, outputTokens: 7, totalTokens: 132 });
+  expect(output.usage).toEqual({ inputTokens: 125, outputTokens: 7, totalTokens: 132, cachedTokens: 100 });
 });
 
 test('a forced tool choice turns thinking off; aliases resolve and unknown efforts are refused', async () => {
@@ -78,9 +78,9 @@ test('a forced tool choice turns thinking off; aliases resolve and unknown effor
   expect(estimateVisibleTokens('hello')).toBe(2);
 });
 
-test('history keeps its structure and every call is answered exactly once in the next turn', () => {
+test('history keeps its structure and every call is answered exactly once in the next turn', async () => {
   const keyFor = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, '_');
-  const turns = claudeMessages({ model: 'claude-opus-5-5', input: [
+  const turns = await claudeMessages({ model: 'claude-opus-5-5', input: [
     { type: 'function_call', call_id: 'orphan_first', name: 'exec_command', arguments: '{"cmd":"ls"}' },
     { role: 'developer', content: [{ type: 'input_text', text: 'House rules.' }] },
     { role: 'user', content: [{ type: 'input_text', text: 'Patch it' }, { type: 'input_image', image_url: 'data:image/png;base64,AAAA' }] },
@@ -269,8 +269,8 @@ test('a stream that fails before text gets one fresh attempt, never after text; 
     { type: 'content_block_delta', index: 0, delta: { type: 'input_json_delta', partial_json: '{"cmd":"rm -' } },
     { type: 'message_delta', delta: { stop_reason: 'max_tokens' }, usage: { output_tokens: 1 } }, { type: 'message_stop' },
   );
-  anthropic.state.replies.push(cutCall, cutCall);
-  await expect(claude.run(hello({ tools: TOOLS }))).rejects.toThrow('output limit in the middle of a tool call');
+  anthropic.state.replies.push(cutCall);
+  expect(await claude.run(hello({ tools: TOOLS }))).toMatchObject({ status: 'incomplete', incompleteReason: 'max_output_tokens', toolCalls: [] });
 });
 
 test('the login is read once and kept; a refused token re-reads the store and uses a new sign-in without refreshing', async () => {
@@ -296,8 +296,8 @@ test('a tool contract with a top-level anyOf, oneOf or allOf goes out as one obj
   ] }));
   const [pick, both] = (sent().tools as JsonRecord[]).map(tool => tool.input_schema as JsonRecord);
   for (const schema of [pick!, both!]) for (const key of ['anyOf', 'oneOf', 'allOf']) expect(schema[key]).toBeUndefined();
-  expect(pick).toMatchObject({ type: 'object', properties: { id: { type: 'string' }, mode: { type: 'string' }, url: { type: 'string' } }, required: ['mode'], $defs: union.$defs });
+  expect(pick).toMatchObject({ type: 'object', properties: { mode: { type: 'string' } }, required: ['mode'], $defs: union.$defs });
   expect(String(pick!.description)).toStartWith('Pick one.');
-  expect(String(pick!.description)).toContain('at least one of these schemas');
+  expect(String(pick!.description)).toContain('original anyOf contract');
   expect(both).toMatchObject({ type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a', 'b'] });
 });

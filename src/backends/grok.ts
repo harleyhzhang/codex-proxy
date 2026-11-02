@@ -12,6 +12,8 @@ import { imageUrl, isImagePart, requestTools, toolDescriptors, type ToolDescript
 import { sseEvents } from '../protocol/stream';
 import type { ProxyOutput, ResponsesRequest, StreamEvent, OutputSink, ToolCall } from '../protocol/types';
 import { abortable, ProxyTransportError, sleep } from '../transport';
+import { RetryBudget } from './retries';
+import { Admission } from './admission';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
 const MODEL = 'grok-4.7';
@@ -230,6 +232,7 @@ function refusal(status: number, detail: string, home: string): BackendError {
 }
 
 export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
+  const admission = new Admission('Grok', positiveInt('GROK_MAX_ACTIVE', 8), positiveInt('PROVIDER_MAX_QUEUED', 64));
   const baseUrl = options.baseUrl ?? 'https://cli-chat-proxy.grok.com/v1';
   const login = new GrokLogin(options.home, options.issuer ?? 'https://auth.x.ai');
   const replay = new ReasoningReplay();
@@ -255,22 +258,23 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
   }
 
   /** Opens the stream. Nothing has reached Codex yet, so each retry here is safe. */
-  async function open(body: string, signal: AbortSignal): Promise<Response> {
+  async function open(body: string, signal: AbortSignal, budget: RetryBudget): Promise<Response> {
     let token = await login.token(signal);
     let refreshed = false, upgraded = false;
     for (let attempt = 0; ; attempt++) {
+      budget.take();
       const response = await fetch(`${baseUrl}/responses`, { method: 'POST', headers: headers(token), body, signal });
       if (response.ok) return response;
       const detail = await errorDetail(response);
       logSafe('grok-http-refused', { status: response.status, attempt });
       if (response.status === 401 && !refreshed) { refreshed = true; token = await login.token(signal, token); continue; }
       if (response.status === 426 && !upgraded) { upgraded = true; if (await currentVersion()) continue; }
-      if (response.status >= 500 && response.status !== 503 && attempt < SERVER_RETRIES) { await sleep(200 * 2 ** attempt, signal); continue; }
+      if (response.status >= 500 && response.status !== 503 && attempt < SERVER_RETRIES && budget.remaining) { await sleep(budget.delay(response.headers), signal); continue; }
       throw refusal(response.status, detail, options.home);
     }
   }
 
-  async function run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+  async function run(request: ResponsesRequest, signal: AbortSignal | undefined, sink: OutputSink | undefined, budget: RetryBudget): Promise<ProxyOutput> {
     signal?.throwIfAborted();
     if (request.model !== MODEL) throw new GrokError('Unsupported Grok model');
     if (!(EFFORTS as readonly string[]).includes(request.reasoning?.effort ?? 'high')) throw new GrokError('Unsupported Grok reasoning effort');
@@ -283,19 +287,19 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
     const touch = () => { clearTimeout(timer); timer = setTimeout(() => idle.abort(new DOMException('Grok stream idle', 'TimeoutError')), idleMs); };
     const combined = signal ? AbortSignal.any([signal, idle.signal]) : idle.signal;
     touch();
-    let firstEventMs = 0, completed: JsonRecord | undefined, failed: StreamEvent | undefined;
+    let firstEventMs = 0, firstUsefulMs: number | undefined, completed: JsonRecord | undefined, failed: StreamEvent | undefined;
     try {
-      const response = await open(JSON.stringify(body), combined);
+      const response = await open(JSON.stringify(body), combined, budget);
       if (!response.body) throw new ProxyTransportError();
       const watched = new Response(response.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({ transform(chunk, controller) { touch(); controller.enqueue(chunk); } })));
       await sseEvents(watched, event => {
         firstEventMs ||= performance.now() - started;
-        if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') sink?.text(event.delta);
+        if (event.type === 'response.output_text.delta' && typeof event.delta === 'string') { firstUsefulMs ??= performance.now() - started; sink?.text(event.delta); }
         if (event.type === 'response.reasoning_summary_text.delta' && typeof event.delta === 'string') sink?.reasoning?.(event.delta);
         // A finished call goes to Codex now, so it starts running while Grok writes the next one.
         if (event.type === 'response.output_item.done' && isRecord(event.item) && event.item.type === 'function_call') {
           const call = grokOutput([event.item], byKey).toolCalls[0];
-          if (call) sink?.call?.(call);
+          if (call) { firstUsefulMs ??= performance.now() - started; sink?.call?.(call); }
         }
         if ((event.type === 'response.completed' || event.type === 'response.incomplete') && isRecord(event.response)) completed = event.response;
         if (event.type === 'response.failed' || event.type === 'error') failed = event;
@@ -316,8 +320,11 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
     const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : estimateVisibleTokens(JSON.stringify(body.input));
     const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : estimateVisibleTokens(text + JSON.stringify(toolCalls));
     const cached = isRecord(usage.input_tokens_details) && typeof usage.input_tokens_details.cached_tokens === 'number' ? usage.input_tokens_details.cached_tokens : 0;
-    logSafe('grok-turn', { ms: Math.round(performance.now() - started), first_event_ms: Math.round(firstEventMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: cached, status: String(completed.status ?? '') });
-    return { text, toolCalls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
+    logSafe('grok-turn', { ms: Math.round(performance.now() - started), first_event_ms: Math.round(firstEventMs), first_useful_ms: firstUsefulMs === undefined ? null : Math.round(firstUsefulMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: cached, status: String(completed.status ?? '') });
+    const incomplete = completed.status === 'incomplete';
+    const detail = isRecord(completed.incomplete_details) ? completed.incomplete_details : {};
+    const outputDetails = isRecord(usage.output_tokens_details) ? usage.output_tokens_details : {};
+    return { text, toolCalls, ...(incomplete ? { status: 'incomplete' as const, incompleteReason: typeof detail.reason === 'string' ? detail.reason : 'max_output_tokens' } : {}), usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cached, ...(typeof outputDetails.reasoning_tokens === 'number' ? { reasoningTokens: outputDetails.reasoning_tokens } : {}) } };
   }
 
   return {
@@ -328,7 +335,11 @@ export function createGrokBackend(options: GrokOptions): SubscriptionBackend {
       slug: MODEL, displayName: 'Grok 4.7', description: 'Grok 4.7 through your SuperGrok subscription',
       efforts: EFFORTS, defaultEffort: 'high', inputModalities: ['text', 'image'], contextWindow: 500_000,
     }],
-    run: (request, signal, sink) => retryOnce('Grok', signal, () => run(request, signal, sink), sink),
+    run: async (request, signal, sink) => {
+      const release = await admission.acquire(signal, Array.isArray(request.input) && request.input.at(-1)?.type?.endsWith('_output') ? 1 : 0);
+      const budget = new RetryBudget('Grok');
+      try { return await retryOnce('Grok', signal, () => run(request, signal, sink, budget), sink); } finally { release(); }
+    },
     // A chat opening refreshes the login ahead of its first turn.
     prewarm: () => { void login.token().catch(() => {}); },
   };

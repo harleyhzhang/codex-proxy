@@ -1,5 +1,6 @@
 // The router Codex talks to. GPT requests go to ChatGPT unchanged; subscription models run
 // locally. Both share one conversation, so chats can switch model mid-thread.
+import { streamBufferBytes, SlowConsumerError } from '../protocol/buffer';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { ServerWebSocket } from 'bun';
@@ -14,6 +15,7 @@ import { pendingEnvelope, pendingRelay, pendingResponse, pendingStream, startHea
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
+import { upstreamAdmission } from './admission';
 import { NativeAuth } from './auth';
 import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages } from './bridge';
@@ -160,8 +162,10 @@ export function startRouter(options: RouterOptions) {
   const history = new HistoryCache();
   const base: UpstreamFetch = options.upstreamFetch ?? ((url, init) => fetch(url, init));
   const account = options.secondaryAccount ? new AccountUpstream(options.secondaryAccount, base) : undefined;
+  const admit = upstreamAdmission();
   const withPolicy = (transport: UpstreamFetch): UpstreamFetch => {
-    const routed = account ? account.withTransport(transport) : transport;
+    const bounded = admit(transport);
+    const routed = account ? account.withTransport(bounded) : bounded;
     return options.primaryStandard ? standardPrimaryFetch(routed) : routed;
   };
   const upstreamFetch = withPolicy(base);
@@ -192,7 +196,7 @@ export function startRouter(options: RouterOptions) {
   };
 
   /** Validates routing, expands history and makes GPT-only content readable for the target model. */
-  async function normalize(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
+  async function normalizeBody(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
     const body = raw as ResponsesBody;
     assertRoutable(body.model);
     if (options.secondaryAccount && !isLocalModel(body.model)) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
@@ -211,6 +215,12 @@ export function startRouter(options: RouterOptions) {
       expanded = { ...expanded, input: await restoreAgentMessages(expanded.input, bridge) };
     }
     return codec.unwrap(expanded, local, bridge && ((encrypted) => bridge.summary(encrypted)));
+  }
+
+  async function normalize(raw: JsonRecord, headers: Headers): Promise<ResponsesBody> {
+    const started = performance.now();
+    try { return await normalizeBody(raw, headers); }
+    finally { logSafe('request-normalized', { ms: Math.round(performance.now() - started), local: isLocalModel(raw.model) }); }
   }
 
   /** Produces a compaction item: a sealed capsule holding the summary and verbatim requests. */
@@ -392,7 +402,13 @@ export function startRouter(options: RouterOptions) {
   async function handleSocketMessage(ws: ServerWebSocket<SocketData>, data: string | Buffer): Promise<void> {
     const send = (event: unknown) => {
       if (isRecord(event) && event.type === 'response.created' && isRecord(event.response) && typeof event.response.id === 'string') ws.data.responseId = event.response.id;
-      ws.send(JSON.stringify(event));
+      const bytes = JSON.stringify(event);
+      if (ws.getBufferedAmount() + Buffer.byteLength(bytes) > streamBufferBytes()) {
+        const error = new SlowConsumerError();
+        ws.data.abort?.abort(error); ws.data.upstream?.close(); ws.close(1013, 'client output buffer full');
+        logSafe('slow-consumer', { transport: 'websocket' }); throw error;
+      }
+      ws.send(bytes);
     };
     // Codex steers a running turn with `response.interrupt` (InstantInterrupt): stop that turn,
     // finish it as `response.incomplete`, and acknowledge. A turn that already finished is still
@@ -559,7 +575,7 @@ export function startRouter(options: RouterOptions) {
     }
   }
 
-  return Bun.serve<SocketData>({
+  const server = Bun.serve<SocketData>({
     hostname: '127.0.0.1',
     port: options.port,
     idleTimeout: 255,
@@ -582,6 +598,8 @@ export function startRouter(options: RouterOptions) {
     websocket: {
       // Bun otherwise closes full-history replays above its 16 MiB default before our handler.
       maxPayloadLength: MAX_BODY_BYTES,
+      backpressureLimit: streamBufferBytes(),
+      closeOnBackpressureLimit: true,
       message: handleSocketMessage,
       close(ws) {
         ws.data.abort?.abort();
@@ -589,4 +607,7 @@ export function startRouter(options: RouterOptions) {
       },
     },
   });
+  const stop = server.stop.bind(server);
+  server.stop = closeActiveConnections => { history.close(); return stop(closeActiveConnections); };
+  return server;
 }

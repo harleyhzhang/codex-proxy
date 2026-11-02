@@ -16,6 +16,7 @@ import { imageUrl, isImagePart, preparePrompt, requestToPrompt, requestTools, to
 import type { OutputSink, ProxyOutput, ResponsesRequest } from '../protocol/types';
 import { abortable, ProxyTransportError, transportError } from '../transport';
 import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, estimateVisibleTokens, retryOnce, type SubscriptionBackend } from './contract';
+import { Admission } from './admission';
 import { CUSTOM_TOOLS_PROVIDER, NativeRun, nativeToolList, toolResult, type ToolResult } from './cursor-native';
 
 const CURSOR_MODELS = {
@@ -238,6 +239,7 @@ process.once('exit', () => {
 });
 
 class CursorRuntime {
+  private readonly admission = new Admission('Cursor', positiveInt('CURSOR_MAX_ACTIVE', 8), positiveInt('PROVIDER_MAX_QUEUED', 64));
   private readonly heldRuns = new Map<string, RunSession>();
   private readonly sessions = new Set<RunSession>();
   private readonly spares = new Map<string, Promise<Spare>>();
@@ -285,6 +287,7 @@ class CursorRuntime {
 
   /** The ready agent for this login, created ahead of its turn. */
   private spare(key: string): Promise<Spare> {
+    for (const stale of this.spares.keys()) if (stale !== key) { const old = this.spares.get(stale)!; this.spares.delete(stale); void old.then(value => this.dispose(value), () => {}); }
     let spare = this.spares.get(key);
     if (!spare) {
       spare = this.createAgent(key);
@@ -319,6 +322,11 @@ class CursorRuntime {
    * issued its calls (they go to Codex) or the run finishes.
    */
   async run(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
+    const release = await this.admission.acquire(signal, Array.isArray(request.input) && request.input.some(item => item.call_id && this.heldRuns.has(item.call_id)) ? 1 : 0);
+    try { return await this.admittedRun(request, signal, sink); } finally { release(); }
+  }
+
+  private async admittedRun(request: ResponsesRequest, signal?: AbortSignal, sink?: OutputSink): Promise<ProxyOutput> {
     const started = performance.now();
     const sanitized = sanitizeCursorInput(request.input);
     if (sanitized.dropped || sanitized.replaced) logSafe('cursor-input-sanitized', { dropped: sanitized.dropped, replaced: sanitized.replaced });
@@ -329,6 +337,17 @@ class CursorRuntime {
     const combined = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     const idleMs = positiveInt('CURSOR_TIMEOUT_MS', 300_000);
     let session: RunSession | undefined, timedOut = false, setupMs = 0, calls = 0, success = false;
+    let firstUsefulMs: number | undefined;
+    if (sink) {
+      const original = sink;
+      sink = {
+        get started() { return original.started; },
+        snapshot: original.snapshot?.bind(original),
+        text(delta) { if (delta) firstUsefulMs ??= performance.now() - started; original.text(delta); },
+        call(call) { firstUsefulMs ??= performance.now() - started; original.call?.(call); },
+        reasoning: original.reasoning?.bind(original),
+      };
+    }
     const continuation = this.continuation(request, signature);
     // Silence is measured from the request start until the run streams, so a hung setup is cut too.
     const idle = setInterval(() => { if (performance.now() - (session?.lastEvent ?? started) > idleMs) { timedOut = true; controller.abort(); } }, Math.min(1000, idleMs));
@@ -348,8 +367,10 @@ class CursorRuntime {
       calls = step.calls.length;
       const inputTokens = Math.max(estimateVisibleTokens(requestToPrompt(request)), usageTokens(step.usage)?.input ?? 0);
       const outputTokens = Math.max(estimateVisibleTokens(step.text + JSON.stringify(step.calls)), usageTokens(step.usage)?.output ?? 0);
-      const output: ProxyOutput = { text: step.text, toolCalls: step.calls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens } };
-      if (step.calls.length && Array.isArray(request.input)) this.holdRun(session, request, output, signature);
+      const cachedTokens = typeof step.usage?.cacheReadTokens === 'number' ? step.usage.cacheReadTokens : undefined;
+      const reasoningTokens = typeof step.usage?.reasoningTokens === 'number' ? step.usage.reasoningTokens : undefined;
+      const output: ProxyOutput = { text: step.text, toolCalls: step.calls, usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens, ...(cachedTokens === undefined ? {} : { cachedTokens }), ...(reasoningTokens === undefined ? {} : { reasoningTokens }) } };
+      if (step.calls.length && Array.isArray(request.input)) this.holdRun(session, request, output, signature, sink);
       else void this.endRun(session, 'Cursor turn finished');
       success = true;
       return output;
@@ -359,7 +380,7 @@ class CursorRuntime {
       throw error;
     } finally {
       clearInterval(idle);
-      logSafe('cursor-turn', { model: request.model, continued: !!continuation, success, calls, setup_ms: Math.round(setupMs), elapsed_ms: Math.round(performance.now() - started) });
+      logSafe('cursor-turn', { model: request.model, continued: !!continuation, success, calls, setup_ms: Math.round(setupMs), elapsed_ms: Math.round(performance.now() - started), first_useful_ms: firstUsefulMs === undefined ? null : Math.round(firstUsefulMs) });
     }
   }
 
@@ -371,7 +392,7 @@ class CursorRuntime {
       const callId = request.input[index]?.call_id;
       if (callId) session = this.heldRuns.get(callId);
     }
-    if (!session) return undefined;
+    if (!session) { logSafe('cursor-continuation-miss', { reason: 'no-held-call' }); return undefined; }
     // A rotated or unreadable credential never continues a run started under another login.
     let key: string | undefined;
     try { key = readCursorKey(this.options); } catch (error) { void this.endRun(session, 'The Cursor credential changed'); throw error; }
@@ -382,7 +403,7 @@ class CursorRuntime {
       && historyHash(request.input.slice(0, session.historyLength)) === session.historyHash;
     if (!matches) {
       // A changed history, a tool search (new tools) or a user message mid-run: replay instead.
-      logSafe('cursor-replay', { signature: session.signature === signature, answers });
+      logSafe('cursor-replay', { signature: session.signature === signature, answers, reason: key !== session.key ? 'credential' : session.signature !== signature ? 'signature' : !answers ? 'results-or-interjection' : 'history' });
       void this.endRun(session, 'The conversation changed; this run was replaced');
       return undefined;
     }
@@ -469,21 +490,25 @@ class CursorRuntime {
   }
 
   /** Keeps the run until Codex returns these calls' results, or the session expires. */
-  private holdRun(session: RunSession, request: ResponsesRequest, output: ProxyOutput, signature: string): void {
-    const prior = [...(request.input as unknown[]), ...responseObject(request, output).output];
+  private holdRun(session: RunSession, request: ResponsesRequest, output: ProxyOutput, signature: string, sink?: OutputSink): void {
+    // Streaming may interleave text/calls. Reconstructing all text before all calls changes both
+    // the prefix and item count. Use the client-visible sequence, sanitized just like the next input.
+    const rendered = sink?.snapshot?.() ?? responseObject(request, output).output;
+    const prior = sanitizeCursorInput([...(request.input as unknown[]), ...rendered]).input as unknown[];
     session.signature = signature;
     session.historyHash = historyHash(prior);
     session.historyLength = prior.length;
     session.heldSince = Date.now();
     for (const call of output.toolCalls) if (call.callId) this.heldRuns.set(call.callId, session);
+    void this.reclaimHeld(0);
     session.expiry = setTimeout(() => void this.endRun(session, 'Codex did not return the tool results in time'), positiveInt('CURSOR_SESSION_IDLE_MS', 900_000));
     session.expiry.unref?.();
   }
 
   /** Held runs wait on Codex; past the cap, the one waiting longest is ended and replays if continued. */
-  private async reclaimHeld(): Promise<void> {
+  private async reclaimHeld(incoming = 1): Promise<void> {
     const held = [...new Set(this.heldRuns.values())].filter(session => session.heldSince !== undefined && !session.ended);
-    if (held.length < positiveInt('CURSOR_MAX_HELD_RUNS', 16)) return;
+    if (held.length + incoming <= positiveInt('CURSOR_MAX_HELD_RUNS', 16)) return;
     const oldest = held.reduce((a, b) => (a.heldSince! <= b.heldSince! ? a : b));
     logSafe('cursor-reclaimed', { held: held.length, held_ms: Date.now() - oldest.heldSince! });
     await this.endRun(oldest, 'Too many Cursor runs were waiting on Codex; this run will be replayed if continued');

@@ -96,7 +96,7 @@ test('Codex tools go out as function tools and history keeps its shape; calls co
     { name: 'apply_patch', arguments: '*** Begin Patch\n*** End Patch', callId: 'call_x1' },
     { name: 'mcp__docs.search', arguments: '{"q":"boron"}', callId: 'call_x2' },
   ]);
-  expect(output.usage).toEqual({ inputTokens: 40, outputTokens: 5, totalTokens: 45 });
+  expect(output.usage).toEqual({ inputTokens: 40, outputTokens: 5, totalTokens: 45, cachedTokens: 32 });
   // The router renders them as Codex's own item types.
   expect(responseObject(request, output).output.map(item => [item.type, item.name ?? null, item.namespace ?? null])).toEqual([
     ['message', null, null], ['custom_tool_call', 'apply_patch', null], ['function_call', 'search', 'mcp__docs'],
@@ -220,4 +220,18 @@ test('Grok asks for a reasoning summary; it streams as thinking and each finishe
   expect(responses()[0]!.body.reasoning).toEqual({ effort: 'high', summary: 'auto' });
   expect(seen).toEqual(['thinking:Checking.', 'call:apply_patch:*** Begin Patch:call_g1']);
   expect(output.toolCalls).toEqual([{ name: 'apply_patch', arguments: '*** Begin Patch', callId: 'call_g1' }]);
+});
+
+
+test('Grok incomplete status and cache/reasoning usage survive the response adapter', async () => {
+  replies.push(() => sse({ type: 'response.incomplete', response: {
+    status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [say('partial')],
+    usage: { input_tokens: 40, output_tokens: 7, input_tokens_details: { cached_tokens: 32 }, output_tokens_details: { reasoning_tokens: 3 } },
+  } }));
+  const request = hello();
+  const wire = responseObject(request, await backend(login(3_600_000)).run(request));
+  expect(wire.status).toBe('incomplete');
+  expect(wire.incomplete_details).toEqual({ reason: 'max_output_tokens' });
+  expect(wire.usage?.input_tokens_details?.cached_tokens).toBe(32);
+  expect(wire.usage?.output_tokens_details?.reasoning_tokens).toBe(3);
 });

@@ -1,4 +1,5 @@
 // Opt-in native GPT WebSocket transport. Account/speed wrappers still own all request policy.
+import { enqueueBounded, byteStrategy } from '../protocol/buffer';
 import { isRecord, type JsonRecord } from '../json';
 import { logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
@@ -207,7 +208,7 @@ export class UpstreamSession {
         try { session.write(session.active); } catch (error) { session.reset(error); }
       },
       cancel(reason) { session.reset(reason ?? new ProxyTransportError()); },
-    });
+    }, byteStrategy());
     const response = new Response(stream, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
     if (this.active) this.active.response = response;
     return headers;
@@ -295,9 +296,9 @@ export class UpstreamSession {
   private publish(active: Active, frame?: Uint8Array): void {
     clearTimeout(active.provisionalTimer); active.provisionalTimer = undefined;
     if (!active.headersSettled) { active.headersSettled = true; active.resolveHeaders(active.response!); }
-    for (const pending of active.provisional) active.out.enqueue(pending);
+    for (const pending of active.provisional) enqueueBounded(active.out, pending, error => this.reset(error));
     active.provisional = []; active.provisionalBytes = 0; active.published = true;
-    if (frame) active.out.enqueue(frame);
+    if (frame) enqueueBounded(active.out, frame, error => this.reset(error));
   }
 
   private finish(error?: unknown): void {

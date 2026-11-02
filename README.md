@@ -126,7 +126,7 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 | Malformed request body / unknown model | 400, not retried | 400, not retried |
 | Subscription refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
 | Prompt over the model's context window | `context_length_exceeded`, not retried | a Claude, Grok or Cursor "prompt is too long" becomes the same native `context_length_exceeded` code, so Codex stops retrying and offers compaction |
-| Provider 5xx (Claude, Grok) | retried 4x, 200 ms doubling | same burst before anything streams; a lasting one reaches Codex as a retryable `server_error` |
+| Provider 5xx (Claude, Grok) | retried 4x, 200 ms doubling | at most five HTTP attempts per router request, shared with fresh stream retries; jittered backoff honors bounded `Retry-After` hints; exhaustion is terminal so native retries do not multiply the budget |
 | Provider overloaded | `server_is_overloaded`, not retried | a Claude or Grok overload (529) that outlasts that burst becomes native `server_is_overloaded` |
 | Subscription network drop (Claude, Grok, Cursor) | n/a | same pending loop as above; see Connection recovery |
 
@@ -317,6 +317,34 @@ supplier chain. This policy consumes the Cursor account's existing allowance
 and obeys its server-side billing limits; it does not establish an included-only
 billing guarantee or change spending settings.
 
+## Resource bounds and response fidelity
+
+Each configured account admits up to eight active model turns and queues at most 64 more.
+Tool-result continuations take priority over fresh turns. Queued turns can be cancelled; a full
+queue reports overload. Cursor releases its active permit when it yields tools, so a held callback
+never blocks its own continuation. Native GPT's permit lasts until its response body ends or is
+cancelled, and primary and secondary accounts have separate gates. These limits bound local work;
+they do not change provider quota or billing settings.
+
+History retention conservatively charges each entry's complete input and output toward a 512-MiB
+payload allowance (512 entries, 12-hour expiry with idle sweeps). Shared prefixes may be charged
+more than once; evicting one entry cannot leave uncharged history behind. An evicted continuation
+asks Codex to resend the full history. Cursor's continuation signature uses the actual streamed
+message/tool order, including text between parallel calls, rather than rearranging it on replay.
+
+SSE and WebSocket outgoing buffers are bounded by bytes. A client that cannot consume output within
+the allowance is explicitly disconnected and its generation cancelled; executable events are never
+silently discarded. Direct Claude screenshot fitting runs asynchronously, with two conversions at
+once, shared in-flight work and a byte-bounded LRU. Cancelling every waiter stops the conversion.
+
+Provider output limits/refusals retain incomplete status and details. Claude reaching its context
+window reports native `context_length_exceeded`; a paused turn retains `end_turn: false`. Useful
+partial compaction summaries still follow the existing compaction policy. Real cache-read and
+available reasoning-token counts reach Codex. Content-free diagnostics include `first_useful_ms`
+(text or a completed tool call), `request-normalized`, `provider-admission` queue time,
+`provider-retry` attempts/delays, and structured `cursor-replay` reasons. Missing timing is null,
+not a zero-duration text sample from a tool-only turn. No prompt or response content is recorded.
+
 ## Configuration
 
 Everything has a default; set only what you need.
@@ -328,6 +356,10 @@ Everything has a default; set only what you need.
 | `PROXY_STATE_DIR` | `~/.codex-subscription-proxy` | Catalog and summary key |
 | `CATALOG_FILE` | `$PROXY_STATE_DIR/models.json` | Model catalog served to Codex |
 | `SUMMARY_KEY_FILE` | `$PROXY_STATE_DIR/summary.key` | 32-byte key for compaction capsules, created on first start |
+| `GPT_MAX_ACTIVE`, `CLAUDE_MAX_ACTIVE`, `GROK_MAX_ACTIVE`, `CURSOR_MAX_ACTIVE` | `8` | Maximum active turns per account/provider; continuations have queue priority |
+| `PROVIDER_MAX_QUEUED` | `64` | Maximum queued turns per account before reporting overload |
+| `STREAM_BUFFER_BYTES` | `33554432` | Maximum queued output bytes per SSE/WebSocket client, including complete event frames |
+| `IMAGE_CACHE_BYTES` | `67108864` | Maximum retained fitted-image bytes (also capped at 64 entries) |
 | `UPSTREAM_TIMEOUT_MS` | `900000` | Timeout for requests to `chatgpt.com` |
 | `BRIDGE_MODELS` | `gpt-6.1-sol,gpt-6-sol,gpt-6-astra` | GPT models allowed to summarise Claude/Grok history |
 | `ACCOUNT_CODEX_HOME` | unset | Isolated secondary native Codex profile; enables account aliases |

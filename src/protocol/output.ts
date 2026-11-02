@@ -92,19 +92,20 @@ export function responseObject(request: RequestShape, output: ProxyOutput): Resp
     id: randomId('resp'),
     object: 'response',
     created_at: Math.floor(Date.now() / 1000),
-    status: 'completed',
-    error: null,
-    incomplete_details: null,
+    status: output.status ?? 'completed',
+    error: output.error ?? null,
+    incomplete_details: output.status === 'incomplete' ? { reason: output.incompleteReason ?? 'max_output_tokens' } : null,
     model: request.model,
+    ...(output.finishReason ? { finish_reason: output.finishReason, ...(output.finishReason === 'pause_turn' ? { end_turn: false } : {}) } : {}),
     output: outputItems(request, output),
     parallel_tool_calls: true,
     tool_choice: request.tool_choice ?? 'auto',
     tools: request.tools ?? [],
     usage: {
       input_tokens: output.usage.inputTokens,
-      input_tokens_details: { cached_tokens: 0 },
+      input_tokens_details: { cached_tokens: output.usage.cachedTokens ?? 0 },
       output_tokens: output.usage.outputTokens,
-      output_tokens_details: { reasoning_tokens: 0 },
+      output_tokens_details: { reasoning_tokens: output.usage.reasoningTokens ?? 0 },
       total_tokens: output.usage.totalTokens,
     },
   };
@@ -145,7 +146,7 @@ function* responseEvents(response: ResponseObject): Generator<StreamEvent> {
   for (const [output_index, item] of response.output.entries()) {
     for (const event of itemEvents(item, output_index)) yield numbered(event);
   }
-  yield numbered({ type: response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
+  yield numbered({ type: response.status === 'failed' ? 'response.failed' : response.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response });
 }
 
 /** Encodes the shared Responses event sequence for an HTTP client. */

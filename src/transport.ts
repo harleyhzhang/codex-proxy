@@ -73,7 +73,18 @@ export function failureStream(event: unknown): Response {
 
 /** Waits `ms`, or rejects with the signal's reason as soon as it aborts. */
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return abortable(new Promise<void>(resolve => { const timer = setTimeout(resolve, ms); signal?.addEventListener('abort', () => clearTimeout(timer), { once: true }); }), signal);
+  signal?.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const cleanup = () => signal?.removeEventListener('abort', abort);
+    const timer = setTimeout(() => { cleanup(); resolve(); }, ms);
+    const abort = () => { clearTimeout(timer); cleanup(); reject(signal?.reason); };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+/** Jittered exponential delay shared by native HTTP and direct subscription providers. */
+export function retryDelayMs(baseDelayMs: number, attempt: number, random = Math.random): number {
+  return Math.floor(baseDelayMs * 2 ** attempt * (0.9 + 0.2 * random()));
 }
 
 /**
