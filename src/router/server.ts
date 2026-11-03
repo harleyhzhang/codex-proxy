@@ -235,7 +235,7 @@ export function startRouter(options: RouterOptions) {
       const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
       const upstream = await watchBody(offline
         ? connectUpstream(upstreamFetch, '/responses', forwarded, clean, idle, signal, offline)
-        : postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal), idle);
+        : postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal, idle.touch), idle);
       if (!upstream.ok) {
         const { detail, fields } = await upstreamFailure(upstream);
         log.warn('compact-upstream', { status: upstream.status, detail_chars: detail.length });
@@ -323,7 +323,7 @@ export function startRouter(options: RouterOptions) {
       const idle = idleDeadline(req.signal, timeoutMs);
       const upstreamPath = path.slice(3);
       try {
-        return relay(observeResponse(await watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal), idle), response => history.remember(body, response)));
+        return relay(observeResponse(await watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal, idle.touch), idle), response => history.remember(body, response)));
       } catch (error) {
         // Offline before any upstream byte: keep this request pending with progress frames instead of
         // spending one of Codex's five stream reconnects on every outage retry. The first attempt

@@ -96,6 +96,22 @@ Authentication, quota and validation errors still fail promptly. Known gap: the 
 bridge used by `bridgeFor` still has only the finite native retry burst. Reload a running proxy
 after updating its source.
 
+### Model capacity
+
+GPT capacity errors (`server_is_overloaded`) get one recovery window of up to 120 seconds,
+on HTTP, SSE, native WebSockets and compaction. The router retries the same model/account
+and request with jittered 1–15 second backoff, honoring `Retry-After` without shortening it.
+A hint beyond the remaining window ends recovery instead of retrying early. Ordinary
+5xx, quota, authentication, context and policy errors keep their existing handling.
+
+Recovery discards empty scaffolding from failed attempts. Once retrying, it exposes one stable
+response id and progress events, so Stop still works during backoff. Successful item/call ids
+and all prior tool receipts are preserved. The next native WebSocket continuation may replay
+full history once because the logical recovery id differs from the upstream connection id.
+The router never replays an inference after exposing text, reasoning or a tool event; unknown
+events and more than 1 MiB of buffered metadata also commit the current attempt. A lasting
+overload keeps its native classification. No automatic model/account fallback is enabled.
+
 ## Compaction and task continuation
 
 The router's summarization request is internal maintenance, not a new user task. Its tool-free,
@@ -115,13 +131,14 @@ retried, 429 not), `codex-rs/codex-api/src/sse/responses.rs` (unparseable frames
 
 | Situation | Native Codex | This router |
 | --- | --- | --- |
-| OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling, ±10% jitter | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); covers turns, compaction and bridge calls |
+| OpenAI 5xx (500/502/503/507…) | retried 4x, 200 ms doubling, ±10% jitter | same (`UPSTREAM_5XX_RETRIES`, `UPSTREAM_RETRY_BASE_MS`); explicit capacity errors use the separate recovery window below |
 | Dropped socket to OpenAI | retried 4x, then the stream reconnect budget (5) | same 4x burst, then streams and WebSocket turns stay pending with progress events and 1–30 s backoff until the network returns or Codex cancels; plain JSON gets a 503; timeouts are not retried (Codex owns that budget) |
 | OpenAI 4xx incl. 429 | not retried, status surfaced | relayed once with the real status and body |
 | Lasting 5xx | surfaced with real status | surfaced with real status as `server_error`, never masked as 400 |
 | Unparseable SSE frame | skipped, stream continues | skipped (`sse-frame-skipped` log) |
 | Stream ends without terminal event | retryable stream error | WebSocket: retryable `server_error`; HTTP: raw relay so Codex detects it |
-| Upstream `response.failed` | classified by code | forwarded verbatim so Codex classifies it |
+| Upstream `response.failed` | classified by code | capacity before exposed output gets the same-model recovery window; other failures and exhausted recovery preserve native classification |
+| GPT capacity / overload | `server_is_overloaded`, not retried | up to 120 s of cancellable same-model/account recovery before output; honors `Retry-After`, sends progress, retains prior tool receipts |
 | Internal router/backend crash | retryable | `server_error` 500 on every transport; diagnostic never leaked |
 | Malformed request body / unknown model | 400, not retried | 400, not retried |
 | Subscription refusal, auth, quota | n/a | terminal `invalid_prompt` with the backend's own message (a ChatGPT-shaped 429 would make Codex hide which model is capped) |
@@ -388,6 +405,9 @@ Everything has a default; set only what you need.
 | `STREAM_BUFFER_BYTES` | `33554432` | Maximum queued output bytes per SSE/WebSocket client, including complete event frames |
 | `IMAGE_CACHE_BYTES` | `67108864` | Maximum retained fitted-image bytes (also capped at 64 entries) |
 | `UPSTREAM_TIMEOUT_MS` | `900000` | Timeout for requests to `chatgpt.com` |
+| `UPSTREAM_CAPACITY_RECOVERY_MS` | `120000` | Recovery window from the first GPT overload; `0` prevents capacity retries |
+| `UPSTREAM_CAPACITY_RETRY_BASE_MS` | `1000` | Initial GPT capacity retry delay, doubled with jitter up to 15 s |
+| `UPSTREAM_CAPACITY_HEARTBEAT_MS` | `10000` | Progress cadence while holding GPT metadata or recovering capacity |
 | `BRIDGE_MODELS` | `gpt-6.1-sol,gpt-6-sol,gpt-6-astra` | GPT models allowed to summarise Claude/Grok history |
 | `ACCOUNT_CODEX_HOME` | unset | Isolated secondary native Codex profile; enables account aliases |
 | `ACCOUNT_CODEX_BINARY` | `codex` | Native Codex executable for cache retrieval and token renewal |

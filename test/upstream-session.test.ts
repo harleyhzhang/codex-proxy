@@ -7,7 +7,7 @@ import { isRecord, type JsonRecord } from '../src/json';
 import { sseEvents } from '../src/protocol/stream';
 import { ProxyTransportError } from '../src/transport';
 import { UpstreamSession } from '../src/router/upstream-session';
-import { UpstreamStatusError, withoutItemId } from '../src/router/upstream';
+import { postJson, UpstreamStatusError, withoutItemId } from '../src/router/upstream';
 import { AccountUpstream } from '../src/router/account-upstream';
 
 const target = 'https://chatgpt.com/backend-api/codex/responses';
@@ -51,6 +51,31 @@ function fixture(handle: (peer: Peer, request: JsonRecord, count: number) => voi
   };
   return { socket, messages, handshakes, closed, get opens() { return opens; }, get closes() { return closes; }, close() { server.stop(true); } };
 }
+
+test('capacity recovery survives native WebSocket metadata publication and replays only the current inference', async () => {
+  const savedBase = process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS;
+  process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = '1';
+  const app = fixture((peer, _request, count) => {
+    if (count !== 1) { complete(peer, 'recovered', 'RECOVERED'); return; }
+    emit(peer, { type: 'response.created', response: { id: 'discarded', output: [] } });
+    setTimeout(() => emit(peer, { type: 'response.failed', response: { id: 'discarded', status: 'failed', error: { code: 'server_is_overloaded' } } }), 20);
+  });
+  const session = new UpstreamSession({ enabled: true, socket: app.socket, maxProvisionalMs: 2, fallback: async () => { throw new Error('unexpected HTTP fallback'); } });
+  const request = { model: 'gpt-6.1-sol', stream: true, input: [user('install'), { type: 'function_call_output', call_id: 'completed-install', output: 'already installed' }] };
+  try {
+    const events = await collect(await postJson(session.fetch, '/responses', new Headers(), request, AbortSignal.timeout(5_000)));
+    expect(JSON.stringify(events)).toContain('RECOVERED');
+    expect(JSON.stringify(events)).not.toContain('discarded');
+    expect(app.messages).toHaveLength(2);
+    expect(app.messages[1].input).toEqual(request.input);
+    expect(app.messages[1].model).toBe(request.model);
+    expect(app.messages[1]).not.toHaveProperty('previous_response_id');
+    expect(app.opens).toBe(1);
+  } finally {
+    session.close(); app.close();
+    if (savedBase === undefined) delete process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS; else process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = savedBase;
+  }
+});
 
 test('native upstream sessions are disabled by default and preserve the HTTP initializer exactly', async () => {
   const request = init([user('synthetic')]);

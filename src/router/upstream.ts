@@ -4,6 +4,7 @@ import { isRecord } from '../json';
 import { logSafe } from '../log';
 import type { ResponsesBody, StreamEvent } from '../protocol/types';
 import { reconnectTransport, retryDelayMs, sleep, transportError } from '../transport';
+import { inspectCapacity, isCapacityResponse, recoverCapacity } from './capacity';
 
 export const UPSTREAM_URL = 'https://chatgpt.com/backend-api/codex';
 
@@ -156,25 +157,32 @@ export async function postJson(
   headers: Headers,
   body: ResponsesBody,
   signal: AbortSignal,
+  progress?: () => void,
 ): Promise<Response> {
-  const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(withoutItemIds(body)), signal, redirect: 'error' };
+  const init: RequestInit = { method: 'POST', headers, body: JSON.stringify(withoutItemIds(body)), redirect: 'error' };
   const retries = nonNegativeInt('UPSTREAM_5XX_RETRIES', 4);
   const baseDelayMs = nonNegativeInt('UPSTREAM_RETRY_BASE_MS', 200);
-  for (let attempt = 0; ; attempt++) {
-    let response: Response;
-    try { response = await upstreamFetch(UPSTREAM_URL + path, init); }
-    catch (error) {
-      const network = transportError(error);
-      if (!network || network.timedOut || attempt >= retries || signal.aborted) throw error;
-      logSafe('upstream-retry', { path, status: 0, attempt: attempt + 1 });
+  return recoverCapacity(async signal => {
+    const attemptInit = { ...init, signal };
+    for (let attempt = 0; ; attempt++) {
+      let response: Response;
+      try { response = await upstreamFetch(UPSTREAM_URL + path, attemptInit); }
+      catch (error) {
+        const network = transportError(error);
+        if (!network || network.timedOut || attempt >= retries || signal.aborted) throw error;
+        logSafe('upstream-retry', { path, status: 0, attempt: attempt + 1 });
+        await sleep(retryDelayMs(baseDelayMs, attempt), signal);
+        continue;
+      }
+      if (response.status >= 500) response = await inspectCapacity(response, signal);
+      // Explicit capacity errors belong to the single longer recovery window, not nested bursts.
+      if (isCapacityResponse(response)) return response;
+      if (response.status < 500 || attempt >= retries || signal.aborted) return response;
+      logSafe('upstream-retry', { path, status: response.status, attempt: attempt + 1 });
+      await response.body?.cancel().catch(() => {});
       await sleep(retryDelayMs(baseDelayMs, attempt), signal);
-      continue;
     }
-    if (response.status < 500 || attempt >= retries || signal.aborted) return response;
-    logSafe('upstream-retry', { path, status: response.status, attempt: attempt + 1 });
-    await response.body?.cancel().catch(() => {});
-    await sleep(retryDelayMs(baseDelayMs, attempt), signal);
-  }
+  }, body, signal, progress);
 }
 
 /**
@@ -196,7 +204,7 @@ export function connectUpstream(
   onRetry?: (attempt: number, delayMs: number) => void,
 ): Promise<Response> {
   return reconnectTransport(
-    () => { idle.touch(); return postJson(upstreamFetch, path, headers, body, idle.signal); },
+    () => { idle.touch(); return postJson(upstreamFetch, path, headers, body, idle.signal, idle.touch); },
     cancel,
     { onRetry: (attempt, delayMs) => { logSafe('upstream-offline-retry', { path, attempt, delay_ms: delayMs }); onRetry?.(attempt, delayMs); } },
   );

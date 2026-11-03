@@ -21,12 +21,16 @@ const INTERNAL = 'Internal router error; Codex will retry.';
 const OK: ProxyOutput = { text: 'FINE', toolCalls: [], usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 } };
 const savedBase = process.env.UPSTREAM_RETRY_BASE_MS;
 const savedOffline = process.env.OFFLINE_RETRY_BASE_MS;
+const savedCapacityWindow = process.env.UPSTREAM_CAPACITY_RECOVERY_MS;
+const savedCapacityBase = process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS;
 let scratch = '';
 const extraRows: SubscriptionBackend[] = [];
 
 beforeAll(async () => {
   process.env.UPSTREAM_RETRY_BASE_MS = '1';
   process.env.OFFLINE_RETRY_BASE_MS = '5';
+  process.env.UPSTREAM_CAPACITY_RECOVERY_MS = '20';
+  process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = '1';
   scratch = await mkdtemp(tmpdir() + '/failure-matrix-');
   // The same constructors the live launcher uses, with the production prefixes.
   const polyClaude = configuredClaudeAccount({ CLAUDE_ACCOUNT_CONFIG_DIR: scratch, CLAUDE_ACCOUNT_MODEL_PREFIX: 'poly', CLAUDE_ACCOUNT_LABEL: 'Polymarket', CLAUDE_ACCOUNT_MODELS: 'claude-opus-5-5,claude-fable-5-1' })?.backend;
@@ -42,6 +46,8 @@ afterAll(async () => {
   for (const row of extraRows) { const at = BACKENDS.indexOf(row); if (at >= 0) (BACKENDS as SubscriptionBackend[]).splice(at, 1); }
   if (savedBase === undefined) delete process.env.UPSTREAM_RETRY_BASE_MS; else process.env.UPSTREAM_RETRY_BASE_MS = savedBase;
   if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline;
+  if (savedCapacityWindow === undefined) delete process.env.UPSTREAM_CAPACITY_RECOVERY_MS; else process.env.UPSTREAM_CAPACITY_RECOVERY_MS = savedCapacityWindow;
+  if (savedCapacityBase === undefined) delete process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS; else process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = savedCapacityBase;
   await rm(scratch, { recursive: true, force: true });
 });
 
@@ -408,7 +414,7 @@ describe('gpt models × upstream failure modes', () => {
     } finally { await app.close(); }
   });
 
-  test('an upstream response.failed is forwarded verbatim so Codex applies its own classification', async () => {
+  test('upstream response.failed classifications survive, including capacity after its recovery window', async () => {
     for (const code of ['rate_limit_exceeded', 'server_is_overloaded', 'context_length_exceeded', 'insufficient_quota']) {
       const app = await fixtureRouter({ upstreamFetch: async () => new Response(`data: ${JSON.stringify({ type: 'response.failed', sequence_number: 0, response: { id: 'resp_x', status: 'failed', error: { code, message: `upstream ${code}` } } })}\n\n`, { headers: { 'content-type': 'text/event-stream' } }) });
       try {

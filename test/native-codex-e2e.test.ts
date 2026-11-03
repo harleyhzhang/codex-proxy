@@ -13,16 +13,22 @@ import { EMPTY_OUTPUT } from '../src/protocol/types';
 const codexBin = Bun.which('codex');
 const savedBase = process.env.UPSTREAM_RETRY_BASE_MS;
 const savedOffline = process.env.OFFLINE_RETRY_BASE_MS;
+const savedCapacity = process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS;
+const savedCapacityHeartbeat = process.env.UPSTREAM_CAPACITY_HEARTBEAT_MS;
 let home = '';
 
 beforeAll(async () => {
   process.env.UPSTREAM_RETRY_BASE_MS = '1';
   process.env.OFFLINE_RETRY_BASE_MS = '5';
+  process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = '1';
+  process.env.UPSTREAM_CAPACITY_HEARTBEAT_MS = '5';
   home = await mkdtemp(join(tmpdir(), 'codex-e2e-home-'));
 });
 afterAll(async () => {
   if (savedBase === undefined) delete process.env.UPSTREAM_RETRY_BASE_MS; else process.env.UPSTREAM_RETRY_BASE_MS = savedBase;
   if (savedOffline === undefined) delete process.env.OFFLINE_RETRY_BASE_MS; else process.env.OFFLINE_RETRY_BASE_MS = savedOffline;
+  if (savedCapacity === undefined) delete process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS; else process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS = savedCapacity;
+  if (savedCapacityHeartbeat === undefined) delete process.env.UPSTREAM_CAPACITY_HEARTBEAT_MS; else process.env.UPSTREAM_CAPACITY_HEARTBEAT_MS = savedCapacityHeartbeat;
   await rm(home, { recursive: true, force: true });
 });
 
@@ -93,6 +99,25 @@ async function runCodex(routerUrl: string, prompt: string, options: { model?: st
 }
 
 describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
+  test('streamed capacity errors recover in one native turn without a Retry button or model switch', async () => {
+    let calls = 0;
+    const app = await fixtureRouter({ upstreamFetch: async url => {
+      if (!new URL(url).pathname.endsWith('/responses')) return Response.json({});
+      calls++;
+      const text = calls <= 2
+        ? `data: ${JSON.stringify({ type: 'response.created', response: { id: 'discarded-' + calls, status: 'in_progress', output: [] } })}\n\ndata: ${JSON.stringify({ type: 'response.failed', headers: { 'retry-after-ms': '35' }, response: { id: 'discarded-' + calls, status: 'failed', error: { code: 'server_is_overloaded', message: 'synthetic busy' } } })}\n\n`
+        : sseAnswer('SURVIVED_CAPACITY');
+      return new Response(text, { headers: { 'content-type': 'text/event-stream' } });
+    } });
+    try {
+      const run = await runCodex(app.url('/'), 'Reply with the model answer.');
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain('SURVIVED_CAPACITY');
+      expect(run.stdout + run.stderr).not.toMatch(/Selected model is at capacity|Reconnecting|stream disconnected|server_is_overloaded/);
+      expect(calls).toBe(3);
+    } finally { await app.close(); }
+  }, 120_000);
+
   test('native output-schema succeeds only with a matching final result and never retries invalid JSON', async () => {
     const backend = BACKENDS[0]!; const original = backend.run;
     const schema = { type: 'object', properties: { ok: { type: 'boolean', const: true } }, required: ['ok'], additionalProperties: false };
