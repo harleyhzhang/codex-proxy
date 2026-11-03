@@ -108,6 +108,12 @@ test('required raw syntax survives long prose, and an unrepresentable grammar is
   expect(() => functionTools([{ ...descriptor, contract: { definition: 'x'.repeat(17000) } }])).toThrow('Unsupported tool contract');
   const union = functionTools([{ type: 'function', proxyName: 'pick', name: 'pick', contract: { description: 'd'.repeat(9000), oneOf: [{ properties: { a: { type: 'string' } } }, { properties: { b: { type: 'string' } } }] } }]).definitions.pick!;
   expect(String(union.inputSchema.description)).toContain('original oneOf contract');
+  // Anthropic refuses a top-level union key whatever its value, so malformed ones are dropped too.
+  for (const contract of [{ anyOf: {} }, { oneOf: null, properties: { a: { type: 'string' } } }, { allOf: 'x' }]) {
+    const schema = functionTools([{ type: 'function', proxyName: 'odd', name: 'odd', contract }]).definitions.odd!.inputSchema;
+    expect(['anyOf', 'oneOf', 'allOf'].filter(key => Object.hasOwn(schema, key))).toEqual([]);
+    expect(schema.type).toBe('object');
+  }
 });
 
 test('prototype-named tools and union properties remain declared data', () => {

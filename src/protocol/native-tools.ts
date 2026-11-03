@@ -84,7 +84,8 @@ function flattenUnion(contract: JsonRecord, root = contract, seen = new Set<unkn
     const resolved = flattenUnion(target, root, visited);
     return Object.keys(siblings).length ? flattenUnion({ allOf: [resolved, siblings] }, root, visited) : resolved;
   };
-  if (!UNIONS.some(key => Array.isArray(contract[key])) && typeof contract.$ref !== 'string') return contract;
+  // Any top-level union key is refused, even a malformed non-array one, so its presence alone triggers the rewrite.
+  if (!UNIONS.some(key => Object.hasOwn(contract, key)) && typeof contract.$ref !== 'string') return contract;
   if (typeof contract.$ref === 'string') return resolve(contract);
   const requiredOf = (schema: JsonRecord) => Array.isArray(schema.required) ? schema.required.filter((key): key is string => typeof key === 'string') : [];
   const flat: JsonRecord = Object.fromEntries(Object.entries(contract).filter(([key]) => !(UNIONS as readonly string[]).includes(key)));
