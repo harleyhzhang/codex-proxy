@@ -140,7 +140,7 @@ export function codexCall(descriptor: ToolDescriptor, args: unknown, callId: str
 
 /** A model's function call as the Codex call it stands for; raw-input tools get their string back. */
 export function codexToolCall(byKey: Map<string, ToolDescriptor>, name: string, raw: string, callId: string | undefined): ToolCall {
-  const descriptor = byKey.get(name);
+  const descriptor = byKey.get(name) ?? unambiguousTool(byKey, name)?.[1];
   if (descriptor?.type === 'custom') {
     let args: unknown;
     try { args = JSON.parse(raw); } catch {}
@@ -148,6 +148,22 @@ export function codexToolCall(byKey: Map<string, ToolDescriptor>, name: string, 
     return { name: descriptor.proxyName, arguments: (isRecord(args) ? rawInput(args) : undefined) ?? raw, callId };
   }
   return { name: descriptor?.proxyName ?? name, arguments: raw, callId };
+}
+
+/** Older history can use a bare name before Codex moves that tool into a namespace. Resolve
+ * only explicitly declared identities, never a fuzzy spelling or an ambiguous short name. */
+function unambiguousTool(byKey: Map<string, ToolDescriptor>, name: string): [string, ToolDescriptor] | undefined {
+  let bare: [string, ToolDescriptor] | undefined;
+  let ambiguous = false;
+  for (const entry of byKey) {
+    const descriptor = entry[1];
+    if (descriptor.proxyName === name) return entry;
+    if (descriptor.name === name) {
+      if (bare) ambiguous = true;
+      bare = entry;
+    }
+  }
+  return ambiguous ? undefined : bare;
 }
 
 export const HISTORY_CALL_TYPES: ReadonlySet<string> = new Set(['function_call', 'custom_tool_call', 'tool_search_call', 'computer_call']);
@@ -171,5 +187,10 @@ export function historyCallArguments(item: ResponseInputItem): string {
 /** The function key a request declares for a Codex tool name; unknown names are made key-safe. */
 export function keyLookup(byKey: Map<string, ToolDescriptor>): (name: string) => string {
   const keys = new Map([...byKey].map(([key, descriptor]) => [descriptor.proxyName, key]));
-  return name => keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
+  const bare = new Set([...byKey.values()].map(descriptor => descriptor.name));
+  for (const name of bare) {
+    const entry = unambiguousTool(byKey, name);
+    if (entry && !keys.has(name)) keys.set(name, entry[0]);
+  }
+  return name => byKey.has(name) ? name : keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
 }

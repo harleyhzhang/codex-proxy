@@ -159,7 +159,11 @@ export async function claudeMessages(request: ResponsesRequest, keyFor: (name: s
   };
   for (const item of typeof request.input === 'string' ? [{ role: 'user', content: request.input }] : request.input) {
     const type = item.type ?? 'message';
-    if (HISTORY_CALL_TYPES.has(type)) {
+    if (type === 'additional_tools') {
+      // These are protocol declarations, already exposed as native tools by requestTools.
+      // Printing their Responses JSON into user text advertises conflicting bare tool names.
+      continue;
+    } else if (HISTORY_CALL_TYPES.has(type)) {
       let input: unknown;
       try { input = JSON.parse(historyCallArguments(item)); } catch { input = {}; }
       add('assistant', [{ type: 'tool_use', id: toolId(item.call_id), name: keyFor(historyToolName(item)), input: isRecord(input) ? input : { value: input } }]);

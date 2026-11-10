@@ -109,6 +109,13 @@ describe('buildCatalog', () => {
     }
   });
 
+  test('subscription tools do not inherit GPT-only execution modes', () => {
+    const template = { slug: 'gpt-main', visibility: 'list', tool_mode: 'code_mode_only', use_responses_lite: true };
+    const rows = buildCatalog({ models: [template] }).models;
+    expect(rows[0]).toMatchObject(template);
+    for (const row of rows.slice(1)) expect(row).toMatchObject({ tool_mode: 'code_mode', use_responses_lite: false });
+  });
+
   test('every row carries the fields the standalone CLI ModelInfo requires', () => {
     const withKept = { models: [...native.models, { slug: 'gpt-own', visibility: 'list', base_instructions: 'keep me', supports_parallel_tool_calls: false, model_messages: { instructions_template: 't' } }] };
     const { models } = buildCatalog(withKept);

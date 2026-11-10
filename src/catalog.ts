@@ -33,6 +33,10 @@ function catalogRow(template: JsonRecord, model: CatalogModel, priority: number)
     slug: model.slug,
     display_name: model.displayName,
     description: model.description,
+    // Foreign backends need Codex's client tool bridge, including direct browser/MCP tools.
+    // Do not inherit a GPT template's code-mode-only or Responses Lite execution policy.
+    tool_mode: 'code_mode',
+    use_responses_lite: false,
     default_reasoning_level: model.defaultEffort,
     supported_reasoning_levels: model.efforts.map((effort) => ({
       effort,
