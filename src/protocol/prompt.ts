@@ -83,14 +83,15 @@ export function toolDescriptors(tools: ResponseTool[]): ToolDescriptor[] {
 }
 
 /**
- * The tools Codex will execute for this request. Tools loaded by a tool_search are not added to
- * `tools`; Codex keeps them only on the tool_search_output history item, so they are read back here.
+ * The tools Codex will execute for this request. Newer clients send declarations in developer
+ * additional_tools items; deferred discovery uses tool_search_output. Both survive in history
+ * rather than the top-level tools array, including previous_response_id continuations.
  */
 export function requestTools(request: { tools?: ResponseTool[]; input?: unknown }): ResponseTool[] {
   const declared = request.tools ?? [];
   if (!Array.isArray(request.input)) return declared;
   const loaded = request.input.flatMap((item: unknown) =>
-    isRecord(item) && item.type === 'tool_search_output' && Array.isArray(item.tools)
+    isRecord(item) && (item.type === 'tool_search_output' || item.type === 'additional_tools' && item.role === 'developer') && Array.isArray(item.tools)
       ? item.tools.filter(
           (tool: unknown): tool is ResponseTool =>
             isRecord(tool) && typeof tool.type === 'string' && CLIENT_TOOL_TYPES.has(tool.type),

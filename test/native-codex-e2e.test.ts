@@ -9,8 +9,10 @@ import { join } from 'node:path';
 import { fixtureRouter } from './support';
 import { BACKENDS } from '../src/backends/registry';
 import { EMPTY_OUTPUT } from '../src/protocol/types';
+import { createClaudeAccountBackend } from '../src/backends/claude';
+import { anthropicFixture, anthropicStream, say } from './anthropic-fixture';
 
-const codexBin = Bun.which('codex');
+const codexBin = process.env.CODEX_TEST_BINARY ?? Bun.which('codex');
 const savedBase = process.env.UPSTREAM_RETRY_BASE_MS;
 const savedOffline = process.env.OFFLINE_RETRY_BASE_MS;
 const savedCapacity = process.env.UPSTREAM_CAPACITY_RETRY_BASE_MS;
@@ -72,7 +74,7 @@ function offlineOpenAI(failures: number, answer: string) {
   return { calls, upstreamFetch };
 }
 
-async function runCodex(routerUrl: string, prompt: string, options: { model?: string; schema?: unknown } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+async function runCodex(routerUrl: string, prompt: string, options: { model?: string; schema?: unknown; codeMode?: boolean } = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   // Codex parses (but does not verify) the ID token for the account/plan claims.
   const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('base64url');
   const idToken = `${b64({ alg: 'none', typ: 'JWT' })}.${b64({ email: 'fixture@example.com', exp: Math.floor(Date.now() / 1000) + 3600, 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture-account', chatgpt_plan_type: 'pro', chatgpt_user_id: 'user_fixture' } })}.sig`;
@@ -86,6 +88,7 @@ async function runCodex(routerUrl: string, prompt: string, options: { model?: st
     'sandbox_mode = "read-only"',
     '[features]',
     'web_search_request = false',
+    ...(options.codeMode ? ['code_mode = true', 'code_mode_only = true', 'incremental_tools = true'] : []),
   ].join('\n'));
   if (options.schema) await writeFile(join(home, 'schema.json'), JSON.stringify(options.schema));
   const proc = Bun.spawn([codexBin!, 'exec', '--skip-git-repo-check', '-C', home, ...(options.schema ? ['--output-schema', join(home, 'schema.json')] : []), prompt], {
@@ -99,6 +102,37 @@ async function runCodex(routerUrl: string, prompt: string, options: { model?: st
 }
 
 describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
+  for (const model of ['claude-fable-5-2', 'claude-opus-5-5']) {
+    test(`${model} executes code-mode custom tools and reads their results`, async () => {
+      const anthropic = anthropicFixture();
+      const team = createClaudeAccountBackend({ ...anthropic.options(), configDir: home, prefix: 'fixture-team', label: 'Fixture', models: [model], reasoningEffort: 'medium', fastMode: true });
+      const backend = BACKENDS[0]!;
+      const original = { ...backend };
+      Object.assign(backend, team.backend);
+      const app = await fixtureRouter();
+      try {
+        let declared = false, receivedResult = false;
+        anthropic.state.replies.push(body => {
+          const tools = body.tools as { name: string; input_schema: unknown }[];
+          const exec = tools.find(tool => tool.name === 'functions_exec' || tool.name === 'exec');
+          declared = !!exec;
+          return anthropicStream([{ type: 'tool_use', id: 'toolu_native_exec', name: exec?.name ?? 'functions_exec', input: { input: 'text(await tools.exec_command({cmd: "printf CODE_MODE_TOOL_OK"}));' } }], 'tool_use');
+        });
+        anthropic.state.replies.push(body => {
+          const messages = body.messages as { content: { type: string; content?: unknown }[] }[];
+          receivedResult = messages.flatMap(message => message.content)
+            .some(block => block.type === 'tool_result' && JSON.stringify(block.content).includes('CODE_MODE_TOOL_OK'));
+          return say(receivedResult ? 'CODE_MODE_VERIFIED' : 'MISSING_RESULT');
+        });
+        const run = await runCodex(app.url('/'), 'Use the provided tool, then report its result.', { model: `fixture-team-${model}`, codeMode: true });
+        expect(declared).toBe(true);
+        expect(receivedResult).toBe(true);
+        expect(run.code).toBe(0);
+        expect(run.stdout).toContain('CODE_MODE_VERIFIED');
+        expect(run.stderr).not.toContain('incompatible payload');
+      } finally { Object.assign(backend, original); anthropic.stop(); await app.close(); }
+    }, 120_000);
+  }
   test('streamed capacity errors recover in one native turn without a Retry button or model switch', async () => {
     let calls = 0;
     const app = await fixtureRouter({ upstreamFetch: async url => {
