@@ -187,10 +187,8 @@ export function historyCallArguments(item: ResponseInputItem): string {
 /** The function key a request declares for a Codex tool name; unknown names are made key-safe. */
 export function keyLookup(byKey: Map<string, ToolDescriptor>): (name: string) => string {
   const keys = new Map([...byKey].map(([key, descriptor]) => [descriptor.proxyName, key]));
-  const bare = new Set([...byKey.values()].map(descriptor => descriptor.name));
-  for (const name of bare) {
-    const entry = unambiguousTool(byKey, name);
-    if (entry && !keys.has(name)) keys.set(name, entry[0]);
-  }
+  const bare = new Map<string, string | null>();
+  for (const [key, descriptor] of byKey) bare.set(descriptor.name, bare.has(descriptor.name) ? null : key);
+  for (const [name, key] of bare) if (key !== null && !keys.has(name)) keys.set(name, key);
   return name => byKey.has(name) ? name : keys.get(name) ?? (name.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 60) || 'tool');
 }
