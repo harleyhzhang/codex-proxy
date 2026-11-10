@@ -229,7 +229,14 @@ account never falls back to the other Claude subscription. The optional Cursor
 quota policy below applies only to secondary Opus when explicitly enabled.
 
 Only enable models that the second subscription can use. `CLAUDE_ACCOUNT_MODELS`
-optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1`.
+optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1,claude-fable-5-2`.
+`CLAUDE_ACCOUNT_REASONING_EFFORT=medium` fixes both the account's requests and
+picker rows at medium, including when a saved chat requests another effort.
+`CLAUDE_ACCOUNT_SPEED_POLICY=fastest` requests `speed: "fast"` for Fable 5.2
+and Opus 5.5. Other accounts keep their existing speed and effort settings.
+Fast mode requires the organization's fast-mode and usage-credit access; it
+uses credits outside the included subscription limits. The proxy does not
+enable billing or change organization settings.
 `CLAUDE_ACCOUNT_EXPECTED_EMAIL` and `CLAUDE_ACCOUNT_EXPECTED_ORG` can pin the
 identity Anthropic reports for the login; they are checked once per access token,
 before its first turn. The second profile must differ from the primary `CLAUDE_CONFIG_DIR`

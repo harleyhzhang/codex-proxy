@@ -52,3 +52,38 @@ test('second Claude account is opt-in with explicit labels, namespaces and nativ
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('secondary Fable 5.2 and Opus 5.5 pin medium effort and fast speed without changing the primary account', async () => {
+  const fixture = anthropicFixture();
+  const dir = await mkdtemp(join(tmpdir(), 'claude-fixed-controls-'));
+  try {
+    const team = createClaudeAccountBackend({ ...fixture.options(), configDir: dir, prefix: 'team', label: 'Team', models: ['claude-fable-5-2', 'claude-opus-5-5'], reasoningEffort: 'medium', fastMode: true });
+    expect(team.backend.catalog.map(row => [row.slug, row.displayName, row.efforts, row.defaultEffort])).toEqual([
+      ['team-claude-fable-5-2', 'Fable 5.2 (Team)', ['medium'], 'medium'],
+      ['team-claude-opus-5-5', 'Opus 5.5 (Team)', ['medium'], 'medium'],
+    ]);
+    for (const model of Object.values(team.backend.models)) {
+      await team.backend.run({ model, input: 'hello', reasoning: { effort: 'max' } });
+    }
+    for (const { body } of fixture.messages()) expect(body).toMatchObject({ speed: 'fast', output_config: { effort: 'medium' } });
+    expect(fixture.messages()[0]!.body.thinking).toEqual({ type: 'adaptive', block_binding: { prefix_mismatch_behavior: 'drop_block' } });
+    expect(fixture.messages()[0]!.headers['anthropic-beta']).toContain('thinking-binding-controls-2026-08-01');
+    expect(fixture.messages()[1]!.body.thinking).toEqual({ type: 'adaptive' });
+    const primary = new ClaudeAccount(fixture.options());
+    await primary.run({ model: 'claude-opus-5-5', input: 'hello', reasoning: { effort: 'high' } });
+    expect(fixture.messages().at(-1)!.body.output_config).toEqual({ effort: 'high' });
+    expect(fixture.messages().at(-1)!.body.speed).toBeUndefined();
+  } finally { fixture.stop(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('secondary Claude validates and loads fixed effort and speed policies', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'claude-controls-env-'));
+  const env = { CLAUDE_ACCOUNT_CONFIG_DIR: dir, CLAUDE_ACCOUNT_MODELS: 'claude-fable-5-2,claude-opus-5-5', CLAUDE_ACCOUNT_REASONING_EFFORT: 'medium', CLAUDE_ACCOUNT_SPEED_POLICY: 'fastest' };
+  try {
+    const configured = configuredClaudeAccount(env)!;
+    expect(configured.account.options).toMatchObject({ reasoningEffort: 'medium', fastMode: true });
+    expect(() => configuredClaudeAccount({ ...env, CLAUDE_ACCOUNT_REASONING_EFFORT: 'unknown' })).toThrow('reasoning effort');
+    expect(() => configuredClaudeAccount({ ...env, CLAUDE_ACCOUNT_SPEED_POLICY: 'unknown' })).toThrow('SPEED_POLICY');
+    expect(configuredClaudeAccount({ CLAUDE_ACCOUNT_CONFIG_DIR: dir })!.account.options.fastMode).toBe(false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});

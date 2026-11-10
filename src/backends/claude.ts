@@ -22,9 +22,11 @@ import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_T
 
 const MODEL_ALIASES: Readonly<Record<string, string>> = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5' };
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const SECONDARY_MODELS: Readonly<Record<string, string>> = { 'claude-opus-5-5': 'Opus 5.5', 'claude-fable-5-1': 'Fable 5.1', 'claude-fable-5-2': 'Fable 5.2' };
+const FAST_MODELS = new Set(['claude-opus-5-5', 'claude-fable-5-2']);
 /** Claude Code's public OAuth client and its request identity; subscription logins accept only these. */
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
-const CLIENT_VERSION = '2.1.286';
+const CLIENT_VERSION = '2.1.322';
 const BETAS = 'claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,effort-2025-11-24';
 const IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.";
 const REFRESH_LEAD_MS = 5 * 60_000;
@@ -90,6 +92,8 @@ export type ClaudeAccountOptions = {
   configDir?: string;
   expectedEmail?: string;
   expectedOrg?: string;
+  reasoningEffort?: string;
+  fastMode?: boolean;
   /** Overrides for tests; production uses Anthropic, its token endpoint and the profile's own store. */
   apiUrl?: string;
   tokenUrl?: string;
@@ -243,7 +247,7 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
       ...(choice ? { tool_choice: choice } : {}),
       // Anthropic refuses thinking when the tool choice forces a call. Its thinking text stays omitted (the
       // default): asking for a summary delayed the first answer text by about 0.8 s and arrived with it.
-      ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive' } }),
+      ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive', ...(request.model === 'claude-fable-5-2' ? { block_binding: { prefix_mismatch_behavior: 'drop_block' } } : {}) } }),
       output_config: { effort: resolveEffort(request), ...(claudeOutputFormat(request) ? { format: claudeOutputFormat(request) } : {}) },
     },
   };
@@ -272,6 +276,8 @@ export class ClaudeAccount {
   private verified?: { token: string; check: Promise<void> };
 
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) {
+    if (options.reasoningEffort !== undefined && !(EFFORTS as readonly string[]).includes(options.reasoningEffort))
+      throw new Error('Claude reasoning effort must be low, medium, high, xhigh, or max');
     this.options = Object.freeze({ ...options });
     const configDir = options.configDir;
     this.store = options.credentialsFile ? fileStore(options.credentialsFile)
@@ -380,7 +386,7 @@ export class ClaudeAccount {
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
       budget.take();
-      const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream' }), body, signal });
+      const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream', ...(model === 'claude-fable-5-2' ? { 'anthropic-beta': `${BETAS},thinking-binding-controls-2026-08-01` } : {}) }), body, signal });
       this.track(response.headers);
       if (response.ok) return response;
       const detail = await errorDetail(response);
@@ -409,7 +415,9 @@ export class ClaudeAccount {
     signal?.throwIfAborted();
     this.limits.assertAvailable(request.model);
     const started = performance.now();
-    const { body, byKey } = await claudeRequest(request, this.replay, signal);
+    const effective = this.options.reasoningEffort ? { ...request, reasoning: { ...request.reasoning, effort: this.options.reasoningEffort } } : request;
+    const { body, byKey } = await claudeRequest(effective, this.replay, signal);
+    if (this.options.fastMode && FAST_MODELS.has(String(body.model))) body.speed = 'fast';
     // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
     const idle = idleDeadline(signal ?? new AbortController().signal, positiveInt('CLAUDE_TIMEOUT_MS', 300_000), 'Claude stream idle');
     const content: JsonRecord[] = [];
@@ -477,7 +485,7 @@ export class ClaudeAccount {
     // The prompt the model held is uncached input plus cache writes and reads; Codex compacts on this number.
     const inputTokens = count('input_tokens') + count('cache_creation_input_tokens') + count('cache_read_input_tokens');
     const outputTokens = count('output_tokens');
-    logSafe('claude-turn', { model: String(body.model), ms: Math.round(performance.now() - started), first_text_ms: firstTextMs === undefined ? null : Math.round(firstTextMs), first_useful_ms: firstUsefulMs === undefined ? null : Math.round(firstUsefulMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: count('cache_read_input_tokens'), stop });
+    logSafe('claude-turn', { model: String(body.model), speed: typeof usage.speed === 'string' ? usage.speed : 'unknown', ms: Math.round(performance.now() - started), first_text_ms: firstTextMs === undefined ? null : Math.round(firstTextMs), first_useful_ms: firstUsefulMs === undefined ? null : Math.round(firstUsefulMs), calls: toolCalls.length, input_tokens: inputTokens, cached_tokens: count('cache_read_input_tokens'), stop });
     const status: Pick<ProxyOutput, 'status' | 'incompleteReason' | 'error'> = stop === 'model_context_window_exceeded'
       ? { status: 'failed', error: { code: 'context_length_exceeded', message: 'Claude reached its context window; compact the conversation to continue.' } }
       : stop === 'max_tokens' || stop === 'refusal' ? { status: 'incomplete', incompleteReason: stop === 'refusal' ? 'content_filter' : 'max_output_tokens' } : {};
@@ -523,12 +531,15 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
   if (canonical(options.configDir) === canonical(primary)) throw new Error('CLAUDE_ACCOUNT_CONFIG_DIR must differ from the primary Claude profile');
   const account = new ClaudeAccount(options);
   const selected = [...new Set(options.models ?? ['claude-opus-5-5', 'claude-fable-5-1'])];
-  if (!selected.length || selected.some(model => !['claude-opus-5-5', 'claude-fable-5-1'].includes(model)))
+  if (!selected.length || selected.some(model => !Object.hasOwn(SECONDARY_MODELS, model)))
     throw new Error('CLAUDE_ACCOUNT_MODELS must contain supported native Claude model slugs');
   const models = Object.fromEntries(selected.map(model => [`${options.prefix}-${model}`, model]));
   const backend: SubscriptionBackend = {
     name: `Claude (${options.label})`, models, reservedPrefix: `${options.prefix}-claude-`,
-    catalog: selected.map(model => claudeModel(`${options.prefix}-${model}`, `${model === 'claude-opus-5-5' ? 'Opus 5.5' : 'Fable 5.1'} (${options.label})`)),
+    catalog: selected.map(model => ({
+      ...claudeModel(`${options.prefix}-${model}`, `${SECONDARY_MODELS[model]} (${options.label})`),
+      ...(options.reasoningEffort ? { efforts: [options.reasoningEffort], defaultEffort: options.reasoningEffort } : {}),
+    })),
     assertAvailable: model => account.limits.assertAvailable(model),
     assertRequestControls: request => { claudeOutputFormat(request); },
     run: (request, signal, sink) => account.run(request, signal, sink),
@@ -539,10 +550,14 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
 
 export function configuredClaudeAccount(env: Readonly<Record<string, string | undefined>> = process.env) {
   if (!env.CLAUDE_ACCOUNT_CONFIG_DIR) return undefined;
+  if (env.CLAUDE_ACCOUNT_SPEED_POLICY !== undefined && !['client', 'fastest'].includes(env.CLAUDE_ACCOUNT_SPEED_POLICY))
+    throw new Error('CLAUDE_ACCOUNT_SPEED_POLICY must be client or fastest');
   return createClaudeAccountBackend({
     configDir: env.CLAUDE_ACCOUNT_CONFIG_DIR, prefix: env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary',
     label: env.CLAUDE_ACCOUNT_LABEL || 'Secondary', expectedEmail: env.CLAUDE_ACCOUNT_EXPECTED_EMAIL,
     expectedOrg: env.CLAUDE_ACCOUNT_EXPECTED_ORG,
+    reasoningEffort: env.CLAUDE_ACCOUNT_REASONING_EFFORT,
+    fastMode: env.CLAUDE_ACCOUNT_SPEED_POLICY === 'fastest',
     models: env.CLAUDE_ACCOUNT_MODELS?.split(',').map(model => model.trim()).filter(Boolean),
   });
 }
