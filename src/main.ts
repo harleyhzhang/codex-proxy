@@ -48,6 +48,7 @@ const server = startRouter({
   upstreamTimeoutMs: config.upstreamTimeoutMs,
   bridgeModels: config.bridgeModels,
   secondaryAccount: config.secondaryAccount,
+  additionalAccounts: config.additionalAccounts,
   primaryStandard: config.primaryStandard,
   upstreamWebSocket: true,
 });

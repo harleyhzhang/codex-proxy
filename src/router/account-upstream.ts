@@ -16,6 +16,7 @@ export type AccountOptions = {
   expectedAccountId?: string;
   models?: readonly string[];
   fastest?: boolean;
+  reasoningEffort?: string;
   refresh?: () => Promise<void>;
   /** Rewrites the profile's models cache through native Codex. Defaults to a native `model/list`. */
   catalog?: () => Promise<void>;
@@ -206,7 +207,9 @@ export class AccountUpstream {
       tier = tiers.includes('ultrafast') ? 'ultrafast' : tiers.includes('priority') ? 'priority' : 'default';
     }
     logSafe('account-speed', { account: this.options.prefix, model: native, tier });
-    const outbound = rewriteJson(snapshot, { model: native, ...(tier === undefined ? {} : { service_tier: tier }) });
+    const outbound = rewriteJson(snapshot, { model: native, ...(tier === undefined ? {} : { service_tier: tier }),
+      ...(this.options.reasoningEffort ? { reasoning: { ...(record(body.reasoning) ? body.reasoning : {}), effort: this.options.reasoningEffort } } : {}),
+    });
     const response = await upstream(url, requestOptions(outbound, { headers: authorized(identity) }));
     if (response.status !== 401) return response;
     // Like native Codex, a 401 earns one forced refresh and one retry; a failed refresh keeps the original 401.

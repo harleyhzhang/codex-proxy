@@ -20,6 +20,7 @@ describe('loadConfig', () => {
       bridgeModels: DEFAULT_BRIDGE_MODELS,
       secondaryAccount: undefined,
       secondaryLabel: 'Secondary',
+      additionalAccounts: [],
       primaryStandard: false,
       pinnedEfforts: [],
     });
@@ -143,4 +144,11 @@ describe('buildCatalog', () => {
       expect(() => loadConfig({ HOME: '/h', CATALOG_EFFORTS: bad })).toThrow('CATALOG_EFFORTS');
     }
   });
+});
+
+test('additional native account configuration rejects collisions and invalid routing policy', () => {
+  const entry = { home: '/third', prefix: 'extra', label: 'Extra', fastest: true, reasoningEffort: 'high', models: ['gpt-demo'], expectedEmail: 'extra@example.com', expectedAccountId: 'space' };
+  const configured = (entries: unknown) => loadConfig({ HOME: '/h', ACCOUNT_CODEX_HOME: '/second', ACCOUNT_MODEL_PREFIX: 'team', ADDITIONAL_CODEX_ACCOUNTS: JSON.stringify(entries) });
+  expect(configured([entry]).additionalAccounts[0]).toMatchObject(entry);
+  for (const entries of [{}, [entry, entry], [{ ...entry, home: '/second' }], [{ ...entry, prefix: 'team' }], [{ ...entry, reasoningEffort: 'invalid' }], [{ ...entry, fastest: 'yes' }], [{ ...entry, models: ['claude-other'] }]]) expect(() => configured(entries)).toThrow();
 });

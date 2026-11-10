@@ -43,6 +43,7 @@ export type RouterOptions = {
   heartbeatMs?: number;
   bridgeModels?: readonly string[];
   secondaryAccount?: AccountOptions;
+  additionalAccounts?: readonly AccountOptions[];
   primaryStandard?: boolean;
   /** Keep native GPT continuations on their client's own upstream WebSocket. */
   upstreamWebSocket?: boolean;
@@ -141,11 +142,12 @@ export function startRouter(options: RouterOptions) {
   const auth = new NativeAuth(options.authFile);
   const history = new HistoryCache();
   const base: UpstreamFetch = options.upstreamFetch ?? ((url, init) => fetch(url, init));
-  const account = options.secondaryAccount ? new AccountUpstream(options.secondaryAccount, base) : undefined;
+  const accountOptions = [...(options.secondaryAccount ? [options.secondaryAccount] : []), ...(options.additionalAccounts ?? [])];
+  const accounts = accountOptions.map(account => new AccountUpstream(account, base));
   const admit = upstreamAdmission();
   const withPolicy = (transport: UpstreamFetch): UpstreamFetch => {
     const bounded = admit(transport);
-    const routed = account ? account.withTransport(bounded) : bounded;
+    const routed = accounts.reduce((transport, account) => account.withTransport(transport), bounded);
     return options.primaryStandard ? standardPrimaryFetch(routed) : routed;
   };
   const upstreamFetch = withPolicy(base);
@@ -179,7 +181,7 @@ export function startRouter(options: RouterOptions) {
   async function normalizeBody(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const body = raw as ResponsesBody;
     assertRoutable(body.model);
-    if (options.secondaryAccount && !isLocalModel(body.model)) accountModel(body.model, options.secondaryAccount.prefix, options.secondaryAccount.models);
+    if (!isLocalModel(body.model)) for (const account of accountOptions) accountModel(body.model, account.prefix, account.models);
     const backend = backendFor(body.model);
     if (body.generate !== false && backend && typeof body.model === 'string') {
       backend.assertAvailable?.(backend.models[body.model] as string);

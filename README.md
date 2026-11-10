@@ -424,6 +424,7 @@ Everything has a default; set only what you need.
 | `ACCOUNT_EXPECTED_EMAIL` | unset | Optional secondary login identity pin |
 | `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
 | `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
+| `ADDITIONAL_CODEX_ACCOUNTS` | `[]` | JSON array of additional native accounts: distinct `home`, `prefix`, `label`; optional `binary`, identity pins `expectedEmail` / `expectedAccountId`, `models`, `fastest`, and fixed `reasoningEffort` |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
 | `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |
 | `CLAUDE_CONFIG_DIR` | `~/.claude` | Primary Claude login (Claude Code configuration directory); the router uses and refreshes it |

@@ -368,3 +368,53 @@ for await (const line of lines) {
   const [out, err, status] = await Promise.all([new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited]);
   expect(err).toBe(''); expect(status).toBe(0); expect(out).toContain('1 available models');
 });
+
+test('multiple native accounts isolate identity and fixed effort over HTTP and WebSocket', async () => {
+  const first = await fixture(), second = await fixture();
+  await second.write(Date.now() / 1000 + 3600, 'other@example.com', 'other-space');
+  Object.assign(second.options, { prefix: 'other', expectedEmail: 'other@example.com', expectedAccountId: 'other-space', fastest: true, reasoningEffort: 'high' });
+  await Bun.write(first.home + '/client.json', JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'primary-token', account_id: 'primary-space' } }));
+  await Bun.write(first.home + '/catalog.json', '{}');
+  const seen: string[] = [];
+  const server = startRouter({ port: 0, authFile: first.home + '/client.json', catalog: first.home + '/catalog.json', secondaryAccount: first.options, additionalAccounts: [second.options], primaryStandard: true,
+    upstreamFetch: async (_url, init) => {
+      const account = new Headers(init.headers).get('chatgpt-account-id')!;
+      const body = JSON.parse(String(init.body)) as { model: string; service_tier: string; reasoning: { effort: string; summary: string } };
+      expect(body.model).toBe('gpt-6-astra');
+      expect(body.reasoning.effort).toBe(account === 'other-space' ? 'high' : 'low');
+      expect(body.reasoning.summary).toBe('auto');
+      expect(body.service_tier).toBe(account === 'other-space' ? 'ultrafast' : 'default');
+      seen.push(account);
+      return new Response('data: ' + JSON.stringify({ type: 'response.completed', response: { id: 'resp-isolation', output: [] } }) + '\n\n');
+    },
+  });
+  try {
+    for (const model of ['other-gpt-6-astra', 'secondary-gpt-6-astra', 'gpt-6-astra']) {
+      const init = request(model, 'default', 'low');
+      init.body = JSON.stringify({ ...JSON.parse(String(init.body)), reasoning: { effort: 'low', summary: 'auto' } });
+      const response = await fetch(server.url + 'v1/responses', init);
+      expect(response.status).toBe(200); await response.text();
+      await new Promise<void>((resolve, reject) => {
+        const Socket = WebSocket as unknown as { new(url: string, options: { headers?: HeadersInit }): WebSocket };
+        const ws = new Socket(String(server.url).replace('http:', 'ws:') + 'v1/responses', { headers: init.headers });
+        const timer = setTimeout(() => { ws.close(); reject(new Error('WebSocket timeout')); }, 5000);
+        ws.onopen = () => ws.send(JSON.stringify({ type: 'response.create', response: JSON.parse(String(init.body)) as unknown }));
+        ws.onmessage = event => { if ((JSON.parse(String(event.data)) as { type: string }).type === 'response.completed') { clearTimeout(timer); ws.close(); resolve(); } };
+        ws.onerror = () => { clearTimeout(timer); reject(new Error('WebSocket failed')); };
+      });
+    }
+    expect(seen).toEqual(['other-space', 'other-space', 'secondary-space', 'secondary-space', 'primary-space', 'primary-space']);
+    await rm(second.home + '/auth.json');
+    const failed = await fetch(server.url + 'v1/responses', request('other-gpt-6-astra'));
+    await failed.text();
+    expect(seen).toHaveLength(6);
+  } finally { server.stop(true); }
+});
+
+test('multiple account catalog rows keep each entitlement and fixed effort policy', () => {
+  const cache = { models: [{ slug: 'gpt-6-astra', display_name: 'Astra', visibility: 'list', supported_reasoning_levels: [{ effort: 'low' }, { effort: 'high' }], service_tiers: [{ id: 'priority' }] }] };
+  const models = buildCatalog(cache, { cache, prefix: 'one', label: 'One' }, false, [{ cache, prefix: 'two', label: 'Two', fastest: true, reasoningEffort: 'high' }]).models;
+  expect(models.find(row => row.slug === 'one-gpt-6-astra')!.supported_reasoning_levels).toHaveLength(2);
+  expect(models.find(row => row.slug === 'two-gpt-6-astra')).toMatchObject({ display_name: 'Astra (Two)', default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'high' }], service_tiers: [] });
+  expect(() => buildCatalog(cache, undefined, false, [{ cache, prefix: 'two', label: 'Two', reasoningEffort: 'ultra' }])).toThrow('unavailable');
+});
