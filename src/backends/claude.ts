@@ -24,6 +24,8 @@ const MODEL_ALIASES: Readonly<Record<string, string>> = { opus: 'claude-opus-5-5
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const SECONDARY_MODELS: Readonly<Record<string, string>> = { 'claude-opus-5-5': 'Opus 5.5', 'claude-fable-5-1': 'Fable 5.1', 'claude-fable-5-2': 'Fable 5.2' };
 const FAST_MODELS = new Set(['claude-opus-5-5', 'claude-fable-5-2']);
+const FAST_MODE_COOLDOWN_MS = 5 * 60_000;
+const FAST_MODE_REFUSAL = /^fast mode (?:is |has been )?(?:not enabled|disabled|not available|unavailable|not supported|unsupported)\b/i;
 /** Claude Code's public OAuth client and its request identity; subscription logins accept only these. */
 const CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
 const CLIENT_VERSION = '2.1.322';
@@ -278,6 +280,7 @@ export class ClaudeAccount {
   private cached?: { all: JsonRecord; oauth: JsonRecord };
   private refreshing?: Promise<string>;
   private verified?: { token: string; check: Promise<void> };
+  private readonly fastUnavailableUntil = new Map<string, number>();
 
   constructor(options: ClaudeAccountOptions = {}, readonly limits = new ClaudeUsageLimits()) {
     if (options.reasoningEffort !== undefined && !(EFFORTS as readonly string[]).includes(options.reasoningEffort))
@@ -385,16 +388,23 @@ export class ClaudeAccount {
   }
 
   /** Opens the stream. Nothing has reached Codex yet, so each retry here is safe. */
-  private async open(model: string, body: string, signal: AbortSignal, budget: RetryBudget): Promise<Response> {
+  private async open(model: string, body: JsonRecord, signal: AbortSignal, budget: RetryBudget): Promise<Response> {
     let token = await this.authorize(signal);
     let refreshed = false;
     for (let attempt = 0; ; attempt++) {
       budget.take();
-      const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream', ...(model === 'claude-fable-5-2' ? { 'anthropic-beta': `${BETAS},thinking-binding-controls-2026-08-01` } : {}) }), body, signal });
+      const response = await fetch(`${this.api}/v1/messages?beta=true`, { method: 'POST', headers: this.headers(token, { 'content-type': 'application/json', accept: 'text/event-stream', ...(model === 'claude-fable-5-2' ? { 'anthropic-beta': `${BETAS},thinking-binding-controls-2026-08-01` } : {}) }), body: JSON.stringify(body), signal });
       this.track(response.headers);
       if (response.ok) return response;
       const detail = await errorDetail(response);
       logSafe('claude-http-refused', { status: response.status, attempt });
+      if (body.speed === 'fast' && (response.status === 400 || response.status === 403) && FAST_MODE_REFUSAL.test(detail)) {
+        // Speed is optional. Keep this account, model, prompt and tools; only retry before exposure.
+        this.fastUnavailableUntil.set(model, Date.now() + FAST_MODE_COOLDOWN_MS);
+        delete body.speed;
+        logSafe('claude-fast-fallback', { model, status: response.status, cooldown_ms: FAST_MODE_COOLDOWN_MS });
+        if (budget.remaining) continue;
+      }
       if (response.status === 401 && !refreshed) { refreshed = true; token = await this.authorize(signal, token); continue; }
       if (response.status === 429) throw this.limits.blocked(model) ?? new ClaudeUsageLimitError();
       if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');
@@ -421,14 +431,15 @@ export class ClaudeAccount {
     const started = performance.now();
     const effective = this.options.reasoningEffort ? { ...request, reasoning: { ...request.reasoning, effort: this.options.reasoningEffort } } : request;
     const { body, byKey } = await claudeRequest(effective, this.replay, signal);
-    if (this.options.fastMode && FAST_MODELS.has(String(body.model))) body.speed = 'fast';
+    const model = String(body.model);
+    if (this.options.fastMode && FAST_MODELS.has(model) && Date.now() >= (this.fastUnavailableUntil.get(model) ?? 0)) body.speed = 'fast';
     // Bound silence, like native Codex's stream idle timeout; every chunk restarts the window.
     const idle = idleDeadline(signal ?? new AbortController().signal, positiveInt('CLAUDE_TIMEOUT_MS', 300_000), 'Claude stream idle');
     const content: JsonRecord[] = [];
     const usage: JsonRecord = {};
     let stop = '', ended = false, firstTextMs: number | undefined, firstUsefulMs: number | undefined, failure: JsonRecord | undefined;
     try {
-      const response = await this.open(String(body.model), JSON.stringify(body), idle.signal, budget);
+      const response = await this.open(model, body, idle.signal, budget);
       if (!response.body) throw new ProxyTransportError();
       const watched = watchBody(response, idle);
       await sseEvents(watched, event => {

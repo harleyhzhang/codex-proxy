@@ -1,6 +1,6 @@
 // Claude over Anthropic's Messages API against a scripted Anthropic: the request and history mapping,
 // the login refresh and identity pin it owns, streaming, and every refusal Codex can receive.
-import { afterAll, beforeEach, expect, test } from 'bun:test';
+import { afterAll, beforeEach, expect, spyOn, test } from 'bun:test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { ClaudeAccount, claudeBackend, claudeMessages, resolveModel } from '../src/backends/claude';
 import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
@@ -32,6 +32,79 @@ const TOOLS: ResponsesRequest['tools'] = [
   { type: 'custom', name: 'apply_patch', description: 'Edit files', format: { type: 'grammar', syntax: 'lark', definition: 'start: /.+/' } },
   { type: 'namespace', name: 'mcp__docs', tools: [{ type: 'function', name: 'search', parameters: { type: 'object', properties: { q: { type: 'string' } } } }] },
 ];
+
+const fastRefusal = (status = 400, message = 'Fast mode is not enabled for your organization. An organization admin must enable this feature.') =>
+  () => Response.json({ type: 'error', error: { type: 'invalid_request_error', message } }, { status });
+
+for (const model of ['claude-opus-5-5', 'claude-fable-5-2']) {
+  test(`${model} retries a Fast refusal at standard speed without changing the request or duplicating streamed tools`, async () => {
+    const claude = new ClaudeAccount({ ...anthropic.options(), fastMode: true, reasoningEffort: 'medium' });
+    anthropic.state.replies.push(fastRefusal(), () => anthropicStream([
+      { type: 'text', text: 'working' },
+      { type: 'tool_use', id: 'fallback-call', name: 'apply_patch', input: { input: 'patch' } },
+    ], 'tool_use'));
+    const calls: string[] = [], text: string[] = [];
+    const sink = { started: false, text(delta: string) { text.push(delta); this.started = true; }, call(call: { name: string }) { calls.push(call.name); this.started = true; } };
+    const output = await claude.run(hello({ model, tools: TOOLS, reasoning: { effort: 'max' } }), undefined, sink);
+    expect(output.text).toBe('working');
+    expect(text.join('')).toBe('working');
+    expect(calls).toEqual(['apply_patch']);
+    expect(output.toolCalls).toEqual([{ name: 'apply_patch', arguments: 'patch', callId: 'fallback-call' }]);
+    expect(anthropic.messages()).toHaveLength(2);
+    const { speed, ...standard } = sent();
+    expect(speed).toBe('fast');
+    expect(sent(1)).toEqual(standard);
+    expect(sent(1).output_config).toEqual({ effort: 'medium' });
+    expect(anthropic.messages()[1]!.headers.authorization).toBe(anthropic.messages()[0]!.headers.authorization);
+    await claude.run(hello({ model, tools: TOOLS, input: [
+      { role: 'user', content: 'hello' },
+      { type: 'custom_tool_call', name: 'apply_patch', call_id: 'fallback-call', input: 'patch' },
+      { type: 'custom_tool_call_output', call_id: 'fallback-call', output: 'done' },
+    ] }));
+    expect(sent(2).speed).toBeUndefined();
+    expect(JSON.stringify(sent(2).messages)).toContain('fallback-call');
+  });
+}
+
+test('Fast cooldown expires and stays scoped to the account and model', async () => {
+  const now = Date.now();
+  const clock = spyOn(Date, 'now').mockReturnValue(now);
+  try {
+    const claude = new ClaudeAccount({ ...anthropic.options(), fastMode: true });
+    anthropic.state.replies.push(fastRefusal(403, 'Fast mode has been disabled by your organization.'));
+    await claude.run(hello());
+    await claude.run(hello());
+    expect(sent(2).speed).toBeUndefined();
+    await claude.run(hello({ model: 'claude-fable-5-2' }));
+    expect(sent(3).speed).toBe('fast');
+    await new ClaudeAccount({ ...anthropic.options(), fastMode: true }).run(hello());
+    expect(sent(4).speed).toBe('fast');
+    clock.mockReturnValue(now + 5 * 60_000);
+    await claude.run(hello());
+    expect(sent(5).speed).toBe('fast');
+  } finally { clock.mockRestore(); }
+});
+
+test('Fast fallback is bounded and preserves unrelated errors and cancellation', async () => {
+  for (const [status, message] of [[400, 'tools.0: bad schema'], [403, 'Permission denied'], [429, 'Usage limit reached']] as const) {
+    const claude = new ClaudeAccount({ ...anthropic.options(), fastMode: true });
+    const before = anthropic.messages().length;
+    anthropic.state.replies.push(fastRefusal(status, message));
+    await expect(claude.run(hello())).rejects.toThrow();
+    expect(anthropic.messages()).toHaveLength(before + 1);
+  }
+  const before = anthropic.messages().length;
+  anthropic.state.replies.push(fastRefusal(), fastRefusal());
+  await expect(new ClaudeAccount({ ...anthropic.options(), fastMode: true }).run(hello())).rejects.toThrow('Fast mode is not enabled');
+  expect(anthropic.messages()).toHaveLength(before + 2);
+  anthropic.state.replies.push(fastRefusal());
+  await expect(account().account.run(hello())).rejects.toThrow('Fast mode is not enabled');
+  expect(anthropic.messages()).toHaveLength(before + 3);
+  const controller = new AbortController();
+  anthropic.state.replies.push(() => { controller.abort(new Error('cancelled')); return fastRefusal()(); });
+  await expect(new ClaudeAccount({ ...anthropic.options(), fastMode: true }).run(hello(), controller.signal)).rejects.toThrow('cancelled');
+  expect(anthropic.messages()).toHaveLength(before + 4);
+});
 
 test('Claude preserves parallel-call restrictions for automatic and forced tool choices', async () => {
   const { account: claude } = account();

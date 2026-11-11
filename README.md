@@ -234,6 +234,11 @@ optionally selects a comma-separated subset of `claude-opus-5-5,claude-fable-5-1
 picker rows at medium, including when a saved chat requests another effort.
 `CLAUDE_ACCOUNT_SPEED_POLICY=fastest` requests `speed: "fast"` for Fable 5.2
 and Opus 5.5. Other accounts keep their existing speed and effort settings.
+If Anthropic refuses Fast mode as disabled or unavailable (HTTP 400/403), the
+proxy automatically retries the same model and account at standard speed before
+exposing output. It skips Fast for that account/model for five minutes, then
+tries Fast again. Unrelated request, authentication and quota errors retain
+their normal handling.
 Fast mode requires the organization's fast-mode and usage-credit access; it
 uses credits outside the included subscription limits. The proxy does not
 enable billing or change organization settings.
