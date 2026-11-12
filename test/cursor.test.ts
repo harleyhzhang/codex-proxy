@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { cursorFailure, cursorSelection, finishedRun, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
+import { cursorFailure, cursorSelection, misaddressedCodexTool, finishedRun, assertCursorIdentity, verifyCursorProfile, sanitizeCursorInput, CursorError } from '../src/backends/cursor';
 import { ProxyTransportError } from '../src/transport';
 
 test('Cursor sanitizer drops encrypted reasoning and compaction items, keeps inline images and replaces other media instead of refusing the turn',()=>{
@@ -65,7 +65,10 @@ test('Cursor model parameters are family specific and unsupported effort is refu
  expect(cursorSelection('grok-4.7','xhigh',true).params).toContainEqual({id:'fast',value:'true'});
  expect(cursorSelection('grok-4.7','xhigh').params).toContainEqual({id:'reasoning_effort',value:'xhigh'});
  expect(()=>cursorSelection('gpt-5.6-sol','none')).toThrow();
- expect(()=>cursorSelection('kimi-k3','medium')).toThrow();expect(()=>cursorSelection('auto','high')).toThrow();
+ expect(()=>cursorSelection('auto','high')).toThrow();
+ // An effort carried over from another model falls back to the strongest the model has.
+ expect(cursorSelection('kimi-k3','medium').params).toEqual([{id:'reasoning',value:'max'}]);
+ expect(cursorSelection('grok-4.7','ultra').params).toContainEqual({id:'reasoning_effort',value:'xhigh'});
 });
 test('Cursor verifies both email and stable user id before inference',()=>{
  const pins={expectedEmail:'work@example.com',expectedUserId:'1'};
@@ -203,4 +206,14 @@ test('SDK failures: network is an outage, retryable and server errors get one at
   const mapped=cursorFailure(error);expect(mapped).toBeInstanceOf(CursorError);expect((mapped as CursorError).retryable).toBe(retryable);
  }
  expect((cursorFailure(new Error('prompt is too long for this model')) as BackendError).code).toBe('context_length_exceeded');
+});
+
+test('a Codex tool aimed at a server named after its prefix is recognised, anything else stays native',()=>{
+ const byKey=new Map([['mcp__codex_apps__search_service__web_run',{proxyName:'mcp__codex_apps__search_service._web_run'}],['exec_command',{proxyName:'exec_command'}]]);
+ const call=(providerIdentifier:string,toolName:string)=>({type:'mcp',args:{providerIdentifier,toolName,args:{}}});
+ expect(misaddressedCodexTool(call('mcp__codex_apps__search_service','_web_run'),byKey)).toBe(true);
+ expect(misaddressedCodexTool(call('codex','exec_command'),byKey)).toBe(true);
+ expect(misaddressedCodexTool(call('other-server','delete_everything'),byKey)).toBe(false);
+ expect(misaddressedCodexTool(call('custom-user-tools','exec_command'),byKey)).toBe(false);
+ expect(misaddressedCodexTool({type:'shell',args:{providerIdentifier:'codex',toolName:'exec_command'}},byKey)).toBe(false);
 });

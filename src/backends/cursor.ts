@@ -68,7 +68,11 @@ const short = (text: string) => text.replace(/\s+/g, ' ').trim().slice(0, 160);
 export function cursorSelection(model: string, effort = 'high', fastest = false): JsonRecord {
   if (!Object.hasOwn(CURSOR_MODELS, model)) throw new CursorError('Unsupported Cursor model');
   const spec = CURSOR_MODELS[model as CursorModel];
-  if (!(spec.efforts as readonly string[]).includes(effort)) throw new CursorError('Unsupported Cursor reasoning effort');
+  // Codex can carry another model's effort into the first turns after a model switch (a chat forked from
+  // a medium-effort model sent Kimi `medium`, 2026-11-12). The catalog already advertises that an effort
+  // a model lacks falls back to its strongest, so the request does the same instead of failing the turn.
+  const efforts: readonly string[] = spec.efforts;
+  if (!efforts.includes(effort)) { logSafe('cursor-effort-coerced', { model, requested: String(effort).replace(/[^a-z]/gi, '').slice(0, 16), used: efforts.at(-1) }); effort = efforts.at(-1)!; }
   return { id: model, params: [{ id: spec.parameter, value: effort }, ...(spec.context ? [{ id: 'context', value: spec.context }] : []), ...(spec.fast ? [{ id: 'fast', value: fastest ? 'true' : 'false' }] : [])] };
 }
 
@@ -126,7 +130,7 @@ export function sanitizeCursorInput(input: unknown): { input: unknown; dropped: 
 }
 
 // Native tool calls: Codex's tools are the only callable tools, so the prompt only says who runs them.
-const nativeRules = (raw: string[]) => `You are the model inside a Codex agent loop. Your tools are the Codex tools on the "${CUSTOM_TOOLS_PROVIDER}" MCP server; Codex executes every call on the user's machine and returns the result to you. Their input schemas are listed in <tool_schemas>, so call them directly through the MCP tool call without a discovery step, with arguments exactly matching each schema.${raw.length ? ` Only ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} one raw string, in the field "input"; every other tool takes the fields of its own schema.` : ''} You have no other tools. Independent calls may be made in parallel. When the task is done or you need the user, reply with plain text. Never claim an action ran before its result appears.`;
+const nativeRules = (raw: string[]) => `You are the model inside a Codex agent loop. Your tools are the Codex tools on the "${CUSTOM_TOOLS_PROVIDER}" MCP server; Codex executes every call on the user's machine and returns the result to you. Their input schemas are listed in <tool_schemas>, so call them directly through the MCP tool call without a discovery step, with arguments exactly matching each schema.${raw.length ? ` Only ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} one raw string, in the field "input"; every other tool takes the fields of its own schema.` : ''} A tool name that starts with "mcp__" is still one tool on "${CUSTOM_TOOLS_PROVIDER}": call it there by its full listed name, never on a server named after its prefix. You have no other tools. Independent calls may be made in parallel. When the task is done or you need the user, reply with plain text. Never claim an action ran before its result appears.`;
 
 function readCursorKey(options: CursorOptions): string {
   const info = statSync(options.authFile);
@@ -237,7 +241,7 @@ type Spare = { agent: SdkAgent; dir: string };
 /** A Cursor run that may span several Codex turns while it waits on their tool results. */
 type RunSession = {
   run: NativeRun; spare: Spare; key: string; sdkRun?: SdkRun; signature: string; historyHash: string; historyLength: number;
-  lastEvent: number; done: boolean; heldSince?: number; expiry?: ReturnType<typeof setTimeout>; ended?: Promise<void>;
+  lastEvent: number; done: boolean; misaddressed?: number; heldSince?: number; expiry?: ReturnType<typeof setTimeout>; ended?: Promise<void>;
 };
 export type CursorBackend = SubscriptionBackend & { close(): Promise<void> };
 
@@ -474,7 +478,13 @@ class CursorRuntime {
         if (!isRecord(update)) return;
         if (update.type === 'text-delta' && typeof update.text === 'string') run.appendText(update.text);
         else if (update.type === 'thinking-delta' && typeof update.text === 'string') run.appendReasoning(update.text);
-        else if (update.type === 'tool-call-started' && !isCodexTool(update.toolCall)) run.fail(new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned'));
+        else if (update.type === 'tool-call-started' && !isCodexTool(update.toolCall)) {
+          // A Codex tool named like an MCP server (`mcp__x`) can be called on that imaginary server. No such
+          // server exists for this agent, so nothing runs and Cursor tells the model; let it correct itself.
+          if (misaddressedCodexTool(update.toolCall, tools.byKey) && (current.misaddressed = (current.misaddressed ?? 0) + 1) <= MISADDRESSED_LIMIT) { logSafe('cursor-tool-misaddressed', { count: current.misaddressed }); return; }
+          logNativeAction('delta', update.toolCall);
+          run.fail(new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned'));
+        }
         else if (update.type === 'summary-started') run.fail(contextOverflowError('Cursor'));
       };
       signal.throwIfAborted();
@@ -502,7 +512,11 @@ class CursorRuntime {
       for await (const message of session.sdkRun!.stream()) {
         session.lastEvent = performance.now();
         if (!isRecord(message)) continue;
-        if (message.type === 'tool_call' && !(message.name === 'mcp' && isRecord(message.args) && message.args.providerIdentifier === CUSTOM_TOOLS_PROVIDER)) throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
+        if (message.type === 'tool_call' && !(message.name === 'mcp' && isRecord(message.args) && message.args.providerIdentifier === CUSTOM_TOOLS_PROVIDER)) {
+          if (message.name === 'mcp' && misaddressedCodexTool({ type: 'mcp', args: message.args }, run.byKey) && (session.misaddressed ?? 0) <= MISADDRESSED_LIMIT) continue;
+          logNativeAction('stream', message);
+          throw new CursorError('Cursor attempted a native action; it was stopped and no Codex actions were returned');
+        }
         // Cursor summarizes its own context only near the model's limit: Codex compacts instead.
         if (message.type === 'summary') throw contextOverflowError('Cursor');
         if (message.type === 'task') throw new CursorError('Cursor attempted a subagent; it was stopped and no Codex actions were returned');
@@ -560,6 +574,30 @@ class CursorRuntime {
     })();
     return session.ended;
   }
+}
+
+/** How many times one run may aim a Codex tool at a server that does not exist before the turn fails. */
+const MISADDRESSED_LIMIT = 3;
+
+/**
+ * An MCP call that names one of this turn's Codex tools but not the custom-tools server, typically a
+ * `mcp__server.tool` name split into server and tool. The agent has no other MCP server, so the call
+ * cannot run anything.
+ */
+export function misaddressedCodexTool(call: unknown, byKey: ReadonlyMap<string, { proxyName: string }>): boolean {
+  if (!isRecord(call) || call.type !== 'mcp' || !isRecord(call.args)) return false;
+  const { providerIdentifier: provider, toolName } = call.args;
+  if (typeof provider !== 'string' || typeof toolName !== 'string' || provider === CUSTOM_TOOLS_PROVIDER) return false;
+  if (byKey.has(toolName)) return true;
+  for (const descriptor of byKey.values()) if (descriptor.proxyName === toolName || descriptor.proxyName === `${provider}.${toolName}`) return true;
+  return false;
+}
+
+/** Which Cursor-owned tool a model reached for: tool and provider names only, never arguments. */
+function logNativeAction(source: string, call: unknown): void {
+  const record = isRecord(call) ? call : {}, args = isRecord(record.args) ? record.args : {};
+  const label = (value: unknown) => typeof value === 'string' ? value.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 48) : null;
+  logSafe('cursor-native-action', { source, tool: label(record.type) ?? label(record.name), provider: label(args.providerIdentifier), name: label(args.toolName) ?? label(args.name), keys: Object.keys(args).slice(0, 8).join(',').slice(0, 96) });
 }
 
 /** A tool call aimed at Codex's tools: the SDK's custom-tools MCP provider, and nothing else. */
