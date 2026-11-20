@@ -181,6 +181,9 @@ Speed policies are independently opt-in:
 
 - `ACCOUNT_SPEED_POLICY=fastest` selects Ultrafast, Fast, or Standard according to
   the secondary profile's cached model entitlements.
+- `ACCOUNT_SPEED_POLICY=standard` fixes secondary GPT requests to Standard,
+  overriding saved Fast/Ultrafast selections. Additional accounts accept
+  `standard: true` instead of `fastest: true`.
 - `PRIMARY_SPEED_POLICY=standard` fixes primary GPT response requests to Standard,
   even when a prior model left a Fast/Ultrafast selection. It works without a second
   account, too.
@@ -428,7 +431,7 @@ Everything has a default; set only what you need.
 | `ACCOUNT_MODELS` | unset | Optional comma-separated native-model allowlist |
 | `ACCOUNT_EXPECTED_EMAIL` | unset | Optional secondary login identity pin |
 | `ACCOUNT_EXPECTED_WORKSPACE` | unset | Optional secondary workspace pin |
-| `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier |
+| `ACCOUNT_SPEED_POLICY` | `client` | `client` preserves selection; `fastest` fixes the fastest cached tier; `standard` overrides saved Fast selections |
 | `ADDITIONAL_CODEX_ACCOUNTS` | `[]` | JSON array of additional native accounts: distinct `home`, `prefix`, `label`; optional `binary`, identity pins `expectedEmail` / `expectedAccountId`, `models`, `fastest`, and fixed `reasoningEffort` |
 | `PRIMARY_SPEED_POLICY` | `client` | `client` preserves selection; `standard` fixes primary GPT to Standard |
 | `CATALOG_EFFORTS` | unset | `fragment=effort` pins, e.g. `claude=medium,gpt=high`; one effort per row |

@@ -37,6 +37,8 @@ function additionalAccounts(env: Env, codexHome: string): (AccountOptions & { la
       if (entry[field] !== undefined && (typeof entry[field] !== 'string' || !entry[field])) throw new Error(`Invalid additional account ${field}`);
     }
     if (entry.fastest !== undefined && typeof entry.fastest !== 'boolean') throw new Error('Invalid additional account fastest policy');
+    if (entry.standard !== undefined && typeof entry.standard !== 'boolean') throw new Error('Invalid additional account standard policy');
+    if (entry.standard === true && entry.fastest === true) throw new Error('Conflicting additional account speed policies');
     if (entry.reasoningEffort !== undefined && (typeof entry.reasoningEffort !== 'string' || !['low', 'medium', 'high', 'xhigh', 'max', 'ultra'].includes(entry.reasoningEffort))) throw new Error('Invalid additional account reasoning effort');
     const models = entry.models;
     if (models !== undefined && (!Array.isArray(models) || !models.length || models.some(model => typeof model !== 'string' || !/^gpt-[a-z0-9][a-z0-9.-]*$/.test(model)))) throw new Error('Additional account models must contain native GPT model slugs');
@@ -45,6 +47,7 @@ function additionalAccounts(env: Env, codexHome: string): (AccountOptions & { la
       expectedEmail: typeof entry.expectedEmail === 'string' ? entry.expectedEmail : undefined,
       expectedAccountId: typeof entry.expectedAccountId === 'string' ? entry.expectedAccountId : undefined,
       fastest: entry.fastest === true,
+      standard: entry.standard === true,
       reasoningEffort: typeof entry.reasoningEffort === 'string' ? entry.reasoningEffort : undefined,
       models: Array.isArray(models) ? models as string[] : undefined,
     };
@@ -61,7 +64,7 @@ export function loadConfig(env: Env = process.env): Config {
     .split(',')
     .map((model) => model.trim())
     .filter(Boolean);
-  for (const [name, choices] of [['ACCOUNT_SPEED_POLICY', ['client', 'fastest']], ['PRIMARY_SPEED_POLICY', ['client', 'standard']]] as const) {
+  for (const [name, choices] of [['ACCOUNT_SPEED_POLICY', ['client', 'fastest', 'standard']], ['PRIMARY_SPEED_POLICY', ['client', 'standard']]] as const) {
     const value = env[name];
     if (value !== undefined && !choices.some(choice => choice === value)) throw new Error(`${name} must be ${choices.join(' or ')}`);
   }
@@ -94,6 +97,7 @@ export function loadConfig(env: Env = process.env): Config {
       expectedEmail: env.ACCOUNT_EXPECTED_EMAIL,
       expectedAccountId: env.ACCOUNT_EXPECTED_WORKSPACE,
       fastest: env.ACCOUNT_SPEED_POLICY === 'fastest',
+      standard: env.ACCOUNT_SPEED_POLICY === 'standard',
       models: models.length ? models : undefined,
     } : undefined,
   };

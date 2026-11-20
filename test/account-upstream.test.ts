@@ -418,3 +418,26 @@ test('multiple account catalog rows keep each entitlement and fixed effort polic
   expect(models.find(row => row.slug === 'two-gpt-6-astra')).toMatchObject({ display_name: 'Astra (Two)', default_reasoning_level: 'high', supported_reasoning_levels: [{ effort: 'high' }], service_tiers: [] });
   expect(() => buildCatalog(cache, undefined, false, [{ cache, prefix: 'two', label: 'Two', reasoningEffort: 'ultra' }])).toThrow('unavailable');
 });
+
+test('standard account policy overrides stale fast selections without changing credentials or effort', async () => {
+  const { options } = await fixture();
+  const calls: Request[] = [];
+  const router = new AccountUpstream({ ...options, standard: true }, async (url, init) => {
+    calls.push(new Request(url, init)); return new Response('{}');
+  });
+  for (const speed of ['default', 'priority', 'ultrafast']) {
+    await router.fetch(target, request('secondary-gpt-6-astra', speed, 'high'));
+    const call = calls.at(-1)!;
+    expect(call.headers.get('chatgpt-account-id')).toBe('secondary-space');
+    expect(await call.json()).toMatchObject({ model: 'gpt-6-astra', service_tier: 'default', reasoning: { effort: 'high' } });
+  }
+});
+
+test('standard catalog removes accelerated defaults for every configured account', () => {
+  const cache = { models: [{ slug: 'gpt-demo', visibility: 'list', default_service_tier: 'priority', service_tiers: [{ id: 'priority' }], additional_speed_tiers: ['fast'] }] };
+  const rows = buildCatalog(cache, { cache, prefix: 'second', label: 'Second', standard: true }, true,
+    [{ cache, prefix: 'third', label: 'Third', standard: true }]).models;
+  for (const slug of ['gpt-demo', 'second-gpt-demo', 'third-gpt-demo']) {
+    expect(rows.find(row => row.slug === slug)).toMatchObject({ default_service_tier: 'default', service_tiers: [], additional_speed_tiers: [] });
+  }
+});

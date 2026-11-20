@@ -50,7 +50,7 @@ function catalogRow(template: JsonRecord, model: CatalogModel, priority: number)
 }
 
 /** Appends every subscription model to Codex's native catalog, replacing stale local rows. */
-export type SecondaryCatalog = { cache: unknown; prefix: string; label: string; fastest?: boolean; models?: readonly string[]; reasoningEffort?: string };
+export type SecondaryCatalog = { cache: unknown; prefix: string; label: string; fastest?: boolean; standard?: boolean; models?: readonly string[]; reasoningEffort?: string };
 export function buildCatalog(nativeCache: unknown, secondary?: SecondaryCatalog, primaryStandard = false, additional: readonly SecondaryCatalog[] = []): { models: JsonRecord[] } {
   const accounts = [...(secondary ? [secondary] : []), ...additional];
   for (const account of accounts) validateAccountPrefix(account.prefix);
@@ -79,7 +79,8 @@ export function buildCatalog(nativeCache: unknown, secondary?: SecondaryCatalog,
         priority: lastPriority + local.length + accountRows.length + 1,
         upgrade: null,
         availability_nux: null,
-        ...(account.fastest ? { service_tiers: [], additional_speed_tiers: [] } : {}),
+        ...(account.fastest || account.standard ? { service_tiers: [], additional_speed_tiers: [] } : {}),
+        ...(account.standard ? { default_service_tier: 'default' } : {}),
         ...(effort ? { default_reasoning_level: account.reasoningEffort, supported_reasoning_levels: [effort] } : {}),
       });
     }
@@ -133,6 +134,7 @@ if (import.meta.main) {
     cache: JSON.parse(readFileSync(join(config.secondaryAccount.home, 'models_cache.json'), 'utf8')) as unknown,
     prefix: config.secondaryAccount.prefix, label: config.secondaryLabel,
     fastest: config.secondaryAccount.fastest,
+    standard: config.secondaryAccount.standard,
     models: config.secondaryAccount.models,
   } : undefined;
   const additional = config.additionalAccounts.map(account => ({ ...account,

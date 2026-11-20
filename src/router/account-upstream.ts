@@ -16,6 +16,7 @@ export type AccountOptions = {
   expectedAccountId?: string;
   models?: readonly string[];
   fastest?: boolean;
+  standard?: boolean;
   reasoningEffort?: string;
   refresh?: () => Promise<void>;
   /** Rewrites the profile's models cache through native Codex. Defaults to a native `model/list`. */
@@ -202,7 +203,8 @@ export class AccountUpstream {
     if (!readable) throw new BackendError('Secondary model cache unavailable; refresh its native model catalog');
     if (!row) throw new BackendError('Unsupported secondary Codex model; refresh its native model catalog');
     let tier = body.service_tier;
-    if (this.options.fastest) {
+    if (this.options.standard) tier = 'default';
+    else if (this.options.fastest) {
       const tiers = Array.isArray(row.service_tiers) ? row.service_tiers.filter(record).map(value => value.id) : [];
       tier = tiers.includes('ultrafast') ? 'ultrafast' : tiers.includes('priority') ? 'priority' : 'default';
     }

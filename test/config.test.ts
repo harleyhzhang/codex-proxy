@@ -159,3 +159,13 @@ test('additional native account configuration rejects collisions and invalid rou
   expect(configured([entry]).additionalAccounts[0]).toMatchObject(entry);
   for (const entries of [{}, [entry, entry], [{ ...entry, home: '/second' }], [{ ...entry, prefix: 'team' }], [{ ...entry, reasoningEffort: 'invalid' }], [{ ...entry, fastest: 'yes' }], [{ ...entry, models: ['claude-other'] }]]) expect(() => configured(entries)).toThrow();
 });
+
+test('standard policy can be selected for secondary and additional accounts', () => {
+  const config = loadConfig({ HOME: '/h', ACCOUNT_CODEX_HOME: '/second', ACCOUNT_SPEED_POLICY: 'standard',
+    ADDITIONAL_CODEX_ACCOUNTS: JSON.stringify([{ home: '/third', prefix: 'third', label: 'Third', standard: true }]) });
+  expect(config.secondaryAccount).toMatchObject({ standard: true, fastest: false });
+  expect(config.additionalAccounts[0]).toMatchObject({ standard: true, fastest: false });
+  for (const entry of [{ standard: 'yes' }, { standard: true, fastest: true }]) {
+    expect(() => loadConfig({ HOME: '/h', ADDITIONAL_CODEX_ACCOUNTS: JSON.stringify([{ home: '/third', prefix: 'third', label: 'Third', ...entry }]) })).toThrow();
+  }
+});
