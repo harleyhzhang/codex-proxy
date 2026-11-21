@@ -1,5 +1,6 @@
 // Renders a backend's output as a Responses API object and as the equivalent SSE stream.
 import { randomId } from '../json';
+import { assistantText } from './assistant-text';
 import { COMPUTER_TOOL_NAME, requestTools, TOOL_SEARCH_NAME, toolDescriptors } from './prompt';
 import type { OutputItem, ProxyOutput, ResponseObject, ResponseTool, StreamEvent, ToolCall } from './types';
 
@@ -46,13 +47,14 @@ function computerItem(call: ToolCall): OutputItem {
 
 function outputItems(request: RequestShape, output: ProxyOutput): OutputItem[] {
   const items: OutputItem[] = [];
-  if (output.text) {
+  for (const part of assistantText(output.text)) {
     items.push({
       id: randomId('msg'),
       type: 'message',
       status: 'completed',
       role: 'assistant',
-      content: [{ type: 'output_text', annotations: [], text: output.text }],
+      ...(part.phase ? { phase: part.phase } : {}),
+      content: [{ type: 'output_text', annotations: [], text: part.text }],
     });
   }
   if (!output.toolCalls.length) return items;

@@ -3,7 +3,8 @@
 // and (2) when the burst outlasts the router's budget, the real status reaches native Codex and
 // Codex itself retries, so the chat still completes. Skipped when `codex` is not installed.
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { isRecord } from '../src/json';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fixtureRouter } from './support';
@@ -102,6 +103,34 @@ async function runCodex(routerUrl: string, prompt: string, options: { model?: st
 }
 
 describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
+  test('native Codex retains a standalone browser completion as commentary before the final answer', async () => {
+    const anthropic = anthropicFixture();
+    const team = createClaudeAccountBackend({ ...anthropic.options(), configDir: home, prefix: 'fixture-browser', label: 'Fixture', models: ['claude-opus-5-5'], reasoningEffort: 'medium' });
+    const backend = BACKENDS[0]!;
+    const original = { ...backend };
+    Object.assign(backend, team.backend);
+    const marker = '::browser-complete{title="Verified fixture browser phase"}';
+    anthropic.state.replies.push(() => anthropicStream([{ type: 'text', text: marker + '\n\nBROWSER_PHASE_VERIFIED' }], 'end_turn'));
+    const app = await fixtureRouter();
+    try {
+      const run = await runCodex(app.url('/'), 'Report the synthetic result.', { model: 'fixture-browser-claude-opus-5-5' });
+      expect(run.code).toBe(0);
+      expect(run.stdout).toContain('BROWSER_PHASE_VERIFIED');
+      const stored: Record<string, unknown>[] = [];
+      const sessions = join(home, 'sessions');
+      for (const file of await readdir(sessions, { recursive: true })) {
+        if (!file.endsWith('.jsonl')) continue;
+        for (const line of (await readFile(join(sessions, file), 'utf8')).trim().split('\n')) {
+          const event: unknown = JSON.parse(line);
+          if (isRecord(event) && event.type === 'response_item' && isRecord(event.payload) && event.payload.role === 'assistant' && JSON.stringify(event.payload).includes('Verified fixture browser phase')) stored.push(event.payload);
+        }
+      }
+      expect(stored).toHaveLength(1);
+      expect(stored[0]!.phase).toBe('commentary');
+      expect(stored[0]!.content).toEqual([{ type: 'output_text', text: marker + '\n' }]);
+    } finally { Object.assign(backend, original); anthropic.stop(); await app.close(); }
+  }, 120_000);
+
   for (const model of ['claude-fable-5-2', 'claude-opus-5-5']) {
     test(`${model} executes code-mode custom tools and reads their results`, async () => {
       const anthropic = anthropicFixture();

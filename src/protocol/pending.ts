@@ -1,3 +1,4 @@
+import { AssistantText, type AssistantTextPart } from './assistant-text';
 import { enqueueBounded, byteStrategy } from './buffer';
 import { cancelReader } from './stream';
 import { randomId } from '../json';
@@ -82,10 +83,10 @@ export async function pendingResponse(request: ResponsesBody,
     }
     send({ type: 'response.output_item.done', output_index: entry.index, item: entry.item });
   };
-  const begin = (kind: 'message' | 'reasoning'): Streamed => {
+  const begin = (kind: 'message' | 'reasoning', phase?: 'commentary'): Streamed => {
     close();
     const entry: Streamed = kind === 'message'
-      ? { index: streamed.length, kind, text: '', item: { id: randomId('msg'), type: 'message', status: 'in_progress', role: 'assistant', content: [] } }
+      ? { index: streamed.length, kind, text: '', item: { id: randomId('msg'), type: 'message', status: 'in_progress', role: 'assistant', ...(phase ? { phase } : {}), content: [] } }
       : { index: streamed.length, kind, text: '', item: { id: randomId('rs'), type: 'reasoning', summary: [] } };
     streamed.push(entry);
     open = entry;
@@ -94,12 +95,16 @@ export async function pendingResponse(request: ResponsesBody,
     else send({ type: 'response.reasoning_summary_part.added', ...at(entry), summary_index: 0, part: { type: 'summary_text', text: '' } });
     return entry;
   };
-  const appendText = (delta: string) => {
-    const entry = open?.kind === 'message' ? open : begin('message');
+  const appendText = ({ text: delta, phase }: AssistantTextPart) => {
+    const entry = open?.kind === 'message' && open.item.phase === phase && !phase ? open : begin('message', phase);
     reached = true;
     entry.text += delta;
     send({ type: 'response.output_text.delta', ...at(entry), content_index: 0, delta });
+    if (phase) close();
   };
+  const textParser = new AssistantText(appendText);
+  let receivedText = '';
+  const receiveText = (delta: string) => { receivedText += delta; textParser.push(delta); };
   // A closed socket stops the turn; the backend sees it through the signal.
   const guarded = <T extends unknown[]>(fn: (...args: T) => void) => (...args: T) => {
     if (signal.aborted) return;
@@ -107,10 +112,11 @@ export async function pendingResponse(request: ResponsesBody,
   };
   const sink: OutputSink = {
     get started() { return reached; },
-    snapshot() { close(); return streamed.map(entry => entry.item); },
-    text: guarded((delta: string) => { if (delta) appendText(delta); }),
+    snapshot() { textParser.flush(); close(); return streamed.map(entry => entry.item); },
+    text: guarded((delta: string) => { if (delta) { reached = true; receiveText(delta); } }),
     reasoning: guarded((delta: string) => {
       if (!delta) return;
+      textParser.flush();
       const entry = open?.kind === 'reasoning' ? open : begin('reasoning');
       entry.text += delta;
       send({ type: 'response.reasoning_summary_text.delta', ...at(entry), summary_index: 0, delta });
@@ -119,6 +125,7 @@ export async function pendingResponse(request: ResponsesBody,
       let item: OutputItem;
       // A call the router cannot render (bad computer or search arguments) waits for the final output, which reports it.
       try { item = (renderCall ??= toolCallRenderer(request))(call); } catch { return; }
+      textParser.flush();
       close();
       const entry: Streamed = { index: streamed.length, kind: 'call', item, text: '' };
       streamed.push(entry);
@@ -131,18 +138,17 @@ export async function pendingResponse(request: ResponsesBody,
     const generated = await generate(signal, sink);
     signal.throwIfAborted();
     let output = generated.output;
-    if (streamed.length) {
-      const final = output.find(item => item.type === 'message');
-      const shown = streamed.filter(entry => entry.kind === 'message').map(entry => entry.text).join('');
-      if (!final && generated.status === 'incomplete' && open?.kind === 'message') {
+    if (streamed.length || receivedText) {
+      const final = output.filter(item => item.type === 'message');
+      const text = final.map(textOf).join('');
+      if (text.startsWith(receivedText)) receiveText(text.slice(receivedText.length));
+      else if (final.length) logSafe('stream-text-diverged', { streamed: receivedText.length, final: text.length });
+      textParser.flush();
+      if (!final.length && generated.status === 'incomplete' && open?.kind === 'message') {
         // Interrupted mid-text: the partial message is closed as interrupted, like an OpenAI stream.
         send({ type: 'response.output_item.interrupted', response_id: empty.id, item_id: open.item.id, output_index: open.index });
         streamed.splice(streamed.indexOf(open), 1);
         open = undefined;
-      } else {
-        const text = textOf(final);
-        if (text.startsWith(shown)) { if (text.length > shown.length) appendText(text.slice(shown.length)); }
-        else logSafe('stream-text-diverged', { streamed: shown.length, final: text.length });
       }
       close();
       const calls = new Set(streamed.filter(entry => entry.kind === 'call').map(entry => entry.item.call_id));
