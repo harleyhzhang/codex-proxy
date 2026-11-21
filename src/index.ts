@@ -6,6 +6,6 @@ export { BACKENDS, backendFor, isLocalModel } from './backends/registry';
 export { SummaryCodec } from './router/capsule';
 export { type RouterOptions, startRouter } from './router/server';
 export { AccountUpstream, type AccountOptions, accountModels, nativeAccountRequest, standardPrimaryFetch } from './router/account-upstream';
-export { ClaudeAccount, createClaudeAccountBackend, configuredClaudeAccount, type ClaudeAccountOptions, type SecondaryClaudeOptions } from './backends/claude';
+export { ClaudeAccount, createClaudeAccountBackend, configuredClaudeAccount, configuredAdditionalClaudeAccounts, type ClaudeAccountOptions, type SecondaryClaudeOptions } from './backends/claude';
 export { createCursorBackend, configuredCursorBackend, type CursorOptions } from './backends/cursor';
 export { withOpusQuotaFallback } from './backends/quota-fallback';

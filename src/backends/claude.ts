@@ -560,7 +560,7 @@ export function createClaudeAccountBackend(options: SecondaryClaudeOptions) {
     run: (request, signal, sink) => account.run(request, signal, sink),
     prewarm: () => account.prewarm(),
   };
-  return { account, backend };
+  return { account, backend, prefix: options.prefix };
 }
 
 export function configuredClaudeAccount(env: Readonly<Record<string, string | undefined>> = process.env) {
@@ -574,5 +574,42 @@ export function configuredClaudeAccount(env: Readonly<Record<string, string | un
     reasoningEffort: env.CLAUDE_ACCOUNT_REASONING_EFFORT,
     fastMode: env.CLAUDE_ACCOUNT_SPEED_POLICY === 'fastest',
     models: env.CLAUDE_ACCOUNT_MODELS?.split(',').map(model => model.trim()).filter(Boolean),
+  });
+}
+
+/** Additional organizations use independent logins even when their email addresses match. */
+export function configuredAdditionalClaudeAccounts(env: Readonly<Record<string, string | undefined>> = process.env) {
+  const parsed: unknown = JSON.parse(env.ADDITIONAL_CLAUDE_ACCOUNTS || '[]');
+  if (!Array.isArray(parsed)) throw new Error('ADDITIONAL_CLAUDE_ACCOUNTS must be an array');
+  const canonical = (path: string) => existsSync(path) ? realpathSync(path) : resolve(path);
+  const profiles = new Set([canonical(env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'))]);
+  const prefixes = new Set<string>();
+  if (env.CLAUDE_ACCOUNT_CONFIG_DIR) {
+    profiles.add(canonical(env.CLAUDE_ACCOUNT_CONFIG_DIR));
+    prefixes.add(env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary');
+  }
+  return parsed.map((entry: unknown) => {
+    if (!isRecord(entry) || typeof entry.configDir !== 'string' || !entry.configDir || typeof entry.prefix !== 'string' || typeof entry.label !== 'string' || !entry.label.trim())
+      throw new Error('Additional Claude accounts require configDir, prefix and label');
+    if (!isAbsolute(entry.configDir)) throw new Error('Additional Claude configDir must be an absolute path');
+    const profile = canonical(entry.configDir);
+    if (profiles.has(profile) || prefixes.has(entry.prefix)) throw new Error('Claude accounts require distinct profiles and prefixes');
+    for (const key of ['expectedEmail', 'expectedOrg', 'reasoningEffort'] as const) {
+      if (entry[key] !== undefined && (typeof entry[key] !== 'string' || !entry[key])) throw new Error(`Invalid additional Claude account ${key}`);
+    }
+    if (entry.fastMode !== undefined && typeof entry.fastMode !== 'boolean') throw new Error('Invalid additional Claude fastMode policy');
+    const models = entry.models;
+    if (models !== undefined && (!Array.isArray(models) || !models.length || models.some(model => typeof model !== 'string')))
+      throw new Error('Additional Claude models must contain supported native Claude model slugs');
+    const configured = createClaudeAccountBackend({
+      configDir: entry.configDir, prefix: entry.prefix, label: entry.label,
+      expectedEmail: typeof entry.expectedEmail === 'string' ? entry.expectedEmail : undefined,
+      expectedOrg: typeof entry.expectedOrg === 'string' ? entry.expectedOrg : undefined,
+      reasoningEffort: typeof entry.reasoningEffort === 'string' ? entry.reasoningEffort : undefined,
+      fastMode: entry.fastMode === true,
+      models: Array.isArray(models) ? models as string[] : undefined,
+    });
+    profiles.add(profile); prefixes.add(entry.prefix);
+    return configured;
   });
 }

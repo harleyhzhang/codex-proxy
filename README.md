@@ -208,6 +208,20 @@ in this repository.
 
 ### A second Claude subscription
 
+For more organizations, set `ADDITIONAL_CLAUDE_ACCOUNTS` to a JSON array alongside
+the primary and optional second login:
+
+```json
+[{"configDir":"/absolute/path/to/another-claude-profile","prefix":"another","label":"Another team","expectedEmail":"you@example.com","expectedOrg":"organization-uuid","models":["claude-fable-5-2","claude-opus-5-5"],"reasoningEffort":"medium","fastMode":false}]
+```
+
+Use a separate `CLAUDE_CONFIG_DIR` login for each organization. Profiles and
+prefixes must be distinct, including symlink targets. Identity pins prevent a
+same-email login for a different organization from being used accidentally.
+Each account owns its token refresh, quota state and model namespace; no
+automatic account fallback is added. Keep this variable set for both catalog
+generation and the router. `fastMode` defaults to false (standard speed).
+
 Keep the second Claude login in a separate configuration directory. The CLI is only
 used to sign in; a second desktop app is unnecessary.
 

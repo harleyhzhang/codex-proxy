@@ -2,12 +2,52 @@ import { afterAll, expect, test } from 'bun:test';
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ClaudeAccount, configuredClaudeAccount, createClaudeAccountBackend } from '../src/backends/claude';
+import { ClaudeAccount, configuredClaudeAccount, configuredAdditionalClaudeAccounts, createClaudeAccountBackend } from '../src/backends/claude';
 import { anthropicFixture, limitHeaders, say } from './anthropic-fixture';
 
 const personal = anthropicFixture({ email: 'personal@example.com', org: 'org_personal' });
 const work = anthropicFixture({ email: 'work@example.com', org: 'org_work' });
 afterAll(() => { personal.stop(); work.stop(); });
+
+test('additional organizations reject shared profiles, aliases, namespaces and invalid policies', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'additional-claudes-'));
+  const primary = join(dir, 'personal'), existing = join(dir, 'existing'), extra = join(dir, 'extra');
+  for (const path of [primary, existing, extra]) await mkdir(path);
+  await symlink(existing, join(dir, 'alias'));
+  const entry = { configDir: extra, prefix: 'another', label: 'Another', expectedEmail: 'work@example.com', expectedOrg: 'org_another', models: ['claude-opus-5-5'], reasoningEffort: 'medium', fastMode: false };
+  const env = { CLAUDE_CONFIG_DIR: primary, CLAUDE_ACCOUNT_CONFIG_DIR: existing, CLAUDE_ACCOUNT_MODEL_PREFIX: 'team' };
+  const load = (entries: unknown) => configuredAdditionalClaudeAccounts({ ...env, ADDITIONAL_CLAUDE_ACCOUNTS: JSON.stringify(entries) });
+  try {
+    expect(configuredAdditionalClaudeAccounts({})).toEqual([]);
+    const [configured] = load([entry]);
+    expect(configured!.backend.models).toEqual({ 'another-claude-opus-5-5': 'claude-opus-5-5' });
+    expect(configured!.account.options).toMatchObject({ expectedOrg: 'org_another', reasoningEffort: 'medium', fastMode: false });
+    for (const configDir of [primary, existing, join(dir, 'alias')]) expect(() => load([{ ...entry, configDir }])).toThrow('distinct');
+    expect(() => load([entry, entry])).toThrow('distinct');
+    expect(() => load([{ ...entry, prefix: 'team' }])).toThrow('distinct');
+    expect(() => load([{ ...entry, configDir: 'relative' }])).toThrow('absolute');
+    for (const bad of [null, {}, [{ ...entry, label: '' }], [{ ...entry, fastMode: 'false' }], [{ ...entry, models: [7] }], [{ ...entry, expectedOrg: 7 }], [{ ...entry, reasoningEffort: 'bogus' }]])
+      expect(() => load(bad)).toThrow();
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+test('same-email organizations isolate identity, medium effort and standard-speed inference', async () => {
+  const first = anthropicFixture({ email: 'same@example.com', org: 'org_first' });
+  const second = anthropicFixture({ email: 'same@example.com', org: 'org_second' });
+  const dir = await mkdtemp(join(tmpdir(), 'claude-orgs-'));
+  try {
+    const entries = [first, second].map((fixture, i) => createClaudeAccountBackend({ ...fixture.options(), configDir: join(dir, String(i)), prefix: `org${i}`, label: `Org ${i}`, expectedEmail: 'same@example.com', expectedOrg: i ? 'org_second' : 'org_first', models: ['claude-opus-5-5'], reasoningEffort: 'medium', fastMode: false }));
+    await Promise.all(entries.map(entry => entry.backend.run({ model: 'claude-opus-5-5', input: 'hello', reasoning: { effort: 'max' } })));
+    for (const fixture of [first, second]) {
+      expect(fixture.messages()[0]!.body.speed).toBeUndefined();
+      expect(fixture.messages()[0]!.body.output_config).toEqual({ effort: 'medium' });
+    }
+    second.state.profile = () => Response.json({ account: { email: 'same@example.com' }, organization: { uuid: 'org_first' } });
+    const wrongOrg = createClaudeAccountBackend({ ...second.options(), configDir: join(dir, 'wrong'), prefix: 'wrong', label: 'Wrong', expectedEmail: 'same@example.com', expectedOrg: 'org_second' });
+    await expect(wrongOrg.backend.run({ model: 'claude-opus-5-5', input: 'hello' })).rejects.toThrow();
+    expect(second.messages()).toHaveLength(1);
+  } finally { first.stop(); second.stop(); await rm(dir, { recursive: true, force: true }); }
+});
 
 test('separate Claude logins serve the same model concurrently and keep their own tokens and quota', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'claude-accounts-'));

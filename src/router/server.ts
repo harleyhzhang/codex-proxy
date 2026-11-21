@@ -7,7 +7,7 @@ import type { ServerWebSocket } from 'bun';
 import { onClaudeRateLimit } from '../backends/claude';
 import { claudeLimits, claudeUsageSnapshot, type ClaudeUsage } from '../backends/claude-limits';
 import { BackendError, terminalEvent } from '../backends/contract';
-import { assertRoutable, backendFor, isLocalModel, secondaryClaude } from '../backends/registry';
+import { assertRoutable, backendFor, isLocalModel, claudeAccounts } from '../backends/registry';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
 import { log, logSafe } from '../log';
 import { responseObject, streamResponse } from '../protocol/output';
@@ -157,10 +157,10 @@ export function startRouter(options: RouterOptions) {
   const codec = options.summaryKeyFile ? new SummaryCodec(readFileSync(options.summaryKeyFile)) : undefined;
   if (stateDir) {
     trackClaudeUsage(join(stateDir, 'claude-usage.json'));
-    if (secondaryClaude) {
-      const file = join(stateDir, `claude-${process.env.CLAUDE_ACCOUNT_MODEL_PREFIX || 'secondary'}-usage.json`);
-      try { secondaryClaude.account.limits.restore(JSON.parse(readFileSync(file, 'utf8')) as ClaudeUsage); } catch {}
-      secondaryClaude.account.onRateLimit(info => { void Bun.write(file, JSON.stringify(claudeUsageSnapshot(info), null, 2)).catch(() => {}); });
+    for (const { account, prefix } of claudeAccounts) {
+      const file = join(stateDir, `claude-${prefix}-usage.json`);
+      try { account.limits.restore(JSON.parse(readFileSync(file, 'utf8')) as ClaudeUsage); } catch {}
+      account.onRateLimit(info => { void Bun.write(file, JSON.stringify(claudeUsageSnapshot(info), null, 2)).catch(() => {}); });
     }
   }
 
