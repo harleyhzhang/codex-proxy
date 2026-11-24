@@ -6,3 +6,4 @@ models_cache.json
 .env
 .env.*
 !.env.example
+bench/*.json
