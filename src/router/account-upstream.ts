@@ -55,6 +55,7 @@ export function accountModel(model: unknown, prefix: string, models?: readonly s
 
 /** Primary models that may keep an explicit `priority` (Fast) request; everything else is forced to Standard. */
 export const PRIMARY_FAST_MODELS: ReadonlySet<string> = new Set(['gpt-6-luna']);
+export const FAST_HEADER = 'x-codex-fast';
 
 /** Can be enabled independently of secondary-account routing. Native tool endpoints are untouched. */
 export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
@@ -63,12 +64,15 @@ export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
     if (target.origin !== 'https://chatgpt.com' || !/^\/backend-api\/codex\/responses(?:\/|$)/.test(target.pathname) || typeof init.body !== 'string') return upstream(url, init);
     const body = requestJson(init);
     if (!record(body) || typeof body.model !== 'string' || !MODEL_SLUG.test(body.model)) return upstream(url, init);
-    // Explicit Fast stays opt-in per model; the catalog never offers it to the desktop picker.
-    const fast = body.service_tier === 'priority' && PRIMARY_FAST_MODELS.has(body.model);
-    logSafe('account-speed', { account: 'primary', model: body.model, tier: fast ? 'priority' : 'default' });
+    // Fast is opt-in per client and model: the desktop catalog never offers it, so native Codex
+    // drops any service_tier. A client that wants Fast sends `x-codex-fast: 1` (the ping texting layer).
     const headers = new Headers(init.headers); headers.delete('content-length');
-    if (body.service_tier === 'default' || fast) return upstream(url, requestOptions(init, { headers }));
-    return upstream(url, rewriteJson(init, { service_tier: 'default' }, { headers }));
+    const fast = headers.get(FAST_HEADER) === '1' && PRIMARY_FAST_MODELS.has(body.model);
+    headers.delete(FAST_HEADER);
+    const tier = fast ? 'priority' : 'default';
+    logSafe('account-speed', { account: 'primary', model: body.model, tier });
+    if (body.service_tier === tier) return upstream(url, requestOptions(init, { headers }));
+    return upstream(url, rewriteJson(init, { service_tier: tier }, { headers }));
   };
 }
 

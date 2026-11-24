@@ -338,8 +338,11 @@ test('primary-only standard policy leaves hosted tools, aliases, and foreign ori
     expect(await calls.at(-1)!.json()).toMatchObject({ service_tier: 'priority' });
   }
   await route(target, request('gpt-6-luna', 'priority'));
+  expect(await calls.at(-1)!.json()).toMatchObject({ service_tier: 'default' });
+  await route(target, { ...request('gpt-6-luna'), headers: { 'x-codex-fast': '1' } });
   expect(await calls.at(-1)!.json()).toMatchObject({ service_tier: 'priority' });
-  await route(target, request('gpt-6-luna', 'flex'));
+  expect(calls.at(-1)!.headers.get('x-codex-fast')).toBeNull();
+  await route(target, { ...request('gpt-future'), headers: { 'x-codex-fast': '1' } });
   expect(await calls.at(-1)!.json()).toMatchObject({ service_tier: 'default' });
   const result = buildCatalog({ models: [{ slug: 'gpt-future', visibility: 'list', service_tiers: ['priority'], additional_speed_tiers: ['fast'] }] }, undefined, true);
   expect(result.models[0]).toMatchObject({ service_tiers: [], additional_speed_tiers: [], default_service_tier: 'default' });
