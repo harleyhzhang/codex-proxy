@@ -53,6 +53,9 @@ export function accountModel(model: unknown, prefix: string, models?: readonly s
   return native;
 }
 
+/** Primary models that may keep an explicit `priority` (Fast) request; everything else is forced to Standard. */
+export const PRIMARY_FAST_MODELS: ReadonlySet<string> = new Set(['gpt-6-luna']);
+
 /** Can be enabled independently of secondary-account routing. Native tool endpoints are untouched. */
 export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
   return async (url, init) => {
@@ -60,9 +63,11 @@ export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
     if (target.origin !== 'https://chatgpt.com' || !/^\/backend-api\/codex\/responses(?:\/|$)/.test(target.pathname) || typeof init.body !== 'string') return upstream(url, init);
     const body = requestJson(init);
     if (!record(body) || typeof body.model !== 'string' || !MODEL_SLUG.test(body.model)) return upstream(url, init);
-    logSafe('account-speed', { account: 'primary', model: body.model, tier: 'default' });
+    // Explicit Fast stays opt-in per model; the catalog never offers it to the desktop picker.
+    const fast = body.service_tier === 'priority' && PRIMARY_FAST_MODELS.has(body.model);
+    logSafe('account-speed', { account: 'primary', model: body.model, tier: fast ? 'priority' : 'default' });
     const headers = new Headers(init.headers); headers.delete('content-length');
-    if (body.service_tier === 'default') return upstream(url, requestOptions(init, { headers }));
+    if (body.service_tier === 'default' || fast) return upstream(url, requestOptions(init, { headers }));
     return upstream(url, rewriteJson(init, { service_tier: 'default' }, { headers }));
   };
 }
