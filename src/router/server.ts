@@ -6,6 +6,8 @@ import { dirname, join } from 'node:path';
 import type { ServerWebSocket } from 'bun';
 import { onClaudeRateLimit } from '../backends/claude';
 import { claudeLimits, claudeUsageSnapshot, type ClaudeUsage } from '../backends/claude-limits';
+import { loadSmartConfig, SmartRouter } from './smart-route';
+import { loadUsageSources, UsagePoller } from './usage-poller';
 import { BackendError, terminalEvent } from '../backends/contract';
 import { assertRoutable, backendFor, isLocalModel, claudeAccounts } from '../backends/registry';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
@@ -164,6 +166,24 @@ export function startRouter(options: RouterOptions) {
     }
   }
 
+  // Auto models: deterministic per-request account balancing from live usage (smart-routes.json).
+  const smartConfig = stateDir ? loadSmartConfig(stateDir) : undefined;
+  const usagePoller = smartConfig && stateDir
+    ? new UsagePoller(loadUsageSources(JSON.parse(readFileSync(join(stateDir, 'smart-routes.json'), 'utf8')).usage), stateDir).start()
+    : undefined;
+  const smart = smartConfig && usagePoller ? new SmartRouter(smartConfig, () => usagePoller.snapshots()) : undefined;
+
+  /** Replaces an auto slug with the chosen account's slug; a moved conversation drops account-bound reasoning. */
+  function routeAuto(raw: JsonRecord, headers: Headers): JsonRecord {
+    if (!smart?.isAuto(raw.model)) return raw;
+    const conversation = typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : headers.get('session_id') ?? headers.get('conversation_id') ?? undefined;
+    const { slug, switched, scores } = smart.resolve(raw.model, conversation);
+    if (raw.generate !== false) logSafe('smart-route', { auto: raw.model, slug, switched, scores: scores.map(s => `${s.slug}:${s.usable ? s.score.toFixed(2) : 'x'}:${s.reason}`).join(' ') });
+    const routed: JsonRecord = { ...raw, model: slug };
+    if (switched && Array.isArray(raw.input)) routed.input = raw.input.filter(item => !(isRecord(item) && item.type === 'reasoning'));
+    return routed;
+  }
+
   const bridgeFlights = new Map<string, BridgeFlight>();
 
   /** A bridge that reads OpenAI ciphertext with the caller's own credentials. */
@@ -206,7 +226,7 @@ export function startRouter(options: RouterOptions) {
 
   async function normalize(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const started = performance.now();
-    try { return await normalizeBody(raw, headers, signal); }
+    try { return await normalizeBody(routeAuto(raw, headers), headers, signal); }
     finally { logSafe('request-normalized', { ms: Math.round(performance.now() - started), local: isLocalModel(raw.model) }); }
   }
 

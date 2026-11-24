@@ -77,7 +77,7 @@ export function standardPrimaryFetch(upstream: UpstreamFetch): UpstreamFetch {
 }
 
 /** Perform an account-only native request; never starts a thread or a model generation. */
-export async function nativeAccountRequest(options: AccountOptions, method: 'account/read' | 'model/list', params: JsonRecord): Promise<unknown> {
+export async function nativeAccountRequest(options: AccountOptions, method: 'account/read' | 'model/list' | 'account/rateLimits/read', params: JsonRecord): Promise<unknown> {
   const child = Bun.spawn([options.binary, 'app-server', '--stdio', '-c', 'cli_auth_credentials_store="file"'], {
     env: { ...process.env, CODEX_HOME: options.home }, stdin: 'pipe', stdout: 'pipe', stderr: 'ignore',
   });
