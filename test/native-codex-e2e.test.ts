@@ -127,7 +127,8 @@ describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
       }
       expect(stored).toHaveLength(1);
       expect(stored[0]!.phase).toBe('commentary');
-      expect(stored[0]!.content).toEqual([{ type: 'output_text', text: marker + '\n' }]);
+      // Newer native Codex also stores `annotations: []`; only the text and type matter here.
+      expect(stored[0]!.content).toMatchObject([{ type: 'output_text', text: marker + '\n' }]);
     } finally { Object.assign(backend, original); anthropic.stop(); await app.close(); }
   }, 120_000);
 
