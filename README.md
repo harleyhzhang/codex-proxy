@@ -110,7 +110,30 @@ and all prior tool receipts are preserved. The next native WebSocket continuatio
 full history once because the logical recovery id differs from the upstream connection id.
 The router never replays an inference after exposing text, reasoning or a tool event; unknown
 events and more than 1 MiB of buffered metadata also commit the current attempt. A lasting
-overload keeps its native classification. No automatic model/account fallback is enabled.
+overload keeps its native classification. Explicit account/model choices never change accounts.
+
+### Auto routes and invalid logins
+
+An operator can configure deterministic same-model account balancing in
+`smart-routes.json` in the router's state directory. Only configured `auto-*`
+routes may switch accounts. Usage limits and spend controls still exclude accounts.
+If an account rejects authentication after its normal token refresh, the router
+quarantines that login and tries another eligible account before exposing output.
+The retry preserves conversation history and tool results; it never replays a turn
+after text, reasoning or tool output was exposed. Explicit account slugs remain pinned.
+
+Credential health is persisted separately in `account-health.json`, so stale usage
+data or a restart cannot revive a rejected login. The usage poller shares Claude's
+inference refresh flight and identity checks. A successful subsequent usage check
+reenables a repaired account without restarting the router.
+
+Optional `authFailureCommand: ["/absolute/path/to/notifier", "fixed-argument"]`
+in `smart-routes.json` runs once when an account first needs reauthorization. The
+router appends only its configured usage-source id, never credentials or prompts.
+The command runs directly without a shell and should deduplicate user notifications.
+An optional `authRecoveryCommand` with the same format runs after the login is
+verified again, allowing a notifier to close its earlier alert.
+The router does not perform an interactive login in the request path.
 
 ## Compaction and task continuation
 

@@ -49,8 +49,8 @@ type FailureOptions = {
 };
 
 /**
- * A deliberate refusal. Codex shows the message and never falls back to another model. Only the
- * backend itself may retry, once, and only when the refusal is marked retryable.
+ * A deliberate refusal. Explicit accounts stay pinned. Opt-in auto routes may select a different
+ * account for AccountAuthenticationError before output; ordinary refusals never trigger that switch.
  */
 export class BackendError extends Error {
   readonly code: string;
@@ -64,6 +64,14 @@ export class BackendError extends Error {
     this.logEvent = options.logEvent;
     this.retryable = options.retryable ?? false;
   }
+}
+
+/** A known account login failure, distinct from invalid prompts, quota and transient outages. */
+export class AccountAuthenticationError extends BackendError {
+  constructor(message: string, readonly refreshable = true) { super(message); }
+}
+export function accountAuthRequired(message: string): AccountAuthenticationError {
+  return new AccountAuthenticationError(message);
 }
 
 /**

@@ -18,7 +18,7 @@ import { abortable, ProxyTransportError, sleep } from '../transport';
 import { RetryBudget } from './retries';
 import { Admission } from './admission';
 import { claudeLimits, ClaudeUsageLimitError, ClaudeUsageLimits, rateLimitInfo } from './claude-limits';
-import { BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
+import { AccountAuthenticationError, accountAuthRequired, BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
 
 const MODEL_ALIASES: Readonly<Record<string, string>> = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5' };
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -260,7 +260,7 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
 }
 
 const signedOut = (configDir: string | undefined) =>
-  new ClaudeError(`Claude account is not logged in for this configuration, or its credential store is inaccessible; sign in again with \`${configDir ? `CLAUDE_CONFIG_DIR=${JSON.stringify(configDir)} ` : ''}claude auth login\``);
+  accountAuthRequired(`Claude account is not logged in for this configuration, or its credential store is inaccessible; sign in again with \`${configDir ? `CLAUDE_CONFIG_DIR=${JSON.stringify(configDir)} ` : ''}claude auth login\``);
 
 /** Anthropic's own error text, short; it never contains the request. */
 async function errorDetail(response: Response): Promise<string> {
@@ -362,7 +362,7 @@ export class ClaudeAccount {
       const org = isRecord(profile) && isRecord(profile.organization) ? profile.organization.uuid : undefined;
       if ((expectedEmail && email !== expectedEmail) || (expectedOrg && org !== expectedOrg)) {
         logSafe('claude-identity-mismatch', { email_match: !expectedEmail || email === expectedEmail, org_match: !expectedOrg || org === expectedOrg });
-        throw new ClaudeError('Claude account identity does not match its configured login');
+        throw new AccountAuthenticationError('Claude account identity does not match its configured login', false);
       }
     })();
     this.verified = { token, check };
@@ -372,9 +372,27 @@ export class ClaudeAccount {
 
   /** A verified token. A token the profile endpoint rejects is refreshed once. */
   private async authorize(signal?: AbortSignal, stale?: string): Promise<string> {
-    const token = await this.token(signal, stale);
-    await abortable(this.verify(token), signal);
+    let token = await this.token(signal, stale);
+    try { await abortable(this.verify(token), signal); }
+    catch (error) {
+      if (stale || !(error instanceof AccountAuthenticationError) || !error.refreshable || signal?.aborted) throw error;
+      token = await this.token(signal, token);
+      await abortable(this.verify(token), signal);
+    }
     return token;
+  }
+
+  /** Usage polling shares inference's refresh flight and identity pins; never rotate a second copy. */
+  async readUsage(): Promise<unknown> {
+    let token = await this.authorize();
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetch(`${this.api}/api/oauth/usage`, { headers: this.headers(token), signal: AbortSignal.timeout(15_000) });
+      if (response.ok) return response.json();
+      await response.body?.cancel();
+      if (response.status === 401 && attempt === 0) { token = await this.authorize(undefined, token); continue; }
+      if (response.status === 401) throw signedOut(this.options.configDir);
+      throw new ClaudeError(`Claude usage lookup failed (HTTP ${response.status})`);
+    }
   }
 
   /** A chat opening refreshes and verifies the login ahead of its first turn. Never throws. */
@@ -474,6 +492,7 @@ export class ClaudeAccount {
     } finally { idle.done(); }
     if (failure) {
       const detail = String(failure.message ?? failure.type ?? '').slice(0, 300);
+      if (failure.type === 'authentication_error') throw signedOut(this.options.configDir);
       if (CONTEXT_OVERFLOW_TEXT.test(detail)) throw contextOverflowError('Claude');
       if (failure.type === 'overloaded_error' && sink?.started) throw overloadedError('Claude');
       // A provider failure after the stream opened: one fresh attempt is safe while nothing reached Codex.
@@ -510,7 +529,7 @@ export class ClaudeAccount {
 
 }
 
-const primaryClaudeAccount = new ClaudeAccount({ configDir: process.env.CLAUDE_CONFIG_DIR, expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG }, claudeLimits);
+export const primaryClaudeAccount = new ClaudeAccount({ configDir: process.env.CLAUDE_CONFIG_DIR, expectedEmail: process.env.CLAUDE_EXPECTED_EMAIL, expectedOrg: process.env.CLAUDE_EXPECTED_ORG }, claudeLimits);
 export function onClaudeRateLimit(sink: (info: unknown) => void): void { primaryClaudeAccount.onRateLimit(sink); }
 
 const claudeModel = (slug: string, displayName: string) => ({

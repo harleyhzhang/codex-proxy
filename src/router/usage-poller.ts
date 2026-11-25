@@ -1,13 +1,14 @@
 // Keeps a fresh usage snapshot for every account an auto model can use, so the smart router sees usage
 // spent anywhere (other Macs, Claude Code, the web), not only through this router. Read-only: GPT
 // accounts via native `account/rateLimits/read`, Claude accounts via the OAuth usage endpoint with the
-// profile's existing access token (never refreshed here, so the CLI's token rotation is untouched).
+// profile's shared inference authorizer, so polling and inference never rotate separate token copies.
 import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isRecord } from '../json';
 import { logSafe } from '../log';
 import { nativeAccountRequest } from './account-upstream';
+import { AccountAuthenticationError, accountAuthRequired } from '../backends/contract';
 import type { UsageSnapshot, UsageWindow } from './smart-route';
 
 export type UsageSource =
@@ -80,9 +81,17 @@ async function claudeToken(configDir: string): Promise<string | undefined> {
 
 export class UsagePoller {
   private polled: Record<string, UsageSnapshot> = {};
+  private unhealthy: Record<string, { failedAt: number }> = {};
   private timer?: ReturnType<typeof setInterval>;
-  constructor(private sources: Record<string, UsageSource>, private stateDir: string, private intervalMs = 5 * 60_000) {
+  private polling?: Promise<void>;
+  constructor(private sources: Record<string, UsageSource>, private stateDir: string, private intervalMs = 5 * 60_000,
+    private options: { readClaudeUsage?: (configDir: string) => Promise<unknown>; authFailureCommand?: string[]; authRecoveryCommand?: string[] } = {}) {
     try { const saved: unknown = JSON.parse(readFileSync(join(stateDir, 'usage-snapshots.json'), 'utf8')); if (isRecord(saved)) this.polled = saved as Record<string, UsageSnapshot>; } catch {}
+    try {
+      const saved: unknown = JSON.parse(readFileSync(join(stateDir, 'account-health.json'), 'utf8'));
+      if (isRecord(saved)) for (const [id, value] of Object.entries(saved))
+        if (Object.hasOwn(sources, id) && isRecord(value) && typeof value.failedAt === 'number') this.unhealthy[id] = { failedAt: value.failedAt };
+    } catch {}
   }
 
   start(): this { void this.poll(); this.timer = setInterval(() => void this.poll(), this.intervalMs); this.timer.unref?.(); return this; }
@@ -97,26 +106,64 @@ export class UsagePoller {
       if (!existsSync(file)) continue;
       try { const local = claudeRouterSnapshot(JSON.parse(readFileSync(file, 'utf8'))); if (local && (!out[id] || local.updatedAt > out[id]!.updatedAt)) out[id] = local; } catch {}
     }
+    // Credential health is independent of usage: a newer quota snapshot cannot revive a bad login.
+    for (const id of Object.keys(this.unhealthy)) out[id] = { ...(out[id] ?? { updatedAt: 0, windows: [] }), blocked: 'authentication required', blockedUntil: null };
     return out;
   }
 
-  async poll(): Promise<void> {
+  markAuthFailure(id: string): void {
+    if (this.unhealthy[id]) return;
+    this.unhealthy[id] = { failedAt: Date.now() / 1000 };
+    this.saveHealth();
+    logSafe('account-auth-required', { account: id });
+    this.notifyAuth(id, false);
+  }
+
+  private notifyAuth(id: string, recovered: boolean): void {
+    const command = recovered ? this.options.authRecoveryCommand : this.options.authFailureCommand;
+    if (command?.length) {
+      try {
+        const child = Bun.spawn([...command, id], { stdin: 'ignore', stdout: 'ignore', stderr: 'ignore' });
+        void child.exited.then(code => { if (code) logSafe('account-auth-notification-failed', { account: id, exit: code }); });
+      } catch { logSafe('account-auth-notification-failed', { account: id }); }
+    }
+  }
+
+  private saveHealth(): void {
+    try { writeFileSync(join(this.stateDir, 'account-health.json'), JSON.stringify(this.unhealthy, null, 2), { mode: 0o600 }); }
+    catch { logSafe('account-health-save-failed'); }
+  }
+
+  poll(): Promise<void> {
+    return this.polling ??= this.pollOnce().finally(() => { this.polling = undefined; });
+  }
+
+  private async pollOnce(): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
     await Promise.all(Object.entries(this.sources).map(async ([id, source]) => {
+      const health = this.unhealthy[id];
       try {
         let snap: UsageSnapshot | undefined;
         if (source.kind === 'codex') snap = codexSnapshot(await nativeAccountRequest({ home: source.home, binary: source.binary, prefix: id }, 'account/rateLimits/read', {}), now);
         else {
-          const token = await claudeToken(source.configDir);
-          if (!token) return;
-          const res = await fetch('https://api.anthropic.com/api/oauth/usage', { headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'user-agent': 'codex-subscription-proxy-usage/1.0' }, signal: AbortSignal.timeout(15_000) });
-          if (!res.ok) { logSafe('usage-poll', { account: id, status: res.status }); return; }
-          snap = claudeOauthSnapshot(await res.json(), now);
+          if (this.options.readClaudeUsage) snap = claudeOauthSnapshot(await this.options.readClaudeUsage(source.configDir), now);
+          else {
+            const token = await claudeToken(source.configDir);
+            if (!token) throw accountAuthRequired('Claude login unavailable');
+            const res = await fetch('https://api.anthropic.com/api/oauth/usage', { headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'user-agent': 'codex-subscription-proxy-usage/1.0' }, signal: AbortSignal.timeout(15_000) });
+            if (res.status === 401) { await res.body?.cancel(); throw accountAuthRequired('Claude login rejected'); }
+            if (!res.ok) { await res.body?.cancel(); logSafe('usage-poll', { account: id, status: res.status }); return; }
+            snap = claudeOauthSnapshot(await res.json(), now);
+          }
         }
         if (!snap) return;
         this.polled[id] = snap;
+        if (health && this.unhealthy[id] === health) { delete this.unhealthy[id]; this.saveHealth(); logSafe('account-auth-recovered', { account: id }); this.notifyAuth(id, true); }
         appendFileSync(join(this.stateDir, 'usage-history.jsonl'), JSON.stringify({ at: now, account: id, snapshot: snap }) + '\n');
-      } catch (error) { logSafe('usage-poll', { account: id, error: error instanceof Error ? error.message.slice(0, 120) : 'failed' }); }
+      } catch (error) {
+        if (error instanceof AccountAuthenticationError) this.markAuthFailure(id);
+        logSafe('usage-poll', { account: id, failed: true });
+      }
     }));
     try { writeFileSync(join(this.stateDir, 'usage-snapshots.json'), JSON.stringify(this.polled, null, 2)); } catch {}
   }

@@ -1,7 +1,7 @@
 // A second native Codex login, isolated from the desktop login. Only explicitly namespaced
 // GPT models use it. Codex itself owns refresh-token rotation; this router never logs tokens.
 import { join } from 'node:path';
-import { BackendError } from '../backends/contract';
+import { accountAuthRequired, BackendError } from '../backends/contract';
 import type { UpstreamFetch } from './upstream';
 import { logSafe } from '../log';
 import { isRecord, type JsonRecord } from '../json';
@@ -198,7 +198,7 @@ export class AccountUpstream {
     }
     let identity: Identity;
     try { identity = await abortable(this.ready(), signal); }
-    catch { signal?.throwIfAborted(); throw new BackendError('Secondary Codex login unavailable; sign in again to its isolated profile. Primary account was not used.'); }
+    catch { signal?.throwIfAborted(); throw accountAuthRequired('Secondary Codex login unavailable; sign in again to its isolated profile. Primary account was not used.'); }
     signal?.throwIfAborted();
     const authorized = (current: Identity) => {
       const headers = new Headers(init.headers);

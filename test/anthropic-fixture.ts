@@ -45,6 +45,7 @@ export function anthropicFixture(identity: { email: string; org: string } = { em
     reply: (() => say('CLAUDE_OK')) as Handler,
     refreshes: 0,
     profile: (): Response => Response.json({ account: { uuid: 'acct', email: identity.email }, organization: { uuid: identity.org } }),
+    usage: (): Response => Response.json({ seven_day: { utilization: 10, resets_at: new Date(Date.now() + 86400000).toISOString() } }),
     refresh: (): Response => Response.json({ access_token: `access-${state.refreshes}`, refresh_token: `refresh-${state.refreshes}`, expires_in: 28_800 }),
     profileDelayMs: 0,
   };
@@ -55,6 +56,7 @@ export function anthropicFixture(identity: { email: string; org: string } = { em
     const body = req.method === 'POST' ? await req.json() as JsonRecord : {};
     state.seen.push({ path, headers, body });
     if (path === '/api/oauth/profile') { if (state.profileDelayMs) await Bun.sleep(state.profileDelayMs); return state.profile(); }
+    if (path === '/api/oauth/usage') return state.usage();
     if (path === '/v1/oauth/token') { state.refreshes++; return state.refresh(); }
     return (state.replies.shift() ?? state.reply)(body);
   } });

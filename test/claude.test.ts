@@ -266,6 +266,19 @@ test('an expiring login is refreshed once for concurrent turns and the rotated l
   expect(stored.expiresAt).toBeGreaterThan(Date.now() + 7 * 3_600_000);
 });
 
+test('usage polling and inference share one refresh, and a profile-rejected token can recover before inference', async () => {
+  const { account: claude } = account({ expiresInMs: 60_000, expectedEmail: 'work@example.com' });
+  await Promise.all([claude.readUsage(), claude.run(hello())]);
+  expect(anthropic.state.refreshes).toBe(1);
+  expect(anthropic.state.seen.find(entry => entry.path === '/api/oauth/usage')?.headers.authorization).toBe('Bearer access-1');
+  anthropic.state.seen.length = 0; anthropic.state.refreshes = 0;
+  let checks = 0;
+  anthropic.state.profile = () => ++checks === 1 ? new Response('{}', { status: 401 })
+    : Response.json({ account: { email: 'work@example.com' }, organization: { uuid: 'org_work' } });
+  expect((await account({ expectedEmail: 'work@example.com' }).account.run(hello())).text).toBe('CLAUDE_OK');
+  expect(checks).toBe(2); expect(anthropic.state.refreshes).toBe(1);
+});
+
 test('a token Anthropic rejects is refreshed once; a rejected refresh or missing login asks for a new sign-in', async () => {
   const { account: claude } = account();
   anthropic.state.replies.push(() => Response.json({ type: 'error', error: { type: 'authentication_error', message: 'expired' } }, { status: 401 }));

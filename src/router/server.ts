@@ -4,10 +4,11 @@ import { streamBufferBytes, SlowConsumerError } from '../protocol/buffer';
 import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import type { ServerWebSocket } from 'bun';
-import { onClaudeRateLimit } from '../backends/claude';
+import { onClaudeRateLimit, primaryClaudeAccount } from '../backends/claude';
 import { claudeLimits, claudeUsageSnapshot, type ClaudeUsage } from '../backends/claude-limits';
 import { loadSmartConfig, SmartRouter } from './smart-route';
 import { loadUsageSources, UsagePoller } from './usage-poller';
+import { AutoFailover, type AutoRouting } from './auto-failover';
 import { BackendError, terminalEvent } from '../backends/contract';
 import { assertRoutable, backendFor, isLocalModel, claudeAccounts } from '../backends/registry';
 import { isRecord, randomId, sha256, type JsonRecord } from '../json';
@@ -17,7 +18,7 @@ import { pendingEnvelope, pendingRelay, pendingResponse, pendingStream, startHea
 import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { validateControls, requestTools, toolDescriptors } from '../protocol/prompt';
 import { assertToolDescriptions } from '../protocol/native-tools';
-import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent } from '../protocol/types';
+import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent, type ToolCall } from '../protocol/types';
 import { failureStream, transportError, transportFailureEvent } from '../transport';
 import { upstreamAdmission } from './admission';
 import { NativeAuth } from './auth';
@@ -47,6 +48,8 @@ export type RouterOptions = {
   secondaryAccount?: AccountOptions;
   additionalAccounts?: readonly AccountOptions[];
   primaryStandard?: boolean;
+  /** Embedded clients can provide their own live account-health source. */
+  autoRouting?: AutoRouting;
   /** Keep native GPT continuations on their client's own upstream WebSocket. */
   upstreamWebSocket?: boolean;
   /** Transport injection for tests; production always connects to the native Codex backend. */
@@ -168,16 +171,34 @@ export function startRouter(options: RouterOptions) {
 
   // Auto models: deterministic per-request account balancing from live usage (smart-routes.json).
   const smartConfig = stateDir ? loadSmartConfig(stateDir) : undefined;
+  const smartSettings: unknown = smartConfig && stateDir ? JSON.parse(readFileSync(join(stateDir, 'smart-routes.json'), 'utf8')) : undefined;
+  const authCommand = (key: string): string[] | undefined => {
+    const value: unknown = isRecord(smartSettings) ? smartSettings[key] : undefined;
+    return Array.isArray(value) && value.length && value.every(part => typeof part === 'string' && part.length) ? value as string[] : undefined;
+  };
+  const claudeProfiles = [primaryClaudeAccount, ...claudeAccounts.map(entry => entry.account)];
   const usagePoller = smartConfig && stateDir
-    ? new UsagePoller(loadUsageSources(JSON.parse(readFileSync(join(stateDir, 'smart-routes.json'), 'utf8')).usage), stateDir).start()
+    ? new UsagePoller(loadUsageSources(isRecord(smartSettings) ? smartSettings.usage : undefined), stateDir, 5 * 60_000, {
+      authFailureCommand: authCommand('authFailureCommand'), authRecoveryCommand: authCommand('authRecoveryCommand'),
+      readClaudeUsage: configDir => {
+        const account = claudeProfiles.find(account => account.options.configDir === configDir);
+        if (!account) return Promise.reject(new Error('Usage profile is not configured'));
+        return account.readUsage();
+      },
+    }).start()
     : undefined;
-  const smart = smartConfig && usagePoller ? new SmartRouter(smartConfig, () => usagePoller.snapshots()) : undefined;
+  const smart = options.autoRouting?.router ?? (smartConfig && usagePoller ? new SmartRouter(smartConfig, () => usagePoller.snapshots()) : undefined);
+  const auto = options.autoRouting ?? (smart && usagePoller ? { router: smart, authFailed: (usage: string) => usagePoller.markAuthFailure(usage) } : undefined);
+  const failover = auto ? new AutoFailover(auto) : undefined;
+  const conversationFor = (raw: JsonRecord, headers: Headers) => typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : headers.get('session_id') ?? headers.get('conversation_id') ?? undefined;
 
   /** Replaces an auto slug with the chosen account's slug; a moved conversation drops account-bound reasoning. */
   function routeAuto(raw: JsonRecord, headers: Headers): JsonRecord {
     if (!smart?.isAuto(raw.model)) return raw;
-    const conversation = typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : headers.get('session_id') ?? headers.get('conversation_id') ?? undefined;
+    const conversation = conversationFor(raw, headers);
     const { slug, switched, scores } = smart.resolve(raw.model, conversation);
+    if (raw.generate !== false && !scores.some(score => score.usable))
+      throw new BackendError('No eligible account is available for this model. Check account sign-ins and usage limits.');
     if (raw.generate !== false) logSafe('smart-route', { auto: raw.model, slug, switched, scores: scores.map(s => `${s.slug}:${s.usable ? s.score.toFixed(2) : 'x'}:${s.reason}`).join(' ') });
     const routed: JsonRecord = { ...raw, model: slug };
     if (switched && Array.isArray(raw.input)) routed.input = raw.input.filter(item => !(isRecord(item) && item.type === 'reasoning'));
@@ -226,9 +247,30 @@ export function startRouter(options: RouterOptions) {
 
   async function normalize(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const started = performance.now();
-    try { return await normalizeBody(routeAuto(raw, headers), headers, signal); }
+    try {
+      const body = await normalizeBody(routeAuto(raw, headers), headers, signal);
+      if (smart?.isAuto(raw.model)) failover?.track(body, raw.model, conversationFor(raw, headers));
+      return body;
+    }
     finally { logSafe('request-normalized', { ms: Math.round(performance.now() - started), local: isLocalModel(raw.model) }); }
   }
+
+  const runAccount = <T>(body: ResponsesBody, signal: AbortSignal | undefined, attempt: () => Promise<T>, exposed?: () => boolean): Promise<T> =>
+    failover ? failover.run(body, signal, attempt, exposed) : attempt();
+  const runLocal: typeof localResponse = (body, signal, localOptions = {}) => {
+    let exposed = false;
+    const sink = localOptions.sink;
+    // Account changes must not replay even reasoning. Preserve the backend's existing same-account
+    // network retry semantics (`started` tracks text/tools) while tracking this stricter boundary.
+    const guarded = sink && {
+      get started() { return sink.started; },
+      text(delta: string) { if (delta) exposed = true; sink.text(delta); },
+      reasoning(delta: string) { if (delta && sink.reasoning) exposed = true; sink.reasoning?.(delta); },
+      call(call: ToolCall) { if (sink.call) exposed = true; sink.call?.(call); },
+      ...(sink.snapshot ? { snapshot: () => sink.snapshot!() } : {}),
+    };
+    return runAccount(body, signal, () => localResponse(body, signal, { ...localOptions, sink: guarded }), () => exposed || sink?.started === true);
+  };
 
   /** Produces a compaction item: a sealed capsule holding the summary and verbatim requests. */
   /**
@@ -243,21 +285,22 @@ export function startRouter(options: RouterOptions) {
     const input = Array.isArray(body.input) ? body.input : [];
     portableSummary('', input); // Fail before spending a generation if the requests cannot fit.
     const request = compactRequest(body);
+    failover?.inherit(body, request);
 
     let response: ResponseObject | undefined;
     const streamedItems = new CompletedItems();
     let streamedText = '';
     let terminal: StreamEvent | undefined;
     if (isLocalModel(body.model)) {
-      response = await localResponse(request, signal, { reconnect: offline !== undefined });
+      response = await runLocal(request, signal, { reconnect: offline !== undefined });
     } else {
       const { type: _type, previous_response_id: _previous, ...clean } = request;
       // Streamed like other turns, so bound silence rather than total time; native allows long compactions.
       const idle = idleDeadline(signal, timeoutMs);
       const forwarded = jsonHeaders(headers, { stripCodexMetadata: true });
-      const upstream = await watchBody(offline
-        ? connectUpstream(upstreamFetch, '/responses', forwarded, clean, idle, signal, offline)
-        : postJson(upstreamFetch, '/responses', forwarded, clean, idle.signal, idle.touch), idle);
+      const upstream = await runAccount(request, signal, () => watchBody(offline
+        ? connectUpstream(upstreamFetch, '/responses', forwarded, { ...clean, model: request.model, input: request.input }, idle, signal, offline)
+        : postJson(upstreamFetch, '/responses', forwarded, { ...clean, model: request.model, input: request.input }, idle.signal, idle.touch), idle));
       if (!upstream.ok) {
         const { detail, fields } = await upstreamFailure(upstream);
         log.warn('compact-upstream', { status: upstream.status, detail_chars: detail.length });
@@ -335,9 +378,9 @@ export function startRouter(options: RouterOptions) {
       }
       if (isLocalModel(body.model)) {
         if (path !== '/v1/responses') return invalidRequest('Use Codex local compaction for subscription models');
-        if (body.stream) return pendingStream(body, (signal, sink) => localResponse(body, signal, { sink }), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
+        if (body.stream) return pendingStream(body, (signal, sink) => runLocal(body, signal, { sink }), req.signal, pendingFailure, response => { if (body.generate !== false) history.remember(body, response); }, options.heartbeatMs);
         // Plain JSON has no channel for progress frames, so it fails like a native request would.
-        const response = await localResponse(body, req.signal, { reconnect: false });
+        const response = await runLocal(body, req.signal, { reconnect: false });
         if (body.generate !== false) history.remember(body, response);
         return Response.json(response);
       }
@@ -345,7 +388,7 @@ export function startRouter(options: RouterOptions) {
       const idle = idleDeadline(req.signal, timeoutMs);
       const upstreamPath = path.slice(3);
       try {
-        return relay(observeResponse(await watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal, idle.touch), idle), response => history.remember(body, response)));
+        return relay(observeResponse(await runAccount(body, idle.signal, () => watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal, idle.touch), idle)), response => history.remember(body, response)));
       } catch (error) {
         // Offline before any upstream byte: keep this request pending with progress frames instead of
         // spending one of Codex's five stream reconnects on every outage retry. The first attempt
@@ -355,7 +398,7 @@ export function startRouter(options: RouterOptions) {
         log.warn('upstream-offline', { path: upstreamPath });
         return pendingRelay(body, (signal) => {
           const pendingIdle = idleDeadline(signal, timeoutMs);
-          return watchBody(connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal), pendingIdle).then(response => observeResponse(response, response => history.remember(body, response)));
+          return runAccount(body, signal, () => watchBody(connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal), pendingIdle)).then(response => observeResponse(response, response => history.remember(body, response)));
         }, req.signal, pendingFailure, async (response) => {
           const { detail, fields } = await upstreamFailure(response);
           log.warn('upstream', { status: response.status, detail_chars: detail.length });
@@ -487,7 +530,7 @@ export function startRouter(options: RouterOptions) {
       } else if (isLocalModel(body.model)) {
         await pendingResponse(body, async (signal, sink) => {
           // An interrupt ends the turn: streamed text is closed as interrupted and no tool call is exposed.
-          try { return await localResponse(body, AbortSignal.any([signal, interrupt.signal]), { sink }); }
+          try { return await runLocal(body, AbortSignal.any([signal, interrupt.signal]), { sink }); }
           catch (error) {
             if (!interrupt.signal.aborted || signal.aborted) throw error;
             return interruptedResponse(responseObject(body, EMPTY_OUTPUT), []);
@@ -550,7 +593,7 @@ export function startRouter(options: RouterOptions) {
     let stop: (() => void) | undefined;
     let response: Response;
     try {
-      response = await watchBody(connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+      response = await runAccount(body, upstreamSignal, () => watchBody(connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, model: body.model, input: body.input, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle));
     } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
@@ -617,6 +660,6 @@ export function startRouter(options: RouterOptions) {
     },
   });
   const stop = server.stop.bind(server);
-  server.stop = closeActiveConnections => { history.close(); return stop(closeActiveConnections); };
+  server.stop = closeActiveConnections => { history.close(); usagePoller?.stop(); return stop(closeActiveConnections); };
   return server;
 }
