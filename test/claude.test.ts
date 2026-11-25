@@ -161,6 +161,15 @@ test('a forced tool choice turns thinking off; aliases resolve and unknown effor
   expect(estimateVisibleTokens('hello')).toBe(2);
 });
 
+test('effort "none" sends no thinking at low effort, even on an account pinned to another effort', async () => {
+  const { account: claude } = account();
+  await claude.run(hello({ reasoning: { effort: 'none' } }));
+  expect(sent().thinking).toBeUndefined();
+  expect(sent().output_config).toMatchObject({ effort: 'low' });
+  await claude.run(hello({ reasoning: { effort: 'low' } }));
+  expect(sent(1).thinking).toMatchObject({ type: 'adaptive' });
+});
+
 test('history keeps its structure and every call is answered exactly once in the next turn', async () => {
   const keyFor = (name: string) => name.replace(/[^A-Za-z0-9_-]/g, '_');
   const turns = await claudeMessages({ model: 'claude-opus-5-5', input: [

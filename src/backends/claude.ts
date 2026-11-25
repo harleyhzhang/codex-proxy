@@ -49,7 +49,12 @@ export function resolveModel(model: string): string {
   return model;
 }
 
+/** `none` (not in the catalog): no thinking at all, low effort. For instant short replies (pingd's texting
+ * front), where adaptive thinking alone cost ~2-3 s before the first token. */
+const noThinking = (request: ResponsesRequest) => request.reasoning?.effort === 'none';
+
 function resolveEffort(request: ResponsesRequest): string {
+  if (noThinking(request)) return 'low';
   const effort = request.reasoning?.effort ?? 'high';
   if (!(EFFORTS as readonly string[]).includes(effort)) throw new ClaudeError(`Unsupported Claude reasoning effort: ${effort}`);
   return effort;
@@ -253,7 +258,7 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
       ...(choice ? { tool_choice: choice } : {}),
       // Anthropic refuses thinking when the tool choice forces a call. Its thinking text stays omitted (the
       // default): asking for a summary delayed the first answer text by about 0.8 s and arrived with it.
-      ...(choice?.type === 'any' || choice?.type === 'tool' ? {} : { thinking: { type: 'adaptive', ...(request.model === 'claude-fable-5-2' ? { block_binding: { prefix_mismatch_behavior: 'drop_block' } } : {}) } }),
+      ...(choice?.type === 'any' || choice?.type === 'tool' || noThinking(request) ? {} : { thinking: { type: 'adaptive', ...(request.model === 'claude-fable-5-2' ? { block_binding: { prefix_mismatch_behavior: 'drop_block' } } : {}) } }),
       output_config: { effort: resolveEffort(request), ...(claudeOutputFormat(request) ? { format: claudeOutputFormat(request) } : {}) },
     },
   };
@@ -447,7 +452,7 @@ export class ClaudeAccount {
     signal?.throwIfAborted();
     this.limits.assertAvailable(request.model);
     const started = performance.now();
-    const effective = this.options.reasoningEffort ? { ...request, reasoning: { ...request.reasoning, effort: this.options.reasoningEffort } } : request;
+    const effective = this.options.reasoningEffort && !noThinking(request) ? { ...request, reasoning: { ...request.reasoning, effort: this.options.reasoningEffort } } : request;
     const { body, byKey } = await claudeRequest(effective, this.replay, signal);
     const model = String(body.model);
     if (this.options.fastMode && FAST_MODELS.has(model) && Date.now() >= (this.fastUnavailableUntil.get(model) ?? 0)) body.speed = 'fast';
