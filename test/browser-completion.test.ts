@@ -68,7 +68,7 @@ test('quoted, inline, fenced, malformed and oversized markers remain literal tex
     `Example: ${marker}`, `\`${marker}\``, `> ${marker}`, ` ${marker}`,
     `\`\`\`text\n${marker}\n\`\`\``, `~~~\n${marker}\n~~~`,
     '::browser-complete{title=""}', '::browser-complete{title="unfinished',
-    `${marker} trailing text`, '::browser-complete{title="' + 'x'.repeat(5000) + '"}',
+    '::browser-complete{title="' + 'x'.repeat(5000) + '"}',
   ]) {
     const response = await pendingResponse(request, async (_signal, sink) => {
       for (const char of text) sink.text(char);
@@ -103,4 +103,18 @@ test('tools and snapshots flush a marker without a newline before the next item'
     ['message', 'commentary'], ['function_call', undefined], ['message', undefined],
   ]);
   expect(messages(response).map(textOf)).toEqual([marker, answer]);
+});
+
+test('a marker glued to the answer without a newline is still split into commentary', async () => {
+  for (const text of [`${marker}${answer}`, `${marker} ${answer}`]) {
+    check(responseObject(request, output(text)), text);
+    for (let cut = 0; cut <= text.length; cut++) {
+      const response = await pendingResponse(request, async (_signal, sink) => {
+        sink.text(text.slice(0, cut));
+        sink.text(text.slice(cut));
+        return responseObject(request, output(text));
+      }, new AbortController().signal, () => {});
+      check(response, text);
+    }
+  }
 });

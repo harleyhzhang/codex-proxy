@@ -4,6 +4,7 @@
 export type AssistantTextPart = { text: string; phase?: 'commentary' };
 const PREFIX = '::browser-complete{';
 const MAX_LINE = 4096;
+const DIRECTIVE = /^::browser-complete\{title=("(?:[^"\\\r\n]|\\[^\r\n])*")\}/;
 
 function isCompletion(line: string): boolean {
   const match = /^::browser-complete\{title=("(?:[^"\\\r\n]|\\[^\r\n])*")\}[ \t]*(?:\r?\n)?$/.exec(line);
@@ -35,11 +36,24 @@ export class AssistantText {
           this.emit({ text: this.held });
           this.held = '';
           this.plain = true;
-        } else if (newline >= 0) this.release();
+        } else if (!this.splitGlued() && newline >= 0) this.release();
       }
       if (newline >= 0) this.endLine();
       offset = end;
     }
+  }
+
+  /** Models sometimes glue prose straight after the closing brace ("…}Done."). Separate them. */
+  private splitGlued(): boolean {
+    const match = DIRECTIVE.exec(this.held);
+    if (!match) return false;
+    const rest = this.held.slice(match[0].length);
+    if (!rest.trim() || !isCompletion(match[0])) return false;
+    this.emit({ text: match[0], phase: 'commentary' });
+    this.emit({ text: rest });
+    this.held = '';
+    this.plain = true;
+    return true;
   }
 
   /** A tool, reasoning block or end of response terminates the current text message. */
