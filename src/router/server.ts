@@ -178,7 +178,7 @@ export function startRouter(options: RouterOptions) {
   };
   const claudeProfiles = [primaryClaudeAccount, ...claudeAccounts.map(entry => entry.account)];
   const usagePoller = smartConfig && stateDir
-    ? new UsagePoller(loadUsageSources(isRecord(smartSettings) ? smartSettings.usage : undefined), stateDir, 5 * 60_000, {
+    ? new UsagePoller(loadUsageSources(isRecord(smartSettings) ? smartSettings.usage : undefined), stateDir, 60_000, {
       authFailureCommand: authCommand('authFailureCommand'), authRecoveryCommand: authCommand('authRecoveryCommand'),
       readClaudeUsage: configDir => {
         const account = claudeProfiles.find(account => account.options.configDir === configDir);
@@ -193,8 +193,9 @@ export function startRouter(options: RouterOptions) {
   const conversationFor = (raw: JsonRecord, headers: Headers) => typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : headers.get('session_id') ?? headers.get('conversation_id') ?? undefined;
 
   /** Replaces an auto slug with the chosen account's slug; a moved conversation drops account-bound reasoning. */
-  function routeAuto(raw: JsonRecord, headers: Headers): JsonRecord {
+  async function routeAuto(raw: JsonRecord, headers: Headers): Promise<JsonRecord> {
     if (!smart?.isAuto(raw.model)) return raw;
+    await usagePoller?.ensureFresh();
     const conversation = conversationFor(raw, headers);
     const { slug, switched, scores } = smart.resolve(raw.model, conversation);
     if (raw.generate !== false && !scores.some(score => score.usable))
@@ -248,7 +249,7 @@ export function startRouter(options: RouterOptions) {
   async function normalize(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const started = performance.now();
     try {
-      const body = await normalizeBody(routeAuto(raw, headers), headers, signal);
+      const body = await normalizeBody(await routeAuto(raw, headers), headers, signal);
       if (smart?.isAuto(raw.model)) failover?.track(body, raw.model, conversationFor(raw, headers));
       return body;
     }

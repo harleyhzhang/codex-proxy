@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeAccountBackend } from '../src/backends/claude';
@@ -22,6 +22,9 @@ async function setup() {
   const rows = providers.map((provider, i) => createClaudeAccountBackend({ ...provider.options(), configDir: join(dir, `profile-${i}`), prefix: `auth${i}`, label: `Fixture ${i}`, expectedEmail: 'work@example.com', expectedOrg: 'org_work', models: ['claude-opus-5-5'] }));
   (BACKENDS as SubscriptionBackend[]).push(...rows.map(row => row.backend));
   const candidates = rows.map((row, i) => ({ slug: Object.keys(row.backend.models)[0]!, usage: `fixture-${i}`, tier: 'work' as const }));
+  await writeFile(join(dir, 'usage-snapshots.json'), JSON.stringify(Object.fromEntries(candidates.map(c => [c.usage, {
+    updatedAt: Date.now() / 1000, windows: [{ name: 'weekly', used: 0, resetsAt: null, minutes: 10080 }],
+  }]))));
   const poller = new UsagePoller({}, dir);
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [AUTO]: candidates } }, () => poller.snapshots());
   const routing = { router, authFailed: (id: string) => poller.markAuthFailure(id) };
@@ -166,8 +169,11 @@ for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: nati
   const jwt = (value: unknown) => 'fixture.' + Buffer.from(JSON.stringify(value)).toString('base64url') + '.fixture';
   await Bun.write(join(dir, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: jwt({ exp: Date.now() / 1000 + 3600 }), id_token: jwt({ email: 'team@example.com' }), account_id: 'team' } }));
   await Bun.write(join(dir, 'models_cache.json'), JSON.stringify({ models: [{ slug: 'gpt-6.1-sol', visibility: 'list' }] }));
-  const poller = new UsagePoller({}, dir);
   const candidates = [{ slug: 'team-gpt-6.1-sol', usage: 'team', tier: 'work' as const }, { slug: 'gpt-6.1-sol', usage: 'personal', tier: 'personal' as const }];
+  await writeFile(join(dir, 'usage-snapshots.json'), JSON.stringify(Object.fromEntries(candidates.map(c => [c.usage, {
+    updatedAt: Date.now() / 1000, windows: [{ name: 'weekly', used: 0, resetsAt: null, minutes: 10080 }],
+  }]))));
+  const poller = new UsagePoller({}, dir);
   const model = 'auto-gpt-6.1-sol';
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [model]: candidates } }, () => poller.snapshots());
   let refreshes = 0; const requests: string[] = [];
@@ -209,4 +215,41 @@ test('an auth notification receives only the account id, once per incident', asy
     for (let n = 0; n < 100 && !await Bun.file(recoveredFile).exists(); n++) await Bun.sleep(5);
     expect(await Bun.file(recoveredFile).text()).toBe('team\n');
   } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: parallel auto work moves before spending the last reserved room`, async () => {
+  const f = await setup();
+  let release: (() => void) | undefined;
+  let entered: (() => void) | undefined;
+  const firstEntered = new Promise<void>(resolve => { entered = resolve; });
+  try {
+    const first = f.poller.snapshots()['fixture-0']!;
+    first.windows[0]!.used = 0.87; first.overage = true;
+    f.poller.snapshots()['fixture-1']!.windows[0]!.used = 0.88;
+    f.providers[0]!.state.reply = async () => {
+      entered!(); await new Promise<void>(resolve => { release = resolve; }); return say('FIRST');
+    };
+    f.providers[1]!.state.reply = () => say('ELASTIC');
+    const invoke = async (key: string) => transport === 'ws'
+      ? JSON.stringify(await socketTurn(f.app, { model: AUTO, input: 'hello', prompt_cache_key: key }))
+      : (await post(f.app, { model: AUTO, input: 'hello', stream: transport === 'sse', prompt_cache_key: key })).text();
+    const active = invoke('same-conversation');
+    await firstEntered;
+    const next = await invoke('same-conversation');
+    expect(next).toContain('ELASTIC');
+    expect(f.providers[0]!.messages()).toHaveLength(1);
+    release!(); await active;
+  } finally { release?.(); await f.close(); }
+});
+
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: no safe allowance stops locally without a paid fallback`, async () => {
+  const f = await setup();
+  try {
+    for (const snap of Object.values(f.poller.snapshots())) { snap!.windows[0]!.used = 1; snap!.overage = true; }
+    const result = transport === 'ws' ? JSON.stringify(await socketTurn(f.app, { model: AUTO, input: 'hello' }))
+      : await (await post(f.app, { model: AUTO, input: 'hello', stream: transport === 'sse' })).text();
+    expect(result).toContain('No eligible account');
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
+  } finally { await f.close(); }
 });

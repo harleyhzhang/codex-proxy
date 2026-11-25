@@ -117,6 +117,16 @@ overload keeps its native classification. Explicit account/model choices never c
 An operator can configure deterministic same-model account balancing in
 `smart-routes.json` in the router's state directory. Only configured `auto-*`
 routes may switch accounts. Usage limits and spend controls still exclude accounts.
+Every dispatch rechecks verified usage no older than three minutes; polling runs every
+minute. Missing, expired or stale readings cannot authorize automatic spending.
+A warm conversation moves when another account scores at least 25% better.
+Each dispatch reserves two percentage points of weekly/monthly allowance and ten
+of session allowance, including the new request and parallel work. Finished work
+keeps its reserve until a subsequent provider reading; streamed responses keep it
+through stream completion or cancellation. These conservative budgets reduce overshoot;
+provider billing caps are still needed for an absolute monetary guarantee.
+Response headers cannot lower same-window usage or erase an omitted model limit or
+billing flag from OAuth. Each window retains its own observation time.
 If an account rejects authentication after its normal token refresh, the router
 quarantines that login and tries another eligible account before exposing output.
 The retry preserves conversation history and tool results; it never replays a turn

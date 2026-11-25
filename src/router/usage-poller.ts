@@ -63,11 +63,29 @@ export function claudeRouterSnapshot(raw: unknown): UsageSnapshot | undefined {
   const windows: UsageWindow[] = [];
   for (const [key, w] of [['five_hour', raw.five_hour], ['seven_day', raw.seven_day], ...Object.entries(isRecord(raw.model_windows) ? raw.model_windows : {})] as [string, unknown][]) {
     const used = isRecord(w) ? num(w.used_percent) : undefined;
-    if (isRecord(w) && used !== undefined) windows.push({ name: key, used: used / 100, resetsAt: epoch(w.resets_at), minutes: num(w.window_minutes) ?? 10_080 });
+    if (isRecord(w) && used !== undefined) windows.push({ name: key, used: used / 100, resetsAt: epoch(w.resets_at), minutes: num(w.window_minutes) ?? (key === 'five_hour' ? 300 : 10_080) });
   }
   const snap: UsageSnapshot = { updatedAt: num(raw.updated_at) ?? 0, windows, overage: raw.overage_status === 'allowed' };
   if (raw.status === 'rejected') { snap.blocked = 'rejected'; snap.blockedUntil = Math.max(0, ...windows.map(w => w.resetsAt ?? 0)) || null; }
   return snap;
+}
+
+/** Response headers can be rounded or omit windows present in OAuth. Keep the highest same-window
+ * reading, preserve billing/blocks, and accept a lower value only for a newly verified reset window. */
+export function mergeUsageSnapshots(a: UsageSnapshot, b: UsageSnapshot): UsageSnapshot {
+  const [older, newer] = a.updatedAt <= b.updatedAt ? [a, b] : [b, a];
+  const windows = new Map(older.windows.filter(w => w.resetsAt == null || w.resetsAt > newer.updatedAt)
+    .map(w => [w.name, { ...w, observedAt: w.observedAt ?? older.updatedAt }]));
+  for (const w of newer.windows) {
+    const old = windows.get(w.name);
+    const sameReset = old && (old.resetsAt === w.resetsAt || old.resetsAt != null && w.resetsAt != null && Math.abs(old.resetsAt - w.resetsAt) <= 1);
+    windows.set(w.name, { ...w, observedAt: w.observedAt ?? newer.updatedAt, ...(sameReset ? { used: Math.max(old.used, w.used) } : {}) });
+  }
+  const activeBlock = [newer, older].find(s => s.blocked && (s.blockedUntil == null || s.blockedUntil > newer.updatedAt));
+  return { ...newer, updatedAt: newer.updatedAt, windows: [...windows.values()],
+    overage: a.overage === true || b.overage === true,
+    ...(activeBlock ? { blocked: activeBlock.blocked, blockedUntil: activeBlock.blockedUntil } : {}),
+  };
 }
 
 async function claudeToken(configDir: string): Promise<string | undefined> {
@@ -84,6 +102,7 @@ export class UsagePoller {
   private unhealthy: Record<string, { failedAt: number }> = {};
   private timer?: ReturnType<typeof setInterval>;
   private polling?: Promise<void>;
+  private lastAttempt = 0;
   constructor(private sources: Record<string, UsageSource>, private stateDir: string, private intervalMs = 5 * 60_000,
     private options: { readClaudeUsage?: (configDir: string) => Promise<unknown>; authFailureCommand?: string[]; authRecoveryCommand?: string[] } = {}) {
     try { const saved: unknown = JSON.parse(readFileSync(join(stateDir, 'usage-snapshots.json'), 'utf8')); if (isRecord(saved)) this.polled = saved as Record<string, UsageSnapshot>; } catch {}
@@ -104,7 +123,7 @@ export class UsagePoller {
       if (source.kind !== 'claude' || !source.routerSnapshot) continue;
       const file = join(this.stateDir, source.routerSnapshot);
       if (!existsSync(file)) continue;
-      try { const local = claudeRouterSnapshot(JSON.parse(readFileSync(file, 'utf8'))); if (local && (!out[id] || local.updatedAt > out[id]!.updatedAt)) out[id] = local; } catch {}
+      try { const local = claudeRouterSnapshot(JSON.parse(readFileSync(file, 'utf8'))); if (local) out[id] = out[id] ? mergeUsageSnapshots(out[id]!, local) : local; } catch {}
     }
     // Credential health is independent of usage: a newer quota snapshot cannot revive a bad login.
     for (const id of Object.keys(this.unhealthy)) out[id] = { ...(out[id] ?? { updatedAt: 0, windows: [] }), blocked: 'authentication required', blockedUntil: null };
@@ -134,12 +153,21 @@ export class UsagePoller {
     catch { logSafe('account-health-save-failed'); }
   }
 
+  /** Await startup/in-progress renewal; stale cached usage gets one bounded refresh, not one per request. */
+  async ensureFresh(): Promise<void> {
+    if (this.polling) return this.polling;
+    const now = Date.now() / 1000;
+    const snapshots = this.snapshots();
+    if (now - this.lastAttempt >= 30 && Object.keys(this.sources).some(id => !snapshots[id] || now - snapshots[id]!.updatedAt >= 60)) await this.poll();
+  }
+
   poll(): Promise<void> {
     return this.polling ??= this.pollOnce().finally(() => { this.polling = undefined; });
   }
 
   private async pollOnce(): Promise<void> {
     const now = Math.floor(Date.now() / 1000);
+    this.lastAttempt = now;
     await Promise.all(Object.entries(this.sources).map(async ([id, source]) => {
       const health = this.unhealthy[id];
       try {
@@ -157,7 +185,7 @@ export class UsagePoller {
           }
         }
         if (!snap) return;
-        this.polled[id] = snap;
+        this.polled[id] = this.polled[id] ? mergeUsageSnapshots(this.polled[id]!, snap) : snap;
         if (health && this.unhealthy[id] === health) { delete this.unhealthy[id]; this.saveHealth(); logSafe('account-auth-recovered', { account: id }); this.notifyAuth(id, true); }
         appendFileSync(join(this.stateDir, 'usage-history.jsonl'), JSON.stringify({ at: now, account: id, snapshot: snap }) + '\n');
       } catch (error) {

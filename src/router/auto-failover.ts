@@ -1,5 +1,5 @@
 // One bounded account retry before output: auto routes may change accounts, explicit slugs never do.
-import { AccountAuthenticationError, accountAuthRequired } from '../backends/contract';
+import { AccountAuthenticationError, accountAuthRequired, BackendError } from '../backends/contract';
 import { logSafe } from '../log';
 import type { ResponsesBody } from '../protocol/types';
 import type { SmartRouter } from './smart-route';
@@ -29,11 +29,33 @@ export class AutoFailover {
     if (!context || body.generate === false) return attempt();
     for (;;) {
       signal?.throwIfAborted();
+      // Normalization can await history/bridging. Recheck room at actual dispatch time.
+      const selected = this.routing.router.resolve(context.auto, context.conversation);
+      if (!selected.scores.some(s => s.slug === selected.slug && s.usable))
+        throw new BackendError('No eligible account is available for this model. Check account sign-ins and usage limits.');
+      if (body.model !== selected.slug) {
+        body.model = selected.slug;
+        if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');
+      }
+      const finish = this.routing.router.reserve(body.model);
+      let streaming = false;
       try {
         const result = await attempt();
         if (result instanceof Response && result.status === 401) {
           await result.body?.cancel();
           throw accountAuthRequired('Account login rejected; sign in again to its isolated profile.');
+        }
+        if (result instanceof Response && result.body) {
+          streaming = true;
+          const reader = result.body.getReader();
+          const stream = new ReadableStream<Uint8Array>({
+            async pull(controller) {
+              try { const next = await reader.read(); if (next.done) { finish(); controller.close(); } else controller.enqueue(next.value); }
+              catch (error) { finish(); controller.error(error); }
+            },
+            async cancel(reason) { finish(); await reader.cancel(reason); },
+          });
+          return new Response(stream, { status: result.status, statusText: result.statusText, headers: result.headers }) as T;
         }
         return result;
       } catch (error) {
@@ -50,7 +72,7 @@ export class AutoFailover {
         body.model = slug;
         // Account-bound reasoning must not cross logins; user messages, tools and tool results survive.
         if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');
-      }
+      } finally { if (!streaming) finish(); }
     }
   }
 }
