@@ -137,3 +137,20 @@ test('partial fresh headers cannot freshen an unobserved allowance; verified res
   expect(merged.windows.some(w => w.name === 'expired')).toBe(false);
   expect(scoreCandidate(opus[0]!, merged, now).usable).toBe(false);
 });
+
+
+test('partial response observations release only their own window reserves', () => {
+  let clock = now;
+  const snapshot = week(0.85, 2, { overage: true });
+  snapshot.windows.push({ name: 'five_hour', used: 0.1, resetsAt: now + 3600, minutes: 300 });
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => ({ whop: snapshot }), () => clock);
+  const done = [router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug)];
+  done.forEach(finish => finish());
+  clock++;
+  snapshot.updatedAt = clock;
+  snapshot.windows[0]!.observedAt = now;
+  snapshot.windows[1]!.observedAt = clock;
+  expect(router.resolve('auto').scores[0]!.usable).toBe(false);
+  snapshot.windows[0]!.observedAt = clock;
+  expect(router.resolve('auto').scores[0]!.usable).toBe(true);
+});

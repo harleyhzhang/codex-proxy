@@ -27,7 +27,7 @@ async function setup() {
   }]))));
   const poller = new UsagePoller({}, dir);
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [AUTO]: candidates } }, () => poller.snapshots());
-  const routing = { router, authFailed: (id: string) => poller.markAuthFailure(id) };
+  const routing = { router, authFailed: (id: string) => poller.markAuthFailure(id), refreshUsage: undefined as (() => Promise<void>) | undefined };
   const app = await fixtureRouter({ autoRouting: routing });
   return { app, providers, rows, candidates, poller, routing, async close() {
     await app.close();
@@ -252,4 +252,94 @@ for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: no s
     expect(result).toContain('No eligible account');
     expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
   } finally { await f.close(); }
+});
+
+
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: completed tool-loop reserves refresh quota instead of refusing healthy accounts`, async () => {
+  const f = await setup();
+  try {
+    for (const candidate of f.candidates) for (let n = 0; n < 50; n++) f.routing.router.reserve(candidate.slug)();
+    let refreshes = 0;
+    f.routing.refreshUsage = async () => {
+      refreshes++;
+      for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.updatedAt = Date.now() / 1000 + 1;
+    };
+    f.providers[0]!.state.reply = () => say('RESERVES_RECOVERED');
+    const result = transport === 'ws' ? JSON.stringify(await socketTurn(f.app, { model: AUTO, input: 'continue after tools' }))
+      : await (await post(f.app, { model: AUTO, input: 'continue after tools', stream: transport === 'sse' })).text();
+    expect(result).toContain('RESERVES_RECOVERED');
+    expect(refreshes).toBe(1);
+    expect(f.providers[0]!.messages()).toHaveLength(1);
+    expect(f.providers[1]!.messages()).toHaveLength(0);
+  } finally { await f.close(); }
+});
+
+test('cancelled reservation wait never dispatches, and a fresh poll cannot erase active work', async () => {
+  const f = await setup();
+  try {
+    for (const candidate of f.candidates) for (let n = 0; n < 50; n++) f.routing.router.reserve(candidate.slug);
+    f.routing.refreshUsage = async () => {
+      for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.updatedAt = Date.now() / 1000 + 1;
+    };
+    const failover = new AutoFailover(f.routing);
+    const body: ResponsesBody = { model: f.candidates[0]!.slug, input: [] };
+    failover.track(body, AUTO);
+    const controller = new AbortController();
+    const pending = failover.run(body, controller.signal, async () => { throw new Error('must not dispatch'); });
+    setTimeout(() => controller.abort(new Error('cancel queued request')), 10);
+    await expect(pending).rejects.toThrow('cancel queued request');
+    expect(f.routing.router.resolve(AUTO).scores.every(s => !s.usable)).toBe(true);
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
+  } finally { await f.close(); }
+});
+
+test('many concurrent recovery reads share one provider poll', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'admission-poll-'));
+  let reads = 0, release: (() => void) | undefined;
+  const poller = new UsagePoller({ team: { kind: 'claude', configDir: '/fixture' } }, dir, 60000, {
+    readClaudeUsage: async () => {
+      reads++;
+      await new Promise<void>(resolve => { release = resolve; });
+      return { seven_day: { utilization: 10 } };
+    },
+  });
+  try {
+    const pending = Array.from({ length: 50 }, () => poller.refreshForAdmission());
+    expect(reads).toBe(1);
+    release!(); await Promise.all(pending);
+    await poller.refreshForAdmission();
+    expect(reads).toBe(1);
+  } finally { release?.(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('parallel admission waits for room, resumes after verification, and never oversubscribes', async () => {
+  const f = await setup();
+  const releases: Array<() => void> = [];
+  try {
+    const candidate = f.candidates[0]!;
+    f.routing.router.config.routes[AUTO] = [candidate];
+    const snapshot = f.poller.snapshots()[candidate.usage]!;
+    snapshot.windows[0]!.used = 0.85;
+    snapshot.overage = true;
+    f.routing.refreshUsage = async () => { snapshot.updatedAt = Date.now() / 1000 + 0.001; };
+    const failover = new AutoFailover(f.routing);
+    let active = 0, peak = 0, dispatched = 0;
+    const jobs = Array.from({ length: 3 }, () => {
+      const body: ResponsesBody = { model: candidate.slug, input: [] };
+      failover.track(body, AUTO);
+      return failover.run(body, undefined, async () => {
+        dispatched++; peak = Math.max(peak, ++active);
+        await new Promise<void>(resolve => { releases.push(resolve); });
+        active--; return responseObject(body, EMPTY_OUTPUT);
+      });
+    });
+    for (let n = 0; n < 100 && dispatched < 2; n++) await Bun.sleep(5);
+    expect(dispatched).toBe(2);
+    releases[0]!();
+    for (let n = 0; n < 300 && dispatched < 3; n++) await Bun.sleep(5);
+    expect(dispatched).toBe(3);
+    expect(peak).toBe(2);
+    releases.forEach(release => release());
+    await Promise.all(jobs);
+  } finally { releases.forEach(release => release()); await f.close(); }
 });

@@ -1,11 +1,12 @@
 // One bounded account retry before output: auto routes may change accounts, explicit slugs never do.
 import { AccountAuthenticationError, accountAuthRequired, BackendError } from '../backends/contract';
 import { logSafe } from '../log';
+import { abortable, sleep } from '../transport';
 import type { ResponsesBody } from '../protocol/types';
 import type { SmartRouter } from './smart-route';
 import { UpstreamStatusError } from './upstream';
 
-export type AutoRouting = { router: SmartRouter; authFailed: (usage: string) => void };
+export type AutoRouting = { router: SmartRouter; authFailed: (usage: string) => void; refreshUsage?: () => Promise<void> };
 type Context = { auto: string; conversation?: string; attempted: Set<string> };
 
 export function isAccountAuthFailure(error: unknown): boolean {
@@ -15,6 +16,32 @@ export function isAccountAuthFailure(error: unknown): boolean {
 export class AutoFailover {
   private contexts = new WeakMap<ResponsesBody, Context>();
   constructor(private routing: AutoRouting) {}
+
+  /** An exhausted local reserve is backpressure, not an exhausted subscription. */
+  async select(auto: string, conversation?: string, signal?: AbortSignal) {
+    const deadline = Date.now() + 120_000;
+    let refreshed = false;
+    for (;;) {
+      signal?.throwIfAborted();
+      const selected = this.routing.router.resolve(auto, conversation);
+      if (selected.scores.some(s => s.usable)) return selected;
+      if (!refreshed && this.routing.refreshUsage) {
+        logSafe('smart-route-refresh', { auto });
+        await abortable(this.routing.refreshUsage(), signal);
+        refreshed = true;
+        continue;
+      }
+      const pressure = this.routing.router.reservationBlocked(auto);
+      if (pressure && this.routing.refreshUsage && Date.now() < deadline) {
+        await sleep(1000, signal);
+        await abortable(this.routing.refreshUsage(), signal);
+        continue;
+      }
+      for (const score of selected.scores) logSafe('smart-route-blocked', { auto, account: score.usage, reason: score.reason, reservations: pressure });
+      if (pressure) throw new BackendError('Model accounts are busy with parallel requests. Retry shortly.', { retryable: true });
+      throw new BackendError(`No eligible account is available for this model. ${selected.scores.map(s => `${s.slug}: ${s.reason}`).join('; ')}.`);
+    }
+  }
 
   track(body: ResponsesBody, auto: string, conversation?: string): void {
     this.contexts.set(body, { auto, conversation, attempted: new Set() });
@@ -30,9 +57,11 @@ export class AutoFailover {
     for (;;) {
       signal?.throwIfAborted();
       // Normalization can await history/bridging. Recheck room at actual dispatch time.
+      await this.select(context.auto, context.conversation, signal);
+      signal?.throwIfAborted();
+      // Another waiter may have reserved room while select yielded. Check and reserve atomically.
       const selected = this.routing.router.resolve(context.auto, context.conversation);
-      if (!selected.scores.some(s => s.slug === selected.slug && s.usable))
-        throw new BackendError('No eligible account is available for this model. Check account sign-ins and usage limits.');
+      if (!selected.scores.some(s => s.slug === selected.slug && s.usable)) continue;
       if (body.model !== selected.slug) {
         body.model = selected.slug;
         if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');
@@ -67,7 +96,11 @@ export class AutoFailover {
         // Always quarantine a rejected login, including a refusal after output, but never replay output.
         if (exposed()) throw error;
         const { slug, scores } = this.routing.router.resolve(context.auto, context.conversation);
-        if (context.attempted.has(slug) || !scores.some(s => s.slug === slug && s.usable)) throw error;
+        if (!scores.some(s => s.slug === slug && s.usable)) {
+          if (this.routing.refreshUsage && this.routing.router.reservationBlocked(context.auto)) continue;
+          throw error;
+        }
+        if (context.attempted.has(slug)) throw error;
         logSafe('smart-auth-failover', { auto: context.auto, from: failed.slug, to: slug });
         body.model = slug;
         // Account-bound reasoning must not cross logins; user messages, tools and tool results survive.

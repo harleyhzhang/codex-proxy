@@ -103,6 +103,7 @@ export class UsagePoller {
   private timer?: ReturnType<typeof setInterval>;
   private polling?: Promise<void>;
   private lastAttempt = 0;
+  private lastAdmissionRefresh = 0;
   constructor(private sources: Record<string, UsageSource>, private stateDir: string, private intervalMs = 5 * 60_000,
     private options: { readClaudeUsage?: (configDir: string) => Promise<unknown>; authFailureCommand?: string[]; authRecoveryCommand?: string[] } = {}) {
     try { const saved: unknown = JSON.parse(readFileSync(join(stateDir, 'usage-snapshots.json'), 'utf8')); if (isRecord(saved)) this.polled = saved as Record<string, UsageSnapshot>; } catch {}
@@ -159,6 +160,16 @@ export class UsagePoller {
     const now = Date.now() / 1000;
     const snapshots = this.snapshots();
     if (now - this.lastAttempt >= 30 && Object.keys(this.sources).some(id => !snapshots[id] || now - snapshots[id]!.updatedAt >= 60)) await this.poll();
+  }
+
+  /** Reservation pressure needs a new provider observation, even inside the normal cache TTL.
+   * Coalesce callers and rate-limit retries when the provider is unavailable or work is active. */
+  async refreshForAdmission(): Promise<void> {
+    if (this.polling) return this.polling;
+    const now = Date.now() / 1000;
+    if (now - this.lastAdmissionRefresh < 5) return;
+    this.lastAdmissionRefresh = now;
+    await this.poll();
   }
 
   poll(): Promise<void> {

@@ -93,14 +93,14 @@ export class SmartRouter {
     return () => { entry.finished ??= this.clock(); };
   }
 
-  private budgetedSnapshots(): Record<string, UsageSnapshot | undefined> {
+  private budgetedSnapshots(includeReservations = true): Record<string, UsageSnapshot | undefined> {
     const snaps = { ...this.snapshots() };
     for (const [usage, entries] of this.reservations) {
       const snap = snaps[usage];
-      for (const entry of entries) if (entry.finished !== undefined && snap && snap.updatedAt > entry.finished) entries.delete(entry);
+      for (const entry of entries) if (entry.finished !== undefined && snap?.windows.length && snap.windows.every(w => (w.observedAt ?? snap.updatedAt) > entry.finished!)) entries.delete(entry);
       if (!entries.size) { this.reservations.delete(usage); continue; }
-      if (snap) snaps[usage] = { ...snap, windows: snap.windows.map(w => ({ ...w,
-        used: w.used + entries.size * (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction),
+      if (snap && includeReservations) snaps[usage] = { ...snap, windows: snap.windows.map(w => ({ ...w,
+        used: w.used + [...entries].filter(entry => entry.finished === undefined || (w.observedAt ?? snap.updatedAt) <= entry.finished).length * (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction),
       })) };
     }
     // Also budget the request being considered, including on an otherwise idle account.
@@ -114,6 +114,12 @@ export class SmartRouter {
   }
 
   isAuto(model: unknown): model is string { return typeof model === 'string' && Object.hasOwn(this.config.routes, model); }
+
+  /** Real allowance still fits the next request, but outstanding/unverified dispatches hold it. */
+  reservationBlocked(model: string): boolean {
+    const candidates = this.config.routes[model]!;
+    return rank(candidates, this.budgetedSnapshots(false), this.clock(), this.config.policy).scores.some(s => s.usable);
+  }
 
   /** Concrete slug for this request, and whether the conversation just moved to another account. */
   resolve(model: string, conversation?: string): { slug: string; switched: boolean; scores: Score[] } {

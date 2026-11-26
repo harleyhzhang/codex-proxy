@@ -188,18 +188,16 @@ export function startRouter(options: RouterOptions) {
     }).start()
     : undefined;
   const smart = options.autoRouting?.router ?? (smartConfig && usagePoller ? new SmartRouter(smartConfig, () => usagePoller.snapshots()) : undefined);
-  const auto = options.autoRouting ?? (smart && usagePoller ? { router: smart, authFailed: (usage: string) => usagePoller.markAuthFailure(usage) } : undefined);
+  const auto = options.autoRouting ?? (smart && usagePoller ? { router: smart, authFailed: (usage: string) => usagePoller.markAuthFailure(usage), refreshUsage: () => usagePoller.refreshForAdmission() } : undefined);
   const failover = auto ? new AutoFailover(auto) : undefined;
   const conversationFor = (raw: JsonRecord, headers: Headers) => typeof raw.prompt_cache_key === 'string' ? raw.prompt_cache_key : headers.get('session_id') ?? headers.get('conversation_id') ?? undefined;
 
   /** Replaces an auto slug with the chosen account's slug; a moved conversation drops account-bound reasoning. */
-  async function routeAuto(raw: JsonRecord, headers: Headers): Promise<JsonRecord> {
+  async function routeAuto(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<JsonRecord> {
     if (!smart?.isAuto(raw.model)) return raw;
     await usagePoller?.ensureFresh();
     const conversation = conversationFor(raw, headers);
-    const { slug, switched, scores } = smart.resolve(raw.model, conversation);
-    if (raw.generate !== false && !scores.some(score => score.usable))
-      throw new BackendError('No eligible account is available for this model. Check account sign-ins and usage limits.');
+    const { slug, switched, scores } = raw.generate === false ? smart.resolve(raw.model, conversation) : await failover!.select(raw.model, conversation, signal);
     if (raw.generate !== false) logSafe('smart-route', { auto: raw.model, slug, switched, scores: scores.map(s => `${s.slug}:${s.usable ? s.score.toFixed(2) : 'x'}:${s.reason}`).join(' ') });
     const routed: JsonRecord = { ...raw, model: slug };
     if (switched && Array.isArray(raw.input)) routed.input = raw.input.filter(item => !(isRecord(item) && item.type === 'reasoning'));
@@ -249,7 +247,7 @@ export function startRouter(options: RouterOptions) {
   async function normalize(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<ResponsesBody> {
     const started = performance.now();
     try {
-      const body = await normalizeBody(await routeAuto(raw, headers), headers, signal);
+      const body = await normalizeBody(await routeAuto(raw, headers, signal), headers, signal);
       if (smart?.isAuto(raw.model)) failover?.track(body, raw.model, conversationFor(raw, headers));
       return body;
     }

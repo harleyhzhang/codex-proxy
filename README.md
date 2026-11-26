@@ -560,6 +560,16 @@ Set `ProcessType` to `Interactive`. Codex waits on every request the router serv
 median and 3.0 s p90, against 0.29 s and 0.35 s.
 A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k` keeps the loaded one.
 
+### Automatic account admission
+
+Auto routes reserve allowance before each dispatch to prevent parallel requests from spending
+the same headroom. Completed reservations remain charged until that allowance has a newer
+provider observation. If reservations fill the pool, the router refreshes usage immediately
+(shared across callers, at most once every five seconds), then waits up to two minutes for room.
+Cancellation stops the wait. Actual quota, spending and authentication blocks still refuse locally;
+`smart-route-blocked` logs the account and reason. An unobserved window keeps its reserve even
+when response headers update a different window. Explicit account selections stay pinned.
+
 ## Security
 
 - Listens on `127.0.0.1` only.
