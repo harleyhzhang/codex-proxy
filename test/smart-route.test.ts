@@ -25,12 +25,12 @@ test('personal is a buffer: used only when work accounts run hot', () => {
   expect(rank(opus, { whop: week(0.85, 3.5), fastwhop: week(0.8, 3.5), personal: week(0.1, 3.5) }, now).pick).toBe('claude-opus-5-5');
 });
 
-test('blocks at the edge, earlier when overage would bill, and on short session windows', () => {
-  expect(scoreCandidate(opus[0]!, week(0.97, 2), now).usable).toBe(false);
-  expect(scoreCandidate(opus[0]!, week(0.92, 2, { overage: true }), now).usable).toBe(false);
+test('uses allowance up to the actual limit, including billed and session windows', () => {
+  expect(scoreCandidate(opus[0]!, week(1, 2), now).usable).toBe(false);
+  expect(scoreCandidate(opus[0]!, week(0.999, 2, { overage: true }), now).usable).toBe(true);
   expect(scoreCandidate(opus[0]!, week(0.92, 2), now).usable).toBe(true);
   const session: UsageSnapshot = { updatedAt: now, windows: [{ name: 'five_hour', used: 0.91, resetsAt: now + 3600, minutes: 300 }] };
-  expect(scoreCandidate(opus[0]!, session, now).usable).toBe(false);
+  expect(scoreCandidate(opus[0]!, session, now).usable).toBe(true);
   expect(scoreCandidate(opus[0]!, { ...week(0.1, 3), blocked: 'spend limit reached', blockedUntil: now + DAY }, now).usable).toBe(false);
   expect(scoreCandidate(opus[0]!, { ...week(0.1, 3), blocked: 'spend limit reached', blockedUntil: now - 1 }, now).usable).toBe(true);
 });
@@ -99,7 +99,7 @@ test('warm conversations move to materially healthier accounts without waiting f
 
 test('parallel dispatches reserve quota and completed work waits for a newer usage reading', () => {
   let clock = now;
-  const snaps = { whop: week(0.85, 2, { overage: true }) };
+  const snaps = { whop: week(0.95, 2, { overage: true }) };
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => snaps, () => clock);
   const done = [router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug)];
   expect(router.resolve('auto').scores[0]!.usable).toBe(false);
@@ -108,7 +108,7 @@ test('parallel dispatches reserve quota and completed work waits for a newer usa
   clock++; snaps.whop.updatedAt = clock;
   expect(router.resolve('auto').scores[0]!.usable).toBe(true);
   router.reserve(opus[0]!.slug); clock++; snaps.whop.updatedAt = clock;
-  expect(router.resolve('auto').scores[0]!.headroom).toBeCloseTo((1 - 0.89) / (2 / 7));
+  expect(router.resolve('auto').scores[0]!.headroom).toBeCloseTo((1 - 0.97) / (2 / 7));
 });
 
 test('rounded response headers cannot lower usage, drop model windows or erase billing risk', () => {
@@ -118,14 +118,16 @@ test('rounded response headers cannot lower usage, drop model windows or erase b
   const merged = mergeUsageSnapshots(polled, headers);
   expect(merged.windows.map(w => w.used)).toEqual([0.72, 0.95]);
   expect(merged.overage).toBe(true);
-  expect(scoreCandidate(opus[0]!, merged, now + 1).usable).toBe(false);
+  expect(scoreCandidate(opus[0]!, merged, now + 1).usable).toBe(true);
   const reset = week(0.01, 7, { updatedAt: now + 2 * DAY });
   expect(mergeUsageSnapshots(polled, reset).windows[0]!.used).toBe(0.01);
 });
 
 
-test('the next turn must fit its reserve before it can be dispatched', () => {
-  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => ({ whop: week(0.89, 2, { overage: true }) }), () => now);
+test('the last fraction gets one request, not a permanent safety-buffer refusal', () => {
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => ({ whop: week(0.9999, 2, { overage: true }) }), () => now);
+  expect(router.resolve('auto').scores[0]!.usable).toBe(true);
+  router.reserve(opus[0]!.slug);
   expect(router.resolve('auto').scores[0]!.usable).toBe(false);
 });
 
@@ -141,7 +143,7 @@ test('partial fresh headers cannot freshen an unobserved allowance; verified res
 
 test('partial response observations release only their own window reserves', () => {
   let clock = now;
-  const snapshot = week(0.85, 2, { overage: true });
+  const snapshot = week(0.95, 2, { overage: true });
   snapshot.windows.push({ name: 'five_hour', used: 0.1, resetsAt: now + 3600, minutes: 300 });
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => ({ whop: snapshot }), () => clock);
   const done = [router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug), router.reserve(opus[0]!.slug)];
@@ -153,4 +155,34 @@ test('partial response observations release only their own window reserves', () 
   expect(router.resolve('auto').scores[0]!.usable).toBe(false);
   snapshot.windows[0]!.observedAt = clock;
   expect(router.resolve('auto').scores[0]!.usable).toBe(true);
+});
+
+
+test('dashboard allowances remain usable without double-counting a safety buffer', () => {
+  const whop = week(0.69, 5, { overage: true });
+  whop.windows.push({ name: 'five_hour', used: 0.8, resetsAt: now + 84 * 60, minutes: 300 });
+  const fastwhop = week(0.88, 8 / 24, { overage: true });
+  fastwhop.windows.push({ name: 'five_hour', used: 0, resetsAt: null, minutes: 300 });
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: opus } },
+    () => ({ whop, fastwhop, personal: week(0.89, 15 / 24) }), () => now);
+  const result = router.resolve('auto');
+  expect(result.scores.every(s => s.usable)).toBe(true);
+  expect(result.slug).toBe(opus[1]!.slug);
+});
+
+for (const minutes of [300, 10080, 43200]) test(`one final request uses the last fraction of a ${minutes}-minute allowance`, () => {
+  let clock = now;
+  const snapshot: UsageSnapshot = { updatedAt: now, overage: true,
+    windows: [{ name: 'limit', used: 0.9999, resetsAt: now + DAY, minutes }] };
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { auto: [opus[0]!] } }, () => ({ whop: snapshot }), () => clock);
+  expect(router.resolve('auto').scores[0]!.usable).toBe(true);
+  const finish = router.reserve(opus[0]!.slug);
+  expect(router.resolve('auto').scores[0]!.usable).toBe(false);
+  expect(router.resolve('auto').scores[0]!.reason).toContain('remaining allowance reserved');
+  finish();
+  expect(router.resolve('auto').scores[0]!.usable).toBe(false);
+  snapshot.updatedAt = ++clock;
+  expect(router.resolve('auto').scores[0]!.usable).toBe(true);
+  snapshot.windows[0]!.used = 1;
+  expect(router.resolve('auto').scores[0]!.usable).toBe(false);
 });

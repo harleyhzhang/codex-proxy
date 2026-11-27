@@ -1,10 +1,14 @@
-// One bounded account retry before output: auto routes may change accounts, explicit slugs never do.
+// Bounded account retries before output: auto routes may change accounts, explicit slugs never do.
 import { AccountAuthenticationError, accountAuthRequired, BackendError } from '../backends/contract';
+import { ClaudeUsageLimitError } from '../backends/claude-limits';
 import { logSafe } from '../log';
 import { abortable, sleep } from '../transport';
 import type { ResponsesBody } from '../protocol/types';
 import type { SmartRouter } from './smart-route';
-import { UpstreamStatusError } from './upstream';
+import { upstreamFailure, UpstreamStatusError } from './upstream';
+
+const QUOTA_CODES = new Set(['usage_limit_reached', 'insufficient_quota']);
+const quotaFields = (fields: { type?: string | number; code?: string | number }) => QUOTA_CODES.has(String(fields.type)) || QUOTA_CODES.has(String(fields.code));
 
 export type AutoRouting = { router: SmartRouter; authFailed: (usage: string) => void; refreshUsage?: () => Promise<void> };
 type Context = { auto: string; conversation?: string; attempted: Set<string> };
@@ -74,6 +78,13 @@ export class AutoFailover {
           await result.body?.cancel();
           throw accountAuthRequired('Account login rejected; sign in again to its isolated profile.');
         }
+        if (result instanceof Response && result.status === 429) {
+          const { fields } = await upstreamFailure(result.clone());
+          if (quotaFields(fields)) {
+            await result.body?.cancel();
+            throw new UpstreamStatusError('Account usage limit reached', 429, fields);
+          }
+        }
         if (result instanceof Response && result.body) {
           streaming = true;
           const reader = result.body.getReader();
@@ -88,12 +99,16 @@ export class AutoFailover {
         }
         return result;
       } catch (error) {
-        if (!isAccountAuthFailure(error) || signal?.aborted) throw error;
+        const authFailure = isAccountAuthFailure(error);
+        const quotaFailure = error instanceof ClaudeUsageLimitError || error instanceof UpstreamStatusError && quotaFields(error.fields);
+        if ((!authFailure && !quotaFailure) || signal?.aborted) throw error;
         const failed = this.routing.router.config.routes[context.auto]!.find(c => c.slug === body.model);
         if (!failed) throw error;
         context.attempted.add(failed.slug);
-        this.routing.authFailed(failed.usage);
-        // Always quarantine a rejected login, including a refusal after output, but never replay output.
+        if (authFailure) this.routing.authFailed(failed.usage);
+        else this.routing.router.quotaFailed(failed.usage, error instanceof ClaudeUsageLimitError ? error.resetsAt
+          : error instanceof UpstreamStatusError && typeof error.fields.resets_at === 'number' ? error.fields.resets_at : undefined);
+        // Quarantine the refused account even after output, but never replay delivered output.
         if (exposed()) throw error;
         const { slug, scores } = this.routing.router.resolve(context.auto, context.conversation);
         if (!scores.some(s => s.slug === slug && s.usable)) {
@@ -101,7 +116,7 @@ export class AutoFailover {
           throw error;
         }
         if (context.attempted.has(slug)) throw error;
-        logSafe('smart-auth-failover', { auto: context.auto, from: failed.slug, to: slug });
+        logSafe(authFailure ? 'smart-auth-failover' : 'smart-quota-failover', { auto: context.auto, from: failed.slug, to: slug });
         body.model = slug;
         // Account-bound reasoning must not cross logins; user messages, tools and tool results survive.
         if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');

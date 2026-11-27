@@ -6,11 +6,11 @@ import { join } from 'node:path';
 import { isRecord } from '../json';
 
 /** One rolling allowance: fraction used (0..1), when it resets (unix seconds) and its length. */
-export type UsageWindow = { name: string; used: number; resetsAt: number | null; minutes: number; observedAt?: number };
+export type UsageWindow = { name: string; used: number; resetsAt: number | null; minutes: number; observedAt?: number; reserved?: number; requestReserve?: number };
 export type UsageSnapshot = {
   updatedAt: number;
   windows: UsageWindow[];
-  /** Spending beyond the windows is billed (extra usage, credits): stay further from the edge. */
+  /** Spending beyond the windows is billed (extra usage, credits). */
   overage?: boolean;
   /** Hard stop reported by the provider (rejected, spend control reached), until `blockedUntil`. */
   blocked?: string;
@@ -34,7 +34,7 @@ export type SmartPolicy = {
 export type SmartConfig = { policy: SmartPolicy; routes: Record<string, Candidate[]> };
 
 export const DEFAULT_POLICY: SmartPolicy = {
-  personalWeight: 0.3, cap: 3, blockAt: 0.97, overageBlockAt: 0.9, shortBlockAt: 0.9,
+  personalWeight: 0.3, cap: 3, blockAt: 1, overageBlockAt: 1, shortBlockAt: 1,
   unknownScore: 1, staleAfterSec: 180, stalePenalty: 0.8, idleRepickSec: 30 * 60,
   switchRatio: 1.25, reserveFraction: 0.02, shortReserveFraction: 0.1,
 };
@@ -60,8 +60,10 @@ export function scoreCandidate(c: Candidate, snap: UsageSnapshot | undefined, no
       return { ...base, usable: false, headroom: 0, score: 0, reason: `${w.name} needs refresh` };
     const limit = w.minutes <= 360 ? p.shortBlockAt : snap.overage ? p.overageBlockAt : p.blockAt;
     if (w.used >= limit) return { ...base, usable: false, headroom: 0, score: 0, reason: `${w.name} ${Math.round(w.used * 100)}%` };
+    const budgeted = w.used + (w.reserved ?? 0) + (w.requestReserve ?? 0);
+    if (budgeted > limit + 1e-12) return { ...base, usable: false, headroom: 0, score: 0, reason: `${w.name} ${Math.round(w.used * 100)}% (remaining allowance reserved)` };
     const left = w.resetsAt == null ? 1 : Math.min(1, Math.max(0.02, (w.resetsAt - now) / (w.minutes * 60)));
-    const h = (1 - w.used) / left;
+    const h = Math.max(0, 1 - w.used - (w.reserved ?? 0)) / left;
     if (h < headroom) { headroom = h; binding = w.name; }
   }
   return { ...base, usable: true, headroom, score: headroom * weight, reason: binding };
@@ -76,39 +78,65 @@ export function rank(candidates: Candidate[], snaps: Record<string, UsageSnapsho
 }
 
 type Sticky = { slug: string; at: number };
+type Reservation = { finished?: number; windows: Map<string, { amount: number; resetsAt: number | null }> };
 
 export class SmartRouter {
   private sticky = new Map<string, Sticky>();
-  private reservations = new Map<string, Set<{ finished?: number }>>();
+  private reservations = new Map<string, Set<Reservation>>();
+  private quotaBlocks = new Map<string, number>();
   constructor(readonly config: SmartConfig, private snapshots: () => Record<string, UsageSnapshot | undefined>, private clock = () => Date.now() / 1000) {}
+
+  /** A provider refusal wins over a delayed utilization counter. */
+  quotaFailed(usage: string, resetsAt?: number): void {
+    const now = this.clock();
+    this.quotaBlocks.set(usage, resetsAt && resetsAt > now ? resetsAt : now + 60);
+  }
 
   /** Reserve before dispatch, synchronously, so simultaneous chats cannot all spend the same room.
    * Keep completed work charged until a provider reading taken after completion accounts for it. */
   reserve(slug: string): () => void {
     const candidate = Object.values(this.config.routes).flat().find(c => c.slug === slug);
     if (!candidate) return () => {};
-    const entries = this.reservations.get(candidate.usage) ?? new Set<{ finished?: number }>();
-    const entry: { finished?: number } = {};
+    const snapshot = this.budgetedSnapshots(true, false)[candidate.usage];
+    const entries = this.reservations.get(candidate.usage) ?? new Set<Reservation>();
+    const entry: Reservation = { windows: new Map(snapshot?.windows.map(w => [w.name, { amount: this.nextReserve(w, snapshot!), resetsAt: w.resetsAt }])) };
     entries.add(entry); this.reservations.set(candidate.usage, entries);
     return () => { entry.finished ??= this.clock(); };
   }
 
-  private budgetedSnapshots(includeReservations = true): Record<string, UsageSnapshot | undefined> {
+  /** Near exhaustion, one final request can use the remaining fraction. Its captured reservation
+   * holds that entire tail until a fresh observation; concurrent requests cannot share it. */
+  private nextReserve(w: UsageWindow, snap: UsageSnapshot): number {
+    const base = w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction;
+    const limit = w.minutes <= 360 ? this.config.policy.shortBlockAt : snap.overage ? this.config.policy.overageBlockAt : this.config.policy.blockAt;
+    const remaining = limit - w.used - (w.reserved ?? 0);
+    return remaining > 1e-12 ? Math.min(base, remaining) : base;
+  }
+
+  private budgetedSnapshots(includeReservations = true, includeNext = true): Record<string, UsageSnapshot | undefined> {
     const snaps = { ...this.snapshots() };
     for (const [usage, entries] of this.reservations) {
       const snap = snaps[usage];
       for (const entry of entries) if (entry.finished !== undefined && snap?.windows.length && snap.windows.every(w => (w.observedAt ?? snap.updatedAt) > entry.finished!)) entries.delete(entry);
       if (!entries.size) { this.reservations.delete(usage); continue; }
       if (snap && includeReservations) snaps[usage] = { ...snap, windows: snap.windows.map(w => ({ ...w,
-        used: w.used + [...entries].filter(entry => entry.finished === undefined || (w.observedAt ?? snap.updatedAt) <= entry.finished).length * (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction),
+        reserved: [...entries].reduce((sum, entry) => {
+          const held = entry.windows.get(w.name);
+          if (entry.finished !== undefined && (w.observedAt ?? snap.updatedAt) > entry.finished) return sum;
+          return sum + (held && held.resetsAt === w.resetsAt ? held.amount : (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction));
+        }, 0),
       })) };
     }
     // Also budget the request being considered, including on an otherwise idle account.
-    for (const usage of new Set(Object.values(this.config.routes).flat().map(c => c.usage))) {
+    if (includeNext) for (const usage of new Set(Object.values(this.config.routes).flat().map(c => c.usage))) {
       const snap = snaps[usage];
       if (snap) snaps[usage] = { ...snap, windows: snap.windows.map(w => ({ ...w,
-        used: w.used + (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction),
+        requestReserve: this.nextReserve(w, snap),
       })) };
+    }
+    for (const [usage, until] of this.quotaBlocks) {
+      if (until <= this.clock()) this.quotaBlocks.delete(usage);
+      else if (snaps[usage]) snaps[usage] = { ...snaps[usage]!, blocked: 'provider usage limit reached', blockedUntil: until };
     }
     return snaps;
   }

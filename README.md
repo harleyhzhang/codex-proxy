@@ -563,7 +563,14 @@ A `ProcessType` change needs `launchctl bootout` and `bootstrap`; `kickstart -k`
 ### Automatic account admission
 
 Auto routes reserve allowance before each dispatch to prevent parallel requests from spending
-the same headroom. Completed reservations remain charged until that allowance has a newer
+the same headroom. The default cutoff is 100% used for every window, including accounts with
+paid overage enabled. Reservations shrink to the remaining allowance for the last request;
+they do not strand a fixed buffer. Only one request can spend that final fraction before a
+fresh provider observation. Counters are delayed and rounded, so that last request can slightly
+overshoot; this is not a provider-side billing cap. Reported utilization stays separate from
+reservations in diagnostics. A provider quota refusal before output moves an auto request to
+another eligible account; output already delivered is never replayed.
+Completed reservations remain charged until that allowance has a newer
 provider observation. If reservations fill the pool, the router refreshes usage immediately
 (shared across callers, at most once every five seconds), then waits up to two minutes for room.
 Cancellation stops the wait. Actual quota, spending and authentication blocks still refuse locally;

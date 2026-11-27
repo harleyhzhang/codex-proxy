@@ -50,7 +50,7 @@ type FailureOptions = {
 
 /**
  * A deliberate refusal. Explicit accounts stay pinned. Opt-in auto routes may select a different
- * account for AccountAuthenticationError before output; ordinary refusals never trigger that switch.
+ * account for authentication or quota failures before output; other refusals never trigger that switch.
  */
 export class BackendError extends Error {
   readonly code: string;

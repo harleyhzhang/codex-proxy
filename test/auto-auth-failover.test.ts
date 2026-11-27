@@ -12,7 +12,7 @@ import { responseObject } from '../src/protocol/output';
 import { AutoFailover } from '../src/router/auto-failover';
 import { DEFAULT_POLICY, SmartRouter } from '../src/router/smart-route';
 import { UsagePoller } from '../src/router/usage-poller';
-import { anthropicFixture, anthropicStream, say } from './anthropic-fixture';
+import { anthropicFixture, anthropicStream, limitHeaders, say } from './anthropic-fixture';
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const AUTO = 'auto-claude-opus-5-5';
@@ -37,6 +37,21 @@ async function setup() {
   } };
 }
 const post = (app: Awaited<ReturnType<typeof fixtureRouter>>, body: unknown) => fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(body) });
+
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: quota refusal at the last fraction moves to another account without invalidating login`, async () => {
+  const f = await setup();
+  try {
+    for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.windows[0]!.used = 0.9999;
+    f.providers[0]!.state.reply = () => new Response('{}', { status: 429, headers: limitHeaders(Math.floor(Date.now() / 1000) + 3600) });
+    f.providers[1]!.state.reply = () => say('LAST_FRACTION_RECOVERED');
+    const body = { model: AUTO, input: 'continue', stream: transport === 'sse' };
+    const result = transport === 'ws' ? JSON.stringify(await socketTurn(f.app, body)) : await (await post(f.app, body)).text();
+    expect(result).toContain('LAST_FRACTION_RECOVERED');
+    expect(f.providers.map(provider => provider.messages().length)).toEqual([1, 1]);
+    expect(f.poller.snapshots()['fixture-0']!.blocked).toBeUndefined();
+    expect(f.routing.router.resolve(AUTO).scores[0]!.reason).toBe('provider usage limit reached');
+  } finally { await f.close(); }
+});
 function events(text: string): JsonRecord[] {
   return text.split('\n').filter(line => line.startsWith('data: {')).map(line => JSON.parse(line.slice(6)) as JsonRecord);
 }
@@ -225,8 +240,8 @@ for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: para
   const firstEntered = new Promise<void>(resolve => { entered = resolve; });
   try {
     const first = f.poller.snapshots()['fixture-0']!;
-    first.windows[0]!.used = 0.87; first.overage = true;
-    f.poller.snapshots()['fixture-1']!.windows[0]!.used = 0.88;
+    first.windows[0]!.used = 0.975; first.overage = true;
+    f.poller.snapshots()['fixture-1']!.windows[0]!.used = 0.98;
     f.providers[0]!.state.reply = async () => {
       entered!(); await new Promise<void>(resolve => { release = resolve; }); return say('FIRST');
     };
@@ -319,7 +334,7 @@ test('parallel admission waits for room, resumes after verification, and never o
     const candidate = f.candidates[0]!;
     f.routing.router.config.routes[AUTO] = [candidate];
     const snapshot = f.poller.snapshots()[candidate.usage]!;
-    snapshot.windows[0]!.used = 0.85;
+    snapshot.windows[0]!.used = 0.96;
     snapshot.overage = true;
     f.routing.refreshUsage = async () => { snapshot.updatedAt = Date.now() / 1000 + 0.001; };
     const failover = new AutoFailover(f.routing);
@@ -342,4 +357,26 @@ test('parallel admission waits for room, resumes after verification, and never o
     releases.forEach(release => release());
     await Promise.all(jobs);
   } finally { releases.forEach(release => release()); await f.close(); }
+});
+
+
+test('native quota response fails over; a throughput 429 does not invalidate quota or login', async () => {
+  const f = await setup();
+  try {
+    const failover = new AutoFailover(f.routing);
+    const body: ResponsesBody = { model: f.candidates[0]!.slug, input: [] };
+    failover.track(body, AUTO);
+    let attempts = 0;
+    const result = await failover.run(body, undefined, async () => ++attempts === 1
+      ? Response.json({ error: { type: 'usage_limit_reached' } }, { status: 429 }) : new Response('QUOTA_RECOVERED'));
+    expect(await result.text()).toBe('QUOTA_RECOVERED');
+    expect(attempts).toBe(2);
+    expect(f.poller.snapshots()['fixture-0']!.blocked).toBeUndefined();
+    const next: ResponsesBody = { model: f.candidates[1]!.slug, input: [] };
+    failover.track(next, AUTO);
+    const throttled = await failover.run(next, undefined, async () => Response.json({ error: { type: 'slow_down' } }, { status: 429 }));
+    expect(throttled.status).toBe(429);
+    await throttled.body?.cancel();
+    expect(f.routing.router.resolve(AUTO).scores[1]!.usable).toBe(true);
+  } finally { await f.close(); }
 });
