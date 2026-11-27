@@ -118,6 +118,7 @@ export class SmartRouter {
   private sticky = new Map<string, Sticky>();
   private reservations = new Map<string, Set<Reservation>>();
   private quotaBlocks = new Map<string, number>();
+  private capacityWaiters = new Set<() => void>();
   constructor(readonly config: SmartConfig, private snapshots: () => Record<string, UsageSnapshot | undefined>, private clock = () => Date.now() / 1000) {}
 
   /** A provider refusal wins over a delayed utilization counter. */
@@ -135,7 +136,25 @@ export class SmartRouter {
     const entries = this.reservations.get(candidate.usage) ?? new Set<Reservation>();
     const entry: Reservation = { paid, windows: new Map(snapshot?.windows.map(w => [w.name, { amount: this.nextReserve(w, snapshot!), resetsAt: w.resetsAt }])) };
     entries.add(entry); this.reservations.set(candidate.usage, entries);
-    return () => { entry.finished ??= this.clock(); };
+    return () => {
+      if (entry.finished !== undefined) return;
+      entry.finished = this.clock();
+      for (const wake of this.capacityWaiters) wake();
+    };
+  }
+
+  /** Completion wakes admission immediately; periodic checks also notice provider reads/resets.
+   * A cancelled caller removes its listener without cancelling other chats or their inference. */
+  waitForCapacity(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    return new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timer); this.capacityWaiters.delete(wake); signal?.removeEventListener('abort', abort); };
+      const wake = () => { cleanup(); resolve(); };
+      const abort = () => { cleanup(); reject(signal?.reason); };
+      const timer = setTimeout(wake, 5000);
+      this.capacityWaiters.add(wake);
+      signal?.addEventListener('abort', abort, { once: true });
+    });
   }
 
   /** Near exhaustion, one final request can use the remaining fraction. Its captured reservation

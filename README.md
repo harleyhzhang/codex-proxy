@@ -572,8 +572,10 @@ reservations in diagnostics. A provider quota refusal before output moves an aut
 another eligible account; output already delivered is never replayed.
 Completed reservations remain charged until that allowance has a newer
 provider observation. If reservations fill the pool, the router refreshes usage immediately
-(shared across callers, at most once every five seconds), then waits up to two minutes for room.
-Cancellation stops the wait. Actual spending and authentication blocks still refuse locally;
+(shared across callers, at most once every five seconds), then queues requests in arrival order until room is verified. Other running requests do not
+cause a local two-minute failure. Completion wakes the queue immediately; a five-second
+check also notices new observations and window resets. Streaming requests keep progress
+frames flowing while queued, and cancellation removes only that waiter. Actual spending and authentication blocks still refuse locally;
 `smart-route-blocked` logs the account and reason. An unobserved window keeps its reserve even
 when response headers update a different window. Explicit account selections stay pinned.
 

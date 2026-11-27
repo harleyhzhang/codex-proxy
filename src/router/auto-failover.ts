@@ -2,7 +2,7 @@
 import { AccountAuthenticationError, accountAuthRequired, BackendError } from '../backends/contract';
 import { ClaudeUsageLimitError } from '../backends/claude-limits';
 import { logSafe } from '../log';
-import { abortable, sleep } from '../transport';
+import { abortable } from '../transport';
 import type { ResponsesBody } from '../protocol/types';
 import type { SmartRouter } from './smart-route';
 import { upstreamFailure, UpstreamStatusError } from './upstream';
@@ -19,11 +19,11 @@ export function isAccountAuthFailure(error: unknown): boolean {
 
 export class AutoFailover {
   private contexts = new WeakMap<ResponsesBody, Context>();
+  private queues = new Map<string, Promise<void>>();
   constructor(private routing: AutoRouting) {}
 
   /** An exhausted local reserve is backpressure, not an exhausted subscription. */
   async select(auto: string, conversation?: string, signal?: AbortSignal) {
-    const deadline = Date.now() + 120_000;
     let refreshed = false;
     for (;;) {
       signal?.throwIfAborted();
@@ -36,20 +36,43 @@ export class AutoFailover {
         continue;
       }
       const pressure = this.routing.router.reservationBlocked(auto);
-      if (pressure && this.routing.refreshUsage && Date.now() < deadline) {
-        await sleep(1000, signal);
-        await abortable(this.routing.refreshUsage(), signal);
+      if (pressure) {
+        await this.routing.router.waitForCapacity(signal);
+        if (this.routing.refreshUsage) await abortable(this.routing.refreshUsage(), signal);
         continue;
       }
       for (const score of selected.scores) logSafe('smart-route-blocked', { auto, account: score.usage, reason: score.reason, reservations: pressure });
-      if (pressure) throw new BackendError('Model accounts are busy with parallel requests. Retry shortly.', { retryable: true });
       throw new BackendError(`No eligible account is available for this model. ${selected.scores.map(s => `${s.slug}: ${s.reason}`).join('; ')}.`);
+    }
+  }
+
+  /** FIFO admission per auto route. Release the queue as soon as room is reserved, before inference. */
+  private async admit(context: Context, signal?: AbortSignal) {
+    const previous = this.queues.get(context.auto) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const tail = previous.then(() => gate);
+    this.queues.set(context.auto, tail);
+    try {
+      await abortable(previous, signal);
+      for (;;) {
+        await this.select(context.auto, context.conversation, signal);
+        signal?.throwIfAborted();
+        // Other auto routes can share this account: recheck and reserve without yielding.
+        const selected = this.routing.router.resolve(context.auto, context.conversation);
+        const score = selected.scores.find(s => s.slug === selected.slug && s.usable);
+        if (score) return { slug: selected.slug, finish: this.routing.router.reserve(selected.slug, score.paid) };
+      }
+    } finally {
+      release();
+      void tail.then(() => { if (this.queues.get(context.auto) === tail) this.queues.delete(context.auto); });
     }
   }
 
   track(body: ResponsesBody, auto: string, conversation?: string): void {
     this.contexts.set(body, { auto, conversation, attempted: new Set() });
   }
+  tracked(body: ResponsesBody): boolean { return body.generate !== false && this.contexts.has(body); }
   inherit(from: ResponsesBody, to: ResponsesBody): void {
     const context = this.contexts.get(from);
     if (context) this.contexts.set(to, context);
@@ -60,17 +83,11 @@ export class AutoFailover {
     if (!context || body.generate === false) return attempt();
     for (;;) {
       signal?.throwIfAborted();
-      // Normalization can await history/bridging. Recheck room at actual dispatch time.
-      await this.select(context.auto, context.conversation, signal);
-      signal?.throwIfAborted();
-      // Another waiter may have reserved room while select yielded. Check and reserve atomically.
-      const selected = this.routing.router.resolve(context.auto, context.conversation);
-      if (!selected.scores.some(s => s.slug === selected.slug && s.usable)) continue;
-      if (body.model !== selected.slug) {
-        body.model = selected.slug;
+      const { slug, finish } = await this.admit(context, signal);
+      if (body.model !== slug) {
+        body.model = slug;
         if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');
       }
-      const finish = this.routing.router.reserve(body.model, selected.scores.find(s => s.slug === body.model)?.paid);
       let streaming = false;
       try {
         const result = await attempt();

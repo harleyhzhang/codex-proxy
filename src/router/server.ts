@@ -197,7 +197,10 @@ export function startRouter(options: RouterOptions) {
     if (!smart?.isAuto(raw.model)) return raw;
     await usagePoller?.ensureFresh();
     const conversation = conversationFor(raw, headers);
-    const { slug, switched, scores } = raw.generate === false ? smart.resolve(raw.model, conversation) : await failover!.select(raw.model, conversation, signal);
+    // Normalize using a provisional account, then queue/reserve at dispatch inside the progress
+    // stream. Waiting here hid progress and prevented Stop while other chats held the allowance.
+    signal.throwIfAborted();
+    const { slug, switched, scores } = smart.resolve(raw.model, conversation);
     if (raw.generate !== false) logSafe('smart-route', { auto: raw.model, slug, switched, scores: scores.map(s => `${s.slug}:${s.usable ? s.score.toFixed(2) : 'x'}:${s.reason}`).join(' ') });
     const routed: JsonRecord = { ...raw, model: slug };
     if (switched && Array.isArray(raw.input)) routed.input = raw.input.filter(item => !(isRecord(item) && item.type === 'reasoning'));
@@ -405,6 +408,17 @@ export function startRouter(options: RouterOptions) {
       const headers = jsonHeaders(req.headers, { eventStream: false });
       const idle = idleDeadline(req.signal, timeoutMs);
       const upstreamPath = path.slice(3);
+      if (streaming && failover?.tracked(body)) {
+        idle.done();
+        return pendingRelay(body, signal => runAccount(body, signal, () => {
+          // Time upstream silence from dispatch, excluding the local admission queue.
+          const pendingIdle = idleDeadline(signal, timeoutMs);
+          return watchBody(connectUpstream(upstreamFetch, upstreamPath, headers, body, pendingIdle, signal), pendingIdle);
+        }).then(response => observeResponse(response, response => history.remember(body, response))), req.signal, pendingFailure, async response => {
+          const { detail, fields } = await upstreamFailure(response);
+          return upstreamFailedEvent(response.status, `OpenAI returned HTTP ${response.status}${detail ? `: ${detail}` : ''}`, fields);
+        }, options.heartbeatMs);
+      }
       try {
         return relay(observeResponse(await runAccount(body, idle.signal, () => watchBody(postJson(upstreamFetch, upstreamPath, headers, body, idle.signal, idle.touch), idle)), response => history.remember(body, response)));
       } catch (error) {
@@ -605,13 +619,28 @@ export function startRouter(options: RouterOptions) {
   ): Promise<void> {
     const { type: _type, previous_response_id: _previous, ...request } = body;
     const upstreamSignal = AbortSignal.any([signal, interrupt]);
-    const idle = idleDeadline(upstreamSignal, timeoutMs);
+    let idle = idleDeadline(upstreamSignal, timeoutMs);
     // An outage before OpenAI answers keeps the turn pending with progress frames (the socket is
     // already open, so nothing about the status line is lost); a real HTTP status still arrives below.
+    const queued = failover?.tracked(body) ? { ...responseObject(body, EMPTY_OUTPUT), status: 'in_progress' } : undefined;
     let stop: (() => void) | undefined;
+    if (queued) {
+      idle.done();
+      send({ type: 'response.created', response: queued });
+      stop = startHeartbeat(send, queued, options.heartbeatMs);
+    }
     let response: Response;
     try {
-      response = await runAccount(body, upstreamSignal, () => watchBody(connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, model: body.model, input: body.input, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle));
+      response = await runAccount(body, upstreamSignal, () => {
+        if (queued) idle = idleDeadline(upstreamSignal, timeoutMs);
+        return watchBody(connectUpstream(fetchUpstream, '/responses', jsonHeaders(headers), { ...request, model: body.model, input: body.input, stream: true }, idle, upstreamSignal, () => { stop ??= startHeartbeat(send, pendingEnvelope(body), options.heartbeatMs); }), idle);
+      });
+    } catch (error) {
+      if (!queued || !interrupt.aborted || signal.aborted) throw error;
+      const stopped = interruptedResponse(queued, []);
+      history.remember(body, stopped);
+      forward({ type: 'response.incomplete', response: stopped });
+      return;
     } finally { stop?.(); }
     if (!response.ok) {
       const { detail, fields } = await upstreamFailure(response);
@@ -626,14 +655,19 @@ export function startRouter(options: RouterOptions) {
     const items = new CompletedItems();
     const rememberCompletion = completionObserver(response => history.remember(body, response));
     const open = new Map<unknown, unknown>();
-    let created: ResponseObject | undefined;
+    let created: ResponseObject | undefined = queued;
     try {
-      await sseEvents(response, (event) => {
+      await sseEvents(response, (rawEvent) => {
+        // Keep the queue's interrupt target through dispatch. Item and tool-call ids stay intact.
+        const event = queued ? { ...rawEvent,
+          ...(isRecord(rawEvent.response) ? { response: { ...rawEvent.response, id: queued.id } } : {}),
+          ...(rawEvent.response_id !== undefined ? { response_id: queued.id } : {}),
+        } : rawEvent;
         if (event.type === 'response.created' && isRecord(event.response)) created = event.response as ResponseObject;
         if (event.type === 'response.output_item.added' && isRecord(event.item)) open.set(event.item.id, event.output_index);
         if (event.type === 'response.output_item.done' && isRecord(event.item)) { items.add(event.item as OutputItem, event.output_index); open.delete(event.item.id); }
         rememberCompletion(event);
-        forward(event);
+        if (!queued || event.type !== 'response.created') forward(event);
       });
     } catch (error) {
       if (!interrupt.aborted || signal.aborted || !created) throw error;

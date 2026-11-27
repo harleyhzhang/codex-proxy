@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,7 +8,7 @@ import { BACKENDS } from '../src/backends/registry';
 import type { JsonRecord } from '../src/json';
 import { pendingResponse } from '../src/protocol/pending';
 import { EMPTY_OUTPUT, type ResponsesBody } from '../src/protocol/types';
-import { responseObject } from '../src/protocol/output';
+import { responseObject, streamResponse } from '../src/protocol/output';
 import { AutoFailover } from '../src/router/auto-failover';
 import { DEFAULT_POLICY, SmartRouter } from '../src/router/smart-route';
 import { UsagePoller } from '../src/router/usage-poller';
@@ -16,7 +16,7 @@ import { anthropicFixture, anthropicStream, limitHeaders, say } from './anthropi
 import { AUTH_HEADERS, fixtureRouter } from './support';
 
 const AUTO = 'auto-claude-opus-5-5';
-async function setup() {
+async function setup(heartbeatMs?: number) {
   const dir = await mkdtemp(join(tmpdir(), 'auto-auth-'));
   const providers = [anthropicFixture(), anthropicFixture()];
   const rows = providers.map((provider, i) => createClaudeAccountBackend({ ...provider.options(), configDir: join(dir, `profile-${i}`), prefix: `auth${i}`, label: `Fixture ${i}`, expectedEmail: 'work@example.com', expectedOrg: 'org_work', models: ['claude-opus-5-5'] }));
@@ -28,7 +28,7 @@ async function setup() {
   const poller = new UsagePoller({}, dir);
   const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [AUTO]: candidates } }, () => poller.snapshots());
   const routing = { router, authFailed: (id: string) => poller.markAuthFailure(id), refreshUsage: undefined as (() => Promise<void>) | undefined };
-  const app = await fixtureRouter({ autoRouting: routing });
+  const app = await fixtureRouter({ autoRouting: routing, heartbeatMs });
   return { app, providers, rows, candidates, poller, routing, async close() {
     await app.close();
     for (const row of rows) (BACKENDS as SubscriptionBackend[]).splice(BACKENDS.indexOf(row.backend), 1);
@@ -401,4 +401,153 @@ test('native quota response fails over; a throughput 429 does not invalidate quo
     await throttled.body?.cancel();
     expect(f.routing.router.resolve(AUTO).scores[1]!.usable).toBe(true);
   } finally { await f.close(); }
+});
+
+test('a running request lasting over two minutes does not fail queued admission', async () => {
+  let now = Date.now() / 1000;
+  const snapshot = { updatedAt: now, windows: [{ name: 'weekly', used: 0.9999, resetsAt: null, minutes: 10080 }] };
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [AUTO]: [{ slug: 'fixture', usage: 'team', tier: 'work' }] } }, () => ({ team: snapshot }), () => now);
+  const finish = router.reserve('fixture');
+  const failover = new AutoFailover({ router, authFailed: () => {}, refreshUsage: async () => { snapshot.updatedAt = now; } });
+  const clock = spyOn(Date, 'now').mockImplementation(() => now * 1000);
+  const controller = new AbortController();
+  try {
+    const pending = failover.select(AUTO, undefined, controller.signal);
+    let settled = false;
+    void pending.then(() => { settled = true; }, () => { settled = true; });
+    await Bun.sleep(10);
+    now += 121;
+    // The old one-second poll would now turn still-running work into a terminal busy error.
+    await Bun.sleep(1100);
+    expect(settled).toBe(false);
+    finish();
+    now++;
+    expect((await pending).scores[0]!.usable).toBe(true);
+  } finally { clock.mockRestore(); controller.abort(); }
+});
+
+test('queued callers retain arrival order when a middle waiter is cancelled', async () => {
+  let now = Date.now() / 1000;
+  const snapshot = { updatedAt: now, windows: [{ name: 'weekly', used: 0.9999, resetsAt: null, minutes: 10080 }] };
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [AUTO]: [{ slug: 'fixture', usage: 'team', tier: 'work' }] } }, () => ({ team: snapshot }), () => now);
+  const finish = router.reserve('fixture');
+  const failover = new AutoFailover({ router, authFailed: () => {}, refreshUsage: async () => { snapshot.updatedAt = ++now; } });
+  const controllers = Array.from({ length: 4 }, () => new AbortController());
+  const order: number[] = [];
+  const jobs = controllers.map((controller, i) => {
+    const body: ResponsesBody = { model: 'fixture', input: [] };
+    failover.track(body, AUTO);
+    return failover.run(body, controller.signal, async () => { order.push(i); return responseObject(body, EMPTY_OUTPUT); });
+  });
+  try {
+    controllers[1]!.abort(new Error('cancel middle'));
+    await expect(jobs[1]!).rejects.toThrow('cancel middle');
+    await Bun.sleep(10);
+    finish();
+    await Promise.all([jobs[0], jobs[2], jobs[3]]);
+    expect(order).toEqual([0, 2, 3]);
+  } finally { controllers.forEach(controller => controller.abort()); }
+});
+
+test('SSE admission opens progress before capacity clears and dispatches exactly once', async () => {
+  const f = await setup(5);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  try {
+    for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.windows[0]!.used = 0.9999;
+    const finish = f.candidates.map(candidate => f.routing.router.reserve(candidate.slug));
+    f.routing.refreshUsage = async () => { for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.updatedAt = Date.now() / 1000 + 0.001; };
+    f.providers[0]!.state.reply = () => say('QUEUED_THEN_DISPATCHED');
+    const response = await fetch(f.app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, signal: controller.signal, body: JSON.stringify({ model: AUTO, input: 'queued', stream: true }) });
+    const reader = response.body!.getReader();
+    let text = '';
+    while (!text.includes('response.in_progress')) text += new TextDecoder().decode((await reader.read()).value);
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
+    finish.forEach(done => done());
+    for (;;) { const next = await reader.read(); if (next.done) break; text += new TextDecoder().decode(next.value); }
+    expect(text).toContain('QUEUED_THEN_DISPATCHED');
+    expect(text).not.toContain('response.failed');
+    expect(f.providers.map(p => p.messages().length)).toEqual([1, 0]);
+  } finally { clearTimeout(timer); controller.abort(); await f.close(); }
+});
+
+test('Stop interrupts queued WebSocket admission before any provider work', async () => {
+  const f = await setup(5);
+  const Socket = WebSocket as unknown as { new(url: string, options: { headers: Record<string, string> }): WebSocket };
+  const ws = new Socket(f.app.url('/v1/responses').replace('http:', 'ws:'), { headers: AUTH_HEADERS });
+  try {
+    for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.windows[0]!.used = 0.9999;
+    f.candidates.forEach(candidate => f.routing.router.reserve(candidate.slug));
+    f.routing.refreshUsage = async () => {};
+    const seen: JsonRecord[] = [];
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('queued Stop timed out')), 2000);
+      ws.onopen = () => ws.send(JSON.stringify({ type: 'response.create', model: AUTO, input: 'queued' }));
+      ws.onmessage = event => {
+        const value = JSON.parse(String(event.data)) as JsonRecord; seen.push(value);
+        if (value.type === 'response.created') ws.send(JSON.stringify({ type: 'response.interrupt', response_id: (value.response as JsonRecord).id }));
+        if (value.type === 'response.incomplete') { clearTimeout(timer); resolve(); }
+      };
+    });
+    expect(seen.some(event => event.type === 'response.interrupt.accepted')).toBe(true);
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
+  } finally { ws.close(); await f.close(); }
+});
+
+for (const transport of ['sse', 'ws', 'ws-stop'] as const) test(`GPT ${transport}: queued admission keeps progress and supports dispatch or Stop`, async () => {
+  let now = Date.now() / 1000, calls = 0;
+  const model = 'auto-gpt-6.1-sol';
+  const snapshot = { updatedAt: now, windows: [{ name: 'weekly', used: 0.9999, resetsAt: null, minutes: 10080 }] };
+  const router = new SmartRouter({ policy: DEFAULT_POLICY, routes: { [model]: [{ slug: 'gpt-6.1-sol', usage: 'personal', tier: 'personal' }] } }, () => ({ personal: snapshot }), () => now);
+  const finish = router.reserve('gpt-6.1-sol');
+  const app = await fixtureRouter({
+    heartbeatMs: 5,
+    autoRouting: { router, authFailed: () => {}, refreshUsage: async () => { snapshot.updatedAt = ++now; } },
+    upstreamFetch: async (_url, init) => {
+      calls++;
+      const body = JSON.parse(String(init.body)) as ResponsesBody;
+      const response = responseObject(body, { ...EMPTY_OUTPUT, text: 'GPT_QUEUE_RECOVERED' });
+      return streamResponse(response);
+    },
+  });
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 2000);
+  let ws: WebSocket | undefined;
+  try {
+    let seen: JsonRecord[];
+    if (transport === 'sse') {
+      const response = await fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, signal: controller.signal, body: JSON.stringify({ model, input: 'queued', stream: true }) });
+      const reader = response.body!.getReader();
+      let text = '';
+      while (!text.includes('response.in_progress')) text += new TextDecoder().decode((await reader.read()).value);
+      expect(calls).toBe(0);
+      finish();
+      for (;;) { const next = await reader.read(); if (next.done) break; text += new TextDecoder().decode(next.value); }
+      seen = events(text);
+    } else {
+      seen = [];
+      const Socket = WebSocket as unknown as { new(url: string, options: { headers: Record<string, string> }): WebSocket };
+      const socket = ws = new Socket(app.url('/v1/responses').replace('http:', 'ws:'), { headers: AUTH_HEADERS });
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => reject(new Error('queued GPT timed out'));
+        controller.signal.addEventListener('abort', abort, { once: true });
+        socket.onopen = () => socket.send(JSON.stringify({ type: 'response.create', model, input: 'queued' }));
+        socket.onmessage = event => {
+          const value = JSON.parse(String(event.data)) as JsonRecord; seen.push(value);
+          if (value.type === 'response.in_progress') {
+            expect(calls).toBe(0);
+            if (transport === 'ws-stop') socket.send(JSON.stringify({ type: 'response.interrupt', response_id: (value.response as JsonRecord).id }));
+            else finish();
+          }
+          if (['response.completed', 'response.incomplete', 'error', 'response.failed'].includes(String(value.type))) {
+            controller.signal.removeEventListener('abort', abort); resolve();
+          }
+        };
+      });
+      expect(seen.at(-1)?.response).toMatchObject({ id: (seen.find(event => event.type === 'response.created')?.response as JsonRecord).id });
+    }
+    expect(calls).toBe(transport === 'ws-stop' ? 0 : 1);
+    expect(seen.at(-1)?.type).toBe(transport === 'ws-stop' ? 'response.incomplete' : 'response.completed');
+    if (transport !== 'ws-stop') expect(JSON.stringify(seen)).toContain('GPT_QUEUE_RECOVERED');
+  } finally { clearTimeout(timer); controller.abort(); ws?.close(); await app.close(); }
 });
