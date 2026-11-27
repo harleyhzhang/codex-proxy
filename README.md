@@ -573,9 +573,26 @@ another eligible account; output already delivered is never replayed.
 Completed reservations remain charged until that allowance has a newer
 provider observation. If reservations fill the pool, the router refreshes usage immediately
 (shared across callers, at most once every five seconds), then waits up to two minutes for room.
-Cancellation stops the wait. Actual quota, spending and authentication blocks still refuse locally;
+Cancellation stops the wait. Actual spending and authentication blocks still refuse locally;
 `smart-route-blocked` logs the account and reason. An unobserved window keeps its reserve even
 when response headers update a different window. Explicit account selections stay pinned.
+
+Paid credit fallback is opt-in per work candidate through `creditWeight` in `smart-routes.json`.
+Without that setting, exhausted included allowance still stops locally. With it, paid routing
+unlocks only when a fresh provider observation proves every account in that auto route has an
+exhausted included window. Reservations, missing/stale observations and an unavailable login
+with unspent allowance do not establish exhaustion. Any usable included allowance wins over
+paid credits, including personal allowance and a newly reset allowance in a warm conversation.
+
+In the paid stage, the router requires fresh provider permission to use credits and respects spend
+caps and authentication failures. It chooses the largest `creditWeight / (1 + reported spend +
+provisional pending turns)`, comparing the same currency only. A weight of 2 versus 1 favors
+that account while allowing the other to take more work as weighted spend catches up; it is a
+soft balancing preference, not a guaranteed spend ratio. Pending paid turns retain a provisional
+unit until the credit counter refreshes; partial quota headers cannot refresh that counter.
+Personal accounts never enter paid mode. The router does not change billing settings or caps.
+Delayed spend counters affect soft balancing only: fresh response headers confirming credit
+availability can keep paid work moving, using the last reported spend and provisional turns.
 
 ## Security
 

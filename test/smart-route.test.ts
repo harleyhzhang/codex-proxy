@@ -78,6 +78,10 @@ test('config loads routes and policy overrides, rejects bad slugs', () => {
   expect(loadSmartConfig(dir)).toBeUndefined();
   writeFileSync(join(dir, 'smart-routes.json'), JSON.stringify({ policy: { personalWeight: 0.5 }, routes: { 'auto-claude-opus-5-5': opus } }));
   expect(loadSmartConfig(dir)!.policy.personalWeight).toBe(0.5);
+  writeFileSync(join(dir, 'smart-routes.json'), JSON.stringify({ routes: { 'auto-claude-opus-5-5': [{ ...opus[0], creditWeight: 2 }] } }));
+  expect(loadSmartConfig(dir)!.routes['auto-claude-opus-5-5']![0]!.creditWeight).toBe(2);
+  writeFileSync(join(dir, 'smart-routes.json'), JSON.stringify({ routes: { 'auto-claude-opus-5-5': [{ ...opus[0], creditWeight: 0 }] } }));
+  expect(() => loadSmartConfig(dir)).toThrow('Invalid credit weight');
   writeFileSync(join(dir, 'smart-routes.json'), JSON.stringify({ routes: { 'claude-opus-5-5': opus } }));
   expect(() => loadSmartConfig(dir)).toThrow('Invalid smart route');
 });

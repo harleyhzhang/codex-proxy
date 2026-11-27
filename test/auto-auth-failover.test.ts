@@ -38,6 +38,28 @@ async function setup() {
 }
 const post = (app: Awaited<ReturnType<typeof fixtureRouter>>, body: unknown) => fetch(app.url('/v1/responses'), { method: 'POST', headers: AUTH_HEADERS, body: JSON.stringify(body) });
 
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: exhausted included budgets use preferred paid credits and immediately return to included allowance`, async () => {
+  const f = await setup();
+  try {
+    const configured = f.routing.router.config.routes[AUTO]!;
+    configured[0]!.creditWeight = 1; configured[1]!.creditWeight = 2;
+    for (const snapshot of Object.values(f.poller.snapshots())) {
+      snapshot!.windows[0]!.used = 1; snapshot!.overage = true;
+      snapshot!.credits = { enabled: true, used: 0, limit: null, currency: 'USD', observedAt: Date.now() / 1000, resetsAt: null };
+    }
+    f.providers[0]!.state.reply = () => say('INCLUDED_AGAIN');
+    f.providers[1]!.state.reply = () => say('PREFERRED_PAID');
+    const invoke = async () => {
+      const body = { model: AUTO, input: 'continue', prompt_cache_key: 'paid-warm', stream: transport === 'sse' };
+      return transport === 'ws' ? JSON.stringify(await socketTurn(f.app, body)) : (await post(f.app, body)).text();
+    };
+    expect(await invoke()).toContain('PREFERRED_PAID');
+    f.poller.snapshots()['fixture-0']!.windows[0]!.used = 0.2;
+    expect(await invoke()).toContain('INCLUDED_AGAIN');
+    expect(f.providers.map(provider => provider.messages().length)).toEqual([1, 1]);
+  } finally { await f.close(); }
+});
+
 for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: quota refusal at the last fraction moves to another account without invalidating login`, async () => {
   const f = await setup();
   try {

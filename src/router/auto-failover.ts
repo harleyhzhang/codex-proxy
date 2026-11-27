@@ -70,7 +70,7 @@ export class AutoFailover {
         body.model = selected.slug;
         if (Array.isArray(body.input)) body.input = body.input.filter(item => item.type !== 'reasoning');
       }
-      const finish = this.routing.router.reserve(body.model);
+      const finish = this.routing.router.reserve(body.model, selected.scores.find(s => s.slug === body.model)?.paid);
       let streaming = false;
       try {
         const result = await attempt();

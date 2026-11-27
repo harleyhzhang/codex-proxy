@@ -12,11 +12,15 @@ export type UsageSnapshot = {
   windows: UsageWindow[];
   /** Spending beyond the windows is billed (extra usage, credits). */
   overage?: boolean;
+  creditAccess?: { allowed: boolean; observedAt: number };
+  /** Provider-reported paid usage, in major currency units; separate from included windows. */
+  credits?: { enabled: boolean; used: number; limit: number | null; currency: string; observedAt: number; resetsAt: number | null };
+  creditReserved?: number;
   /** Hard stop reported by the provider (rejected, spend control reached), until `blockedUntil`. */
   blocked?: string;
   blockedUntil?: number | null;
 };
-export type Candidate = { slug: string; usage: string; tier: 'work' | 'personal' };
+export type Candidate = { slug: string; usage: string; tier: 'work' | 'personal'; creditWeight?: number };
 export type SmartPolicy = {
   personalWeight: number; // personal accounts are a buffer: their score is multiplied by this
   cap: number;            // a window far under pace cannot dominate beyond this headroom
@@ -39,7 +43,30 @@ export const DEFAULT_POLICY: SmartPolicy = {
   switchRatio: 1.25, reserveFraction: 0.02, shortReserveFraction: 0.1,
 };
 
-export type Score = { slug: string; usage: string; tier: string; usable: boolean; headroom: number; score: number; reason: string };
+export type Score = { slug: string; usage: string; tier: string; usable: boolean; headroom: number; score: number; reason: string; paid?: boolean };
+
+/** Budget exhaustion must be verified independently of reservations and credential health. */
+function usageProblem(snap: UsageSnapshot | undefined, now: number, p: SmartPolicy): string | undefined {
+  if (!snap) return 'no verified usage';
+  if (!Number.isFinite(snap.updatedAt) || now - snap.updatedAt > p.staleAfterSec || !snap.windows.length) return 'usage needs refresh';
+  for (const w of snap.windows) {
+    if (!Number.isFinite(w.observedAt ?? snap.updatedAt) || now - (w.observedAt ?? snap.updatedAt) > p.staleAfterSec || !Number.isFinite(w.used) || w.used < 0 || !Number.isFinite(w.minutes) || w.minutes <= 0 || (w.resetsAt != null && (!Number.isFinite(w.resetsAt) || w.resetsAt <= now))) return `${w.name} needs refresh`;
+  }
+}
+
+function creditScore(c: Candidate, snap: UsageSnapshot, now: number, p: SmartPolicy): Score {
+  const base: Score = { slug: c.slug, usage: c.usage, tier: c.tier, usable: false, headroom: 0, score: 0, reason: 'paid usage unavailable', paid: true };
+  if (c.tier !== 'work' || !c.creditWeight || c.creditWeight <= 0 || !snap.overage) return base;
+  if (snap.blocked && (snap.blockedUntil == null || snap.blockedUntil > now)) return { ...base, reason: snap.blocked };
+  const credit = snap.credits;
+  const access = snap.creditAccess ?? (credit ? { allowed: credit.enabled, observedAt: credit.observedAt } : undefined);
+  if (!access?.allowed || !Number.isFinite(access.observedAt) || now - access.observedAt > p.staleAfterSec) return { ...base, reason: 'credit availability needs refresh' };
+  if (credit && (!Number.isFinite(credit.used) || credit.used < 0 || !credit.currency)) return base;
+  if (credit?.limit != null && (!Number.isFinite(credit.limit) || credit.limit <= credit.used) && (credit.resetsAt == null || credit.resetsAt > now)) return { ...base, reason: 'credit spend limit reached' };
+  // Delayed spend telemetry affects soft balancing, not fresh provider permission to use credits.
+  const score = c.creditWeight / (1 + (credit?.used ?? 0) + (snap.creditReserved ?? 0));
+  return { ...base, usable: true, score, reason: 'paid credits' };
+}
 
 /**
  * Headroom = how far an account is under its even-spend pace: remaining fraction divided by the
@@ -52,12 +79,10 @@ export function scoreCandidate(c: Candidate, snap: UsageSnapshot | undefined, no
   if (!snap) return { ...base, usable: false, headroom: 0, score: 0, reason: 'no verified usage' };
   if (snap.blocked && (snap.blockedUntil == null || snap.blockedUntil > now))
     return { ...base, usable: false, headroom: 0, score: 0, reason: snap.blocked };
-  if (!Number.isFinite(snap.updatedAt) || now - snap.updatedAt > p.staleAfterSec || !snap.windows.length)
-    return { ...base, usable: false, headroom: 0, score: 0, reason: 'usage needs refresh' };
+  const problem = usageProblem(snap, now, p);
+  if (problem) return { ...base, usable: false, headroom: 0, score: 0, reason: problem };
   let headroom = p.cap, binding = 'under pace';
   for (const w of snap.windows) {
-    if (!Number.isFinite(w.observedAt ?? snap.updatedAt) || now - (w.observedAt ?? snap.updatedAt) > p.staleAfterSec || !Number.isFinite(w.used) || w.used < 0 || !Number.isFinite(w.minutes) || w.minutes <= 0 || (w.resetsAt != null && (!Number.isFinite(w.resetsAt) || w.resetsAt <= now)))
-      return { ...base, usable: false, headroom: 0, score: 0, reason: `${w.name} needs refresh` };
     const limit = w.minutes <= 360 ? p.shortBlockAt : snap.overage ? p.overageBlockAt : p.blockAt;
     if (w.used >= limit) return { ...base, usable: false, headroom: 0, score: 0, reason: `${w.name} ${Math.round(w.used * 100)}%` };
     const budgeted = w.used + (w.reserved ?? 0) + (w.requestReserve ?? 0);
@@ -71,14 +96,23 @@ export function scoreCandidate(c: Candidate, snap: UsageSnapshot | undefined, no
 
 /** Best usable candidate; ties keep list order. All blocked: a placeholder slug; dispatch must check its usable score. */
 export function rank(candidates: Candidate[], snaps: Record<string, UsageSnapshot | undefined>, now: number, p: SmartPolicy = DEFAULT_POLICY): { pick: string; scores: Score[] } {
-  const scores = candidates.map(c => scoreCandidate(c, snaps[c.usage], now, p));
+  let scores = candidates.map(c => scoreCandidate(c, snaps[c.usage], now, p));
+  // A busy/stale/unauthenticated pool is not evidence that every included budget is spent.
+  if (!scores.some(s => s.usable) && candidates.every(c => {
+    const snap = snaps[c.usage];
+    return snap && !usageProblem(snap, now, p) && snap.windows.some(w => w.used >= 1);
+  })) {
+    const paid = candidates.map(c => creditScore(c, snaps[c.usage]!, now, p));
+    const currencies = new Set(paid.filter(s => s.usable).map(s => snaps[s.usage]!.credits?.currency ?? 'USD'));
+    if (currencies.size <= 1 && paid.some(s => s.usable)) scores = paid;
+  }
   let best: Score | undefined;
   for (const s of scores) if (s.usable && (!best || s.score > best.score)) best = s;
   return { pick: (best ?? scores.find(s => s.tier === 'work') ?? scores[0]!).slug, scores };
 }
 
 type Sticky = { slug: string; at: number };
-type Reservation = { finished?: number; windows: Map<string, { amount: number; resetsAt: number | null }> };
+type Reservation = { finished?: number; windows: Map<string, { amount: number; resetsAt: number | null }>; paid: boolean };
 
 export class SmartRouter {
   private sticky = new Map<string, Sticky>();
@@ -94,12 +128,12 @@ export class SmartRouter {
 
   /** Reserve before dispatch, synchronously, so simultaneous chats cannot all spend the same room.
    * Keep completed work charged until a provider reading taken after completion accounts for it. */
-  reserve(slug: string): () => void {
+  reserve(slug: string, paid = false): () => void {
     const candidate = Object.values(this.config.routes).flat().find(c => c.slug === slug);
     if (!candidate) return () => {};
     const snapshot = this.budgetedSnapshots(true, false)[candidate.usage];
     const entries = this.reservations.get(candidate.usage) ?? new Set<Reservation>();
-    const entry: Reservation = { windows: new Map(snapshot?.windows.map(w => [w.name, { amount: this.nextReserve(w, snapshot!), resetsAt: w.resetsAt }])) };
+    const entry: Reservation = { paid, windows: new Map(snapshot?.windows.map(w => [w.name, { amount: this.nextReserve(w, snapshot!), resetsAt: w.resetsAt }])) };
     entries.add(entry); this.reservations.set(candidate.usage, entries);
     return () => { entry.finished ??= this.clock(); };
   }
@@ -117,7 +151,7 @@ export class SmartRouter {
     const snaps = { ...this.snapshots() };
     for (const [usage, entries] of this.reservations) {
       const snap = snaps[usage];
-      for (const entry of entries) if (entry.finished !== undefined && snap?.windows.length && snap.windows.every(w => (w.observedAt ?? snap.updatedAt) > entry.finished!)) entries.delete(entry);
+      for (const entry of entries) if (entry.finished !== undefined && snap?.windows.length && snap.windows.every(w => (w.observedAt ?? snap.updatedAt) > entry.finished!) && (!entry.paid || (snap.credits?.observedAt ?? 0) > entry.finished)) entries.delete(entry);
       if (!entries.size) { this.reservations.delete(usage); continue; }
       if (snap && includeReservations) snaps[usage] = { ...snap, windows: snap.windows.map(w => ({ ...w,
         reserved: [...entries].reduce((sum, entry) => {
@@ -126,6 +160,11 @@ export class SmartRouter {
           return sum + (held && held.resetsAt === w.resetsAt ? held.amount : (w.minutes <= 360 ? this.config.policy.shortReserveFraction : this.config.policy.reserveFraction));
         }, 0),
       })) };
+      if (snap && includeReservations) {
+        // A provisional unit per in-flight paid turn breaks ties while the actual spend read lags.
+        const current = snaps[usage]!;
+        snaps[usage] = { ...current, creditReserved: [...entries].filter(entry => entry.paid && (entry.finished === undefined || (snap.credits?.observedAt ?? 0) <= entry.finished)).length };
+      }
     }
     // Also budget the request being considered, including on an otherwise idle account.
     if (includeNext) for (const usage of new Set(Object.values(this.config.routes).flat().map(c => c.usage))) {
@@ -187,7 +226,9 @@ export function loadSmartConfig(stateDir: string): SmartConfig | undefined {
     if (!/^auto-[a-z0-9.-]+$/.test(slug) || !Array.isArray(list) || !list.length) throw new Error(`Invalid smart route ${slug}`);
     routes[slug] = list.map(entry => {
       if (!isRecord(entry) || typeof entry.slug !== 'string' || typeof entry.usage !== 'string' || (entry.tier !== 'work' && entry.tier !== 'personal')) throw new Error(`Invalid candidate in ${slug}`);
-      return { slug: entry.slug, usage: entry.usage, tier: entry.tier };
+      const creditWeight = num(entry.creditWeight);
+      if (entry.creditWeight !== undefined && (creditWeight === undefined || creditWeight <= 0)) throw new Error(`Invalid credit weight in ${slug}`);
+      return { slug: entry.slug, usage: entry.usage, tier: entry.tier, ...(creditWeight !== undefined ? { creditWeight } : {}) };
     });
   }
   return { policy, routes };

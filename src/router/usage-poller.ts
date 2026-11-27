@@ -19,6 +19,23 @@ const MONTH_MIN = 30 * 1440;
 const num = (v: unknown) => typeof v === 'number' && Number.isFinite(v) ? v : typeof v === 'string' && v.trim() && Number.isFinite(Number(v)) ? Number(v) : undefined;
 const epoch = (v: unknown) => num(v) ?? (typeof v === 'string' && !Number.isNaN(Date.parse(v)) ? Math.floor(Date.parse(v) / 1000) : null);
 
+function claudeCredits(body: Record<string, unknown>, now: number): UsageSnapshot['credits'] {
+  const spend = isRecord(body.spend) ? body.spend : undefined;
+  const extra = isRecord(body.extra_usage) ? body.extra_usage : undefined;
+  const amount = (v: unknown, exponent: unknown): number | undefined => {
+    const n = num(v), e = num(exponent) ?? 2;
+    return n !== undefined && e >= 0 && e <= 6 ? n / 10 ** e : undefined;
+  };
+  const usedObject = spend && isRecord(spend.used) ? spend.used : undefined;
+  const limitObject = spend && isRecord(spend.limit) ? spend.limit : undefined;
+  const used = usedObject ? amount(usedObject.amount_minor, usedObject.exponent) : amount(extra?.used_credits, extra?.decimal_places);
+  const limit = limitObject ? amount(limitObject.amount_minor, limitObject.exponent) : spend?.limit === null || extra?.monthly_limit === null ? null : amount(extra?.monthly_limit, extra?.decimal_places);
+  const enabled = typeof spend?.enabled === 'boolean' ? spend.enabled : extra?.is_enabled;
+  if (used === undefined || limit === undefined || typeof enabled !== 'boolean') return undefined;
+  const currency = typeof usedObject?.currency === 'string' ? usedObject.currency : typeof extra?.currency === 'string' ? extra.currency : 'USD';
+  return { enabled, used, limit, currency, observedAt: now, resetsAt: epoch(spend?.resets_at ?? extra?.resets_at) };
+}
+
 /** Native Codex `account/rateLimits/read` result → snapshot. */
 export function codexSnapshot(result: unknown, now: number): UsageSnapshot | undefined {
   const limits = isRecord(result) && isRecord(result.rateLimits) ? result.rateLimits : undefined;
@@ -54,7 +71,10 @@ export function claudeOauthSnapshot(body: unknown, now: number): UsageSnapshot |
     if (isRecord(w) && used !== undefined) windows.push({ name: key, used: used / 100, resetsAt: epoch(w.resets_at), minutes });
   }
   const extra = isRecord(body.extra_usage) ? body.extra_usage : {};
-  return { updatedAt: now, windows, overage: extra.is_enabled === true };
+  const credits = claudeCredits(body, now);
+  const enabled = credits?.enabled ?? (typeof extra.is_enabled === 'boolean' ? extra.is_enabled : undefined);
+  return { updatedAt: now, windows, overage: enabled === true,
+    ...(enabled !== undefined ? { creditAccess: { allowed: enabled, observedAt: now } } : {}), ...(credits ? { credits } : {}) };
 }
 
 /** The router's own per-response Claude snapshot (claude-*-usage.json) → snapshot. */
@@ -66,7 +86,8 @@ export function claudeRouterSnapshot(raw: unknown): UsageSnapshot | undefined {
     if (isRecord(w) && used !== undefined) windows.push({ name: key, used: used / 100, resetsAt: epoch(w.resets_at), minutes: num(w.window_minutes) ?? (key === 'five_hour' ? 300 : 10_080) });
   }
   const snap: UsageSnapshot = { updatedAt: num(raw.updated_at) ?? 0, windows, overage: raw.overage_status === 'allowed' };
-  if (raw.status === 'rejected') { snap.blocked = 'rejected'; snap.blockedUntil = Math.max(0, ...windows.map(w => w.resetsAt ?? 0)) || null; }
+  if (raw.overage_status === 'allowed' || raw.overage_status === 'rejected') snap.creditAccess = { allowed: raw.overage_status === 'allowed', observedAt: snap.updatedAt };
+  if (raw.status === 'rejected' && raw.overage_status !== 'allowed') { snap.blocked = 'rejected'; snap.blockedUntil = Math.max(0, ...windows.map(w => w.resetsAt ?? 0)) || null; }
   return snap;
 }
 
@@ -84,6 +105,8 @@ export function mergeUsageSnapshots(a: UsageSnapshot, b: UsageSnapshot): UsageSn
   const activeBlock = [newer, older].find(s => s.blocked && (s.blockedUntil == null || s.blockedUntil > newer.updatedAt));
   return { ...newer, updatedAt: newer.updatedAt, windows: [...windows.values()],
     overage: a.overage === true || b.overage === true,
+    ...(newer.credits ?? older.credits ? { credits: newer.credits ?? older.credits } : {}),
+    ...(newer.creditAccess ?? older.creditAccess ? { creditAccess: newer.creditAccess ?? older.creditAccess } : {}),
     ...(activeBlock ? { blocked: activeBlock.blocked, blockedUntil: activeBlock.blockedUntil } : {}),
   };
 }
