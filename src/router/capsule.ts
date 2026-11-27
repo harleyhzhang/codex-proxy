@@ -154,6 +154,36 @@ export function compactRequest(body: ResponsesBody): ResponsesBody {
   return { ...rest, input: [...input, developerText(COMPACT_INSTRUCTION)], tool_choice: 'none', stream: true };
 }
 
+const FALLBACK_ASSISTANT_CHARS = 24_000;
+const FALLBACK_ASSISTANT_MESSAGES = 12;
+
+/**
+ * A model-free continuation summary for when the summarizer itself is refused (an OpenAI safety
+ * classifier flagging the whole transcript). The capsule still carries every verbatim user request
+ * and the newest tool receipts; this adds the newest assistant messages so the receiving agent
+ * knows where the work stood. It never blocks the conversation the way a failed compaction does.
+ */
+export function fallbackSummary(input: ResponseInputItem[] = []): string {
+  const recent: string[] = [];
+  let chars = 0;
+  for (let i = input.length - 1; i >= 0 && recent.length < FALLBACK_ASSISTANT_MESSAGES; i--) {
+    const item = input[i]!;
+    if (item?.type !== undefined && item.type !== 'message') continue;
+    if (item?.role !== 'assistant') continue;
+    let text = plainText(item.content).trim();
+    if (!text || text.startsWith(SUMMARY_PREFIX)) continue;
+    if (chars + text.length > FALLBACK_ASSISTANT_CHARS) text = text.slice(0, Math.max(0, FALLBACK_ASSISTANT_CHARS - chars));
+    if (!text) break;
+    recent.unshift(text);
+    chars += text.length;
+  }
+  return [
+    'Automatic summary unavailable: the summarizer refused this transcript, so this handoff was assembled without a model.',
+    'Every verbatim user request and the newest tool receipts are preserved beside it. Re-check current state (files, git, open pages) before relying on earlier assumptions.',
+    recent.length ? `Newest assistant messages before compaction, oldest first:\n\n${recent.join('\n\n---\n\n')}` : 'No assistant messages were available.',
+  ].join('\n');
+}
+
 /** Decrypts an OpenAI-encrypted compaction through GPT; see CompactionBridge. */
 export type ForeignSummary = (encrypted: string) => Promise<string>;
 

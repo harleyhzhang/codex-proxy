@@ -1,5 +1,5 @@
 import { expect, test } from 'bun:test';
-import { compactRequest, portableSummary, restorePortableSummary, SummaryCodec } from '../src/router/capsule';
+import { compactRequest, fallbackSummary, portableSummary, restorePortableSummary, SummaryCodec } from '../src/router/capsule';
 import { AUTH_HEADERS, firstText, fixtureRouter, items } from './support';
 import type { ResponsesBody } from '../src/protocol/types';
 
@@ -74,4 +74,20 @@ test('GPT compaction and continuation preserve the resume boundary through the H
     expect(replay.at(-1)?.role).toBe('developer');
     expect(firstText(replay.at(-1))).toContain('Compaction is complete');
   } finally { await app.close(); }
+});
+
+test('a refused summarizer yields a model-free handoff that keeps requests, receipts and the newest replies', async () => {
+  const input = [
+    { role: 'user', content: 'Ship the fix and commit.' },
+    { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Patched router; tests pending.' }] },
+    { type: 'function_call', call_id: 'c1', name: 'exec', arguments: '{"cmd":"bun test"}' },
+    { type: 'function_call_output', call_id: 'c1', output: '310 pass' },
+  ];
+  const summary = fallbackSummary(input);
+  expect(summary).toContain('Automatic summary unavailable');
+  expect(summary).toContain('Patched router; tests pending.');
+  const restored = restorePortableSummary(portableSummary(summary, input));
+  expect(restored.some(item => firstText(item).includes('Ship the fix and commit.'))).toBe(true);
+  expect(restored.some(item => item.type === 'function_call_output')).toBe(true);
+  expect(restored.at(-1)?.role).toBe('developer');
 });

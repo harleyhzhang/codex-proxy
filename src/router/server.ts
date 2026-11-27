@@ -24,11 +24,11 @@ import { upstreamAdmission } from './admission';
 import { NativeAuth } from './auth';
 import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
 import { CompactionBridge, DEFAULT_BRIDGE_MODELS, dropForeignReasoning, normalizeAgentPayloads, normalizeToolSearchIds, restoreAgentMessages, type BridgeFlight } from './bridge';
-import { compactRequest, portableSummary, SummaryCodec } from './capsule';
+import { compactRequest, fallbackSummary, portableSummary, SummaryCodec } from './capsule';
 import { HistoryCache, HistoryMiss } from './history';
 import { CompletedItems, completionObserver, observeResponse } from './response-history';
 import { localResponse, prewarmLocal } from './local';
-import { connectUpstream, idleDeadline, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, upstreamStreamFailure, UpstreamStatusError, watchBody } from './upstream';
+import { connectUpstream, idleDeadline, isSafetyRefusal, jsonHeaders, postJson, relay, UPSTREAM_URL, type UpstreamErrorFields, type UpstreamFetch, upstreamFailure, upstreamHeaders, upstreamStreamFailure, UpstreamStatusError, watchBody } from './upstream';
 import { UpstreamSession, type UpstreamSessionOptions } from './upstream-session';
 
 export type RouterOptions = {
@@ -279,6 +279,25 @@ export function startRouter(options: RouterOptions) {
    * decides itself whether to go pending.
    */
   async function compact(body: ResponsesBody, headers: Headers, signal: AbortSignal, offline?: () => void): Promise<ResponseObject> {
+    try {
+      return await summarize(body, headers, signal, offline);
+    } catch (error) {
+      // A refused summarizer would otherwise wedge the chat: every retry resends the same flagged
+      // transcript. Seal a model-free handoff instead (verbatim requests, receipts, recent replies).
+      if (!codec || signal.aborted || !isSafetyRefusal(error)) throw error;
+      const input = Array.isArray(body.input) ? body.input : [];
+      log.warn('compact-safety-fallback', { status: (error as UpstreamStatusError).status, code: String((error as UpstreamStatusError).fields.code ?? '') });
+      return {
+        id: randomId('resp'),
+        object: 'response',
+        status: 'completed',
+        model: body.model,
+        output: [{ id: randomId('cmp'), type: 'compaction', encrypted_content: codec.seal(portableSummary(fallbackSummary(input), input)) }],
+      } as ResponseObject;
+    }
+  }
+
+  async function summarize(body: ResponsesBody, headers: Headers, signal: AbortSignal, offline?: () => void): Promise<ResponseObject> {
     signal.throwIfAborted();
     if (!codec) throw new Error('Local compaction key unavailable');
     const input = Array.isArray(body.input) ? body.input : [];

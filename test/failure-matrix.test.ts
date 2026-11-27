@@ -457,9 +457,11 @@ describe('gpt models × upstream failure modes', () => {
       const capped = await post(app, compaction);
       expect(capped.status).toBe(429); expect(calls).toBe(1);
       expect(((await capped.json()) as any).error).toMatchObject({ type: 'usage_limit_reached', plan_type: 'pro', resets_at: 1_900_000_000 });
+      // A refused summarizer must not wedge the chat: it falls back to a model-free capsule.
       reply = { status: 400, error: { type: 'invalid_request_error', code: 'cyber_policy', message: 'flagged' } };
-      const flagged = ((await (await post(app, compaction)).json()) as any).error;
-      expect(flagged.code).toBe('cyber_policy'); expect(flagged.message).toContain('flagged');
+      const flagged = await post(app, compaction);
+      expect(flagged.status).toBe(200);
+      expect(JSON.stringify(await flagged.json())).toContain('"type":"compaction"');
       reply = { status: 503, error: { type: 'server_error', code: 'server_is_overloaded', message: 'busy' } };
       const ws = await socketTurn(app, compaction);
       expect(ws).toMatchObject({ type: 'error', status: 503, error: { code: 'server_is_overloaded' } });
@@ -488,6 +490,12 @@ describe('gpt models × upstream failure modes', () => {
       const retryable = await post(app, compaction);
       expect(retryable.status).toBe(502);
       expect(((await retryable.json()) as any).error).toMatchObject({ code: 'server_error', message: 'OpenAI compaction failed: boom' });
+
+      // Regression (November 26): an OpenAI safety block mid-stream surfaced as a retried 502.
+      events = failed({ code: 'invalid_prompt', message: 'This request was blocked by our safety systems. Reason: Potentially unintended activity.' });
+      const blocked = await post(app, compaction);
+      expect(blocked.status).toBe(200);
+      expect(JSON.stringify(await blocked.json())).toContain('"type":"compaction"');
 
       events = failed({ code: 'context_length_exceeded', message: 'too long' });
       expect(await socketTurn(app, compaction)).toMatchObject({ type: 'error', status: 400, error: { code: 'context_length_exceeded' } });

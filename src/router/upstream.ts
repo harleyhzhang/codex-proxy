@@ -90,6 +90,13 @@ const CLASSIFYING_FIELDS = ['type', 'code', 'plan_type', 'resets_at', 'resets_in
 const QUOTA_CODES = new Set(['usage_limit_reached', 'rate_limit_exceeded', 'insufficient_quota']);
 const REQUEST_FAULT_CODES = new Set(['context_length_exceeded', 'invalid_prompt', 'cyber_policy', 'invalid_request_error']);
 
+/** OpenAI refused the content itself (safety classifier), not the account, network or request shape. */
+export function isSafetyRefusal(error: unknown): boolean {
+  if (!(error instanceof UpstreamStatusError)) return false;
+  const code = String(error.fields.code ?? '');
+  return code === 'cyber_policy' || /safety system|unintended activity/i.test(error.message);
+}
+
 /** An error inside a successful HTTP stream still owns its native classification. */
 export function upstreamStreamFailure(event: StreamEvent, operation: string): UpstreamStatusError {
   const response = isRecord(event.response) ? event.response : {};
