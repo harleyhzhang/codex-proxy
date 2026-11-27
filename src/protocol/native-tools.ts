@@ -1,7 +1,7 @@
 // Codex's client tools as plain function tools, for backends whose models make real tool calls (Cursor
 // SDK custom tools, xAI Responses). Custom (raw-input) tools take their whole input as the string field
 // `input`; namespaced names are flattened to identifier-safe keys and mapped back on the way out.
-import { isRecord, type JsonRecord } from '../json';
+import { isRecord, randomId, type JsonRecord } from '../json';
 import { COMPUTER_TOOL_NAME, TOOL_SEARCH_NAME, type ToolDescriptor } from './prompt';
 import { resolveSchemaRef } from './tool-schema';
 import type { ResponseInputItem, ToolCall } from './types';
@@ -148,6 +148,20 @@ export function codexToolCall(byKey: Map<string, ToolDescriptor>, name: string, 
     return { name: descriptor.proxyName, arguments: (isRecord(args) ? rawInput(args) : undefined) ?? raw, callId };
   }
   return { name: descriptor?.proxyName ?? name, arguments: raw, callId };
+}
+
+/**
+ * A call the model wrote as a transcript tag (see text-calls.ts), when it names a declared function or
+ * raw-input tool and, for a function tool, carries a JSON object. Anything else stays text.
+ */
+export function textToolCall(byKey: Map<string, ToolDescriptor>, name: string, body: string): ToolCall | undefined {
+  const entry = byKey.has(name) ? [name, byKey.get(name)!] as const : unambiguousTool(byKey, name);
+  if (!entry) return undefined;
+  const [key, descriptor] = entry;
+  if (descriptor.type === 'function') {
+    try { if (!isRecord(JSON.parse(body))) return undefined; } catch { return undefined; }
+  } else if (descriptor.type !== 'custom' || !body.trim()) return undefined;
+  return codexToolCall(byKey, key, body, randomId('call'));
 }
 
 /** Older history can use a bare name before Codex moves that tool into a namespace. Resolve

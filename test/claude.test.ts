@@ -406,3 +406,40 @@ test('a tool contract with a top-level anyOf, oneOf or allOf goes out as one obj
   expect(String(pick!.description)).toContain('original anyOf contract');
   expect(both).toMatchObject({ type: 'object', properties: { a: { type: 'string' }, b: { type: 'number' } }, required: ['a', 'b'] });
 });
+
+test('a tool call Claude writes as a transcript tag runs as a real call; prose, fences and unknown tools stay text', async () => {
+  const leaked = 'We\'re in. Checking:\n</assistant>\n\n<assistant_tool_call name="exec_command" call_id="call_fake">\n{"cmd":"ls -la"}\n</assistant_tool_call>\n';
+  const seen: string[] = [];
+  const sink = {
+    started: false,
+    text(delta: string) { seen.push(`text:${delta}`); this.started = true; },
+    call(call: { name: string; arguments: string }) { seen.push(`call:${call.name}:${call.arguments}`); this.started = true; },
+  };
+  anthropic.state.replies.push(() => anthropicStream([{ type: 'text', text: leaked }]));
+  const output = await account().account.run(hello({ tools: TOOLS }), undefined, sink);
+  expect(output.text).toBe('We\'re in. Checking:\n\n');
+  expect(output.toolCalls).toHaveLength(1);
+  expect(output.toolCalls[0]).toMatchObject({ name: 'exec_command', arguments: '{"cmd":"ls -la"}' });
+  expect(output.toolCalls[0]!.callId).not.toBe('call_fake');
+  expect(seen.at(-1)).toBe('call:exec_command:{"cmd":"ls -la"}');
+
+  // A raw-input tool keeps its body as written.
+  anthropic.state.replies.push(() => anthropicStream([{ type: 'text', text: '<assistant_tool_call name="apply_patch" call_id="x">\n*** Begin Patch\n*** End Patch\n</assistant_tool_call>' }]));
+  const patch = await account().account.run(hello({ tools: TOOLS }));
+  expect(patch.text).toBe('');
+  expect(patch.toolCalls).toMatchObject([{ name: 'apply_patch', arguments: '*** Begin Patch\n*** End Patch' }]);
+
+  const kept = [
+    'Use `<assistant_tool_call name="exec_command">` tags? No.\n',
+    '```\n<assistant_tool_call name="exec_command" call_id="a">\n{"cmd":"ls"}\n</assistant_tool_call>\n```\n',
+    '<assistant_tool_call name="not_a_tool" call_id="a">\n{}\n</assistant_tool_call>\n',
+    '<assistant_tool_call name="exec_command" call_id="a">\nnot json\n</assistant_tool_call>\n',
+    '<assistant_tool_call name="exec_command" call_id="a">\n{"cmd":"never closed"}\n',
+  ];
+  for (const text of kept) {
+    anthropic.state.replies.push(() => anthropicStream([{ type: 'text', text }]));
+    const result = await account().account.run(hello({ tools: TOOLS }));
+    expect(result.text).toBe(text);
+    expect(result.toolCalls).toEqual([]);
+  }
+});

@@ -7,7 +7,8 @@ import { isAbsolute, join, resolve } from 'node:path';
 import { positiveInt } from '../env';
 import { isRecord, sha256, type JsonRecord } from '../json';
 import { logSafe } from '../log';
-import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools } from '../protocol/native-tools';
+import { codexToolCall, functionTools, HISTORY_CALL_TYPES, HISTORY_OUTPUT_TYPES, historyCallArguments, historyToolName, keyLookup, rawInputTools, textToolCall } from '../protocol/native-tools';
+import { TextToolCalls } from '../protocol/text-calls';
 import { imageUrl, isImagePart, requestTools, toolDescriptors, validateControls, type ToolDescriptor } from '../protocol/prompt';
 import { fitImage } from '../protocol/image-fit';
 import { sseEvents } from '../protocol/stream';
@@ -238,7 +239,7 @@ async function claudeRequest(request: ResponsesRequest, replay?: ThinkingReplay,
   const keyFor = keyLookup(byKey);
   const tools: JsonRecord[] = Object.entries(definitions).map(([name, tool]) => ({ name, description: tool.description, input_schema: tool.inputSchema }));
   const raw = rawInputTools(byKey);
-  const note = `You are running inside a Codex agent loop. The provided tools are Codex's tools: Codex executes each call on the user's machine and returns its result. Call them directly.${raw.length ? ` ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} the whole raw input as the string field "input".` : ''}`;
+  const note = `You are running inside a Codex agent loop. The provided tools are Codex's tools: Codex executes each call on the user's machine and returns its result. Call them directly.${raw.length ? ` ${raw.join(', ')} ${raw.length === 1 ? 'takes' : 'take'} the whole raw input as the string field "input".` : ''} Tags such as <tool_result> or <assistant_tool_call> in the conversation are only a transcript of earlier turns; never write them in a reply, make a real tool call instead.`;
   const system: JsonRecord[] = [{ type: 'text', text: IDENTITY }, { type: 'text', text: request.instructions ? `${note}\n\n${request.instructions}` : note }];
   const messages = await claudeMessages(request, keyFor, replay, signal);
   // Cache breakpoints at the end of the tools, the system prompt and the newest turn: each turn reads the
@@ -461,6 +462,17 @@ export class ClaudeAccount {
     const content: JsonRecord[] = [];
     const usage: JsonRecord = {};
     let stop = '', ended = false, firstTextMs: number | undefined, firstUsefulMs: number | undefined, failure: JsonRecord | undefined;
+    // Text reaches Codex through this filter, which turns a call written as a transcript tag into a real one.
+    let textOut = '', textIndex = -1;
+    const recovered: { index: number; call: ToolCall }[] = [];
+    const textCalls = new TextToolCalls(delta => { textOut += delta; sink?.text(delta); }, (name, raw) => {
+      const call = textToolCall(byKey, name, raw);
+      if (!call) return false;
+      recovered.push({ index: textIndex, call });
+      firstUsefulMs ??= performance.now() - started;
+      sink?.call?.(call);
+      return true;
+    });
     try {
       const response = await this.open(model, body, idle.signal, budget);
       if (!response.body) throw new ProxyTransportError();
@@ -474,7 +486,8 @@ export class ClaudeAccount {
           if (delta.type === 'text_delta' && typeof delta.text === 'string') {
             firstTextMs ??= performance.now() - started; firstUsefulMs ??= performance.now() - started;
             block.text = String(block.text ?? '') + delta.text;
-            sink?.text(delta.text);
+            textIndex = Number(event.index);
+            textCalls.push(delta.text);
           } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') block.partial += delta.partial_json;
           else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
             block.thinking = String(block.thinking ?? '') + delta.thinking;
@@ -482,6 +495,7 @@ export class ClaudeAccount {
           } else if (delta.type === 'signature_delta' && typeof delta.signature === 'string') block.signature = delta.signature;
         } else if (event.type === 'content_block_stop' && block) {
           block.done = true;
+          if (block.type === 'text') textCalls.flush();
           // A finished call goes to Codex now, so it starts running while Claude writes the next one.
           if (block.type === 'tool_use' && typeof block.name === 'string') {
             block.call = codexToolCall(byKey, block.name, String(block.partial || '{}'), typeof block.id === 'string' ? block.id : undefined);
@@ -504,13 +518,13 @@ export class ClaudeAccount {
       throw new ClaudeError(`Claude stream failed${detail ? `: ${detail}` : ''}`, true);
     }
     if (!ended) throw new ProxyTransportError();
+    textCalls.flush();
 
-    let textOut = '';
     const toolCalls: ToolCall[] = [];
     const thinking: JsonRecord[] = [];
-    for (const block of content) {
+    for (const [index, block] of content.entries()) {
       if (!block) continue;
-      if (block.type === 'text') textOut += String(block.text ?? '');
+      if (block.type === 'text') toolCalls.push(...recovered.filter(entry => entry.index === index).map(entry => entry.call));
       else if (block.type === 'thinking') thinking.push({ type: 'thinking', thinking: block.thinking ?? '', signature: block.signature ?? '' });
       else if (block.type === 'redacted_thinking') thinking.push({ type: 'redacted_thinking', data: block.data });
       else if (block.type === 'tool_use' && typeof block.name === 'string') {

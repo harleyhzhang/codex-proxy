@@ -309,6 +309,14 @@ blocks it before it reaches Codex, including when its marker is split across str
 It retries once if nothing has streamed and no real tool call was made; otherwise it reports
 the malformed output without replaying actions. Printed markup is never executed as a tool.
 
+Claude sometimes imitates the router's own transcript format and writes a call as text
+(`<assistant_tool_call name="exec_command" …>{…}</assistant_tool_call>`), which Codex would show
+and then end the turn. Unlike Cursor's opaque protocol, this format names the tool and its exact
+arguments, so the Claude backend runs it as a real call when the whole block starts a line outside
+a code fence, names a declared function or raw-input tool, and (for a function tool) carries a JSON
+object; it gets a fresh call id. Stray `<assistant>`/`</assistant>` lines are dropped. Anything
+else stays visible text, and the system note tells Claude never to write these tags.
+
 Authenticate with the official [SDK browser login](https://cursor.com/docs/sdk/typescript#cursorauth).
 Run this once from the repository:
 
