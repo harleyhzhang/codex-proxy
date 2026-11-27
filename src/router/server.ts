@@ -19,7 +19,7 @@ import { decodeBody, MAX_BODY_BYTES, sseEvents } from '../protocol/stream';
 import { validateControls, requestTools, toolDescriptors } from '../protocol/prompt';
 import { assertToolDescriptions } from '../protocol/native-tools';
 import { EMPTY_OUTPUT, type OutputItem, type ResponseObject, type ResponsesBody, type StreamEvent, type ToolCall } from '../protocol/types';
-import { failureStream, transportError, transportFailureEvent } from '../transport';
+import { abortable, failureStream, transportError, transportFailureEvent } from '../transport';
 import { upstreamAdmission } from './admission';
 import { NativeAuth } from './auth';
 import { AccountUpstream, accountModel, standardPrimaryFetch, type AccountOptions } from './account-upstream';
@@ -195,7 +195,7 @@ export function startRouter(options: RouterOptions) {
   /** Replaces an auto slug with the chosen account's slug; a moved conversation drops account-bound reasoning. */
   async function routeAuto(raw: JsonRecord, headers: Headers, signal: AbortSignal): Promise<JsonRecord> {
     if (!smart?.isAuto(raw.model)) return raw;
-    await usagePoller?.ensureFresh();
+    await abortable(usagePoller?.ensureFresh() ?? Promise.resolve(), signal);
     const conversation = conversationFor(raw, headers);
     // Normalize using a provisional account, then queue/reserve at dispatch inside the progress
     // stream. Waiting here hid progress and prevented Stop while other chats held the allowance.

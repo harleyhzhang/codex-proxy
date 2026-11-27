@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createClaudeAccountBackend } from '../src/backends/claude';
-import { accountAuthRequired, BackendError, type SubscriptionBackend } from '../src/backends/contract';
+import { accountAuthRequired, BackendError, UsageLookupError, type SubscriptionBackend } from '../src/backends/contract';
 import { BACKENDS } from '../src/backends/registry';
 import type { JsonRecord } from '../src/json';
 import { pendingResponse } from '../src/protocol/pending';
@@ -550,4 +550,88 @@ for (const transport of ['sse', 'ws', 'ws-stop'] as const) test(`GPT ${transport
     expect(seen.at(-1)?.type).toBe(transport === 'ws-stop' ? 'response.incomplete' : 'response.completed');
     if (transport !== 'ws-stop') expect(JSON.stringify(seen)).toContain('GPT_QUEUE_RECOVERED');
   } finally { clearTimeout(timer); controller.abort(); ws?.close(); await app.close(); }
+});
+
+for (const transport of ['http', 'sse', 'ws'] as const) test(`${transport}: repeated usage lookup failures queue the turn until verified allowance returns`, async () => {
+  const f = await setup(10);
+  const wait = spyOn(f.routing.router, 'waitForCapacity').mockImplementation(async () => { await Bun.sleep(5); });
+  try {
+    for (const snapshot of Object.values(f.poller.snapshots())) snapshot!.updatedAt -= 600;
+    let refreshes = 0;
+    f.routing.refreshUsage = async () => {
+      if (++refreshes < 4) return; // Multiple throttled polls must not kill the turn.
+      f.poller.snapshots()['fixture-1']!.updatedAt = Date.now() / 1000;
+    };
+    f.providers[1]!.state.reply = () => say('TELEMETRY_RECOVERED');
+    const body = { model: AUTO, input: 'continue after telemetry outage', stream: transport === 'sse' };
+    const result = transport === 'ws' ? JSON.stringify(await socketTurn(f.app, body)) : await (await post(f.app, body)).text();
+    expect(result).toContain('TELEMETRY_RECOVERED');
+    expect(refreshes).toBe(4);
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 1]);
+  } finally { wait.mockRestore(); await f.close(); }
+});
+
+test('Stop cancels a stale-usage queue without dispatching or treating it as paid allowance', async () => {
+  const f = await setup();
+  const controller = new AbortController();
+  try {
+    for (const snapshot of Object.values(f.poller.snapshots())) {
+      snapshot!.updatedAt -= 600; snapshot!.overage = true;
+    }
+    f.routing.router.config.routes[AUTO]!.forEach(c => { c.creditWeight = 1; });
+    f.routing.refreshUsage = async () => {};
+    const failover = new AutoFailover(f.routing);
+    const pending = failover.select(AUTO, undefined, controller.signal);
+    setTimeout(() => controller.abort(new Error('stop waiting for usage')), 10);
+    await expect(pending).rejects.toThrow('stop waiting for usage');
+    expect(f.providers.map(p => p.messages().length)).toEqual([0, 0]);
+    expect(f.routing.router.resolve(AUTO).scores.some(s => s.paid)).toBe(false);
+    // Real exhaustion remains terminal, as does a missing refresh mechanism.
+    for (const snapshot of Object.values(f.poller.snapshots())) {
+      snapshot!.updatedAt = Date.now() / 1000; snapshot!.windows[0]!.used = 1; snapshot!.overage = false;
+    }
+    await expect(failover.select(AUTO)).rejects.toThrow('No eligible account');
+  } finally { controller.abort(); await f.close(); }
+});
+
+test('usage polling respects per-account backoff and Retry-After across concurrent chats, then recovers', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'usage-backoff-'));
+  let now = Date.now(), broken = true, reads = 0, healthyReads = 0;
+  const clock = spyOn(Date, 'now').mockImplementation(() => now);
+  const poller = new UsagePoller({ team: { kind: 'claude', configDir: '/fixture' }, healthy: { kind: 'claude', configDir: '/healthy' } }, dir, 60000, {
+    readClaudeUsage: async config => {
+      if (config === '/healthy') healthyReads++;
+      else { reads++; if (broken) throw new UsageLookupError(429, '60'); }
+      return { seven_day: { utilization: 10 } };
+    },
+  });
+  try {
+    await poller.poll();
+    now += 5000;
+    await Promise.all(Array.from({ length: 50 }, () => poller.refreshForAdmission()));
+    expect(reads).toBe(1); expect(healthyReads).toBe(2);
+    expect(poller.snapshots().team).toBeUndefined();
+    broken = false; now += 55000;
+    await poller.refreshForAdmission();
+    expect(reads).toBe(2);
+    expect(poller.snapshots().team?.windows[0]?.used).toBe(0.1);
+    // A success clears old failure backoff immediately.
+    now += 5000; await poller.refreshForAdmission(); expect(reads).toBe(3);
+  } finally { clock.mockRestore(); await rm(dir, { recursive: true, force: true }); }
+});
+
+test('Retry-After zero uses exponential backoff rather than immediately hammering the usage endpoint', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'usage-zero-backoff-'));
+  let now = Date.now(), reads = 0;
+  const clock = spyOn(Date, 'now').mockImplementation(() => now);
+  const poller = new UsagePoller({ team: { kind: 'claude', configDir: '/fixture' } }, dir, 60000, {
+    readClaudeUsage: async () => { reads++; throw new UsageLookupError(429, '0'); },
+  });
+  try {
+    await poller.poll(); await poller.poll(); expect(reads).toBe(1);
+    now += 5000; await poller.poll(); expect(reads).toBe(2);
+    now += 5000; await poller.poll(); expect(reads).toBe(2);
+    now += 5000; await poller.poll(); expect(reads).toBe(3);
+    expect(poller.snapshots().team).toBeUndefined();
+  } finally { clock.mockRestore(); await rm(dir, { recursive: true, force: true }); }
 });

@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { isRecord } from '../json';
 import { logSafe } from '../log';
 import { nativeAccountRequest } from './account-upstream';
-import { AccountAuthenticationError, accountAuthRequired } from '../backends/contract';
+import { AccountAuthenticationError, accountAuthRequired, UsageLookupError } from '../backends/contract';
 import type { UsageSnapshot, UsageWindow } from './smart-route';
 
 export type UsageSource =
@@ -127,6 +127,7 @@ export class UsagePoller {
   private polling?: Promise<void>;
   private lastAttempt = 0;
   private lastAdmissionRefresh = 0;
+  private failures = new Map<string, { count: number; retryAt: number }>();
   constructor(private sources: Record<string, UsageSource>, private stateDir: string, private intervalMs = 5 * 60_000,
     private options: { readClaudeUsage?: (configDir: string) => Promise<unknown>; authFailureCommand?: string[]; authRecoveryCommand?: string[] } = {}) {
     try { const saved: unknown = JSON.parse(readFileSync(join(stateDir, 'usage-snapshots.json'), 'utf8')); if (isRecord(saved)) this.polled = saved as Record<string, UsageSnapshot>; } catch {}
@@ -203,6 +204,7 @@ export class UsagePoller {
     const now = Math.floor(Date.now() / 1000);
     this.lastAttempt = now;
     await Promise.all(Object.entries(this.sources).map(async ([id, source]) => {
+      if ((this.failures.get(id)?.retryAt ?? 0) > Date.now()) return;
       const health = this.unhealthy[id];
       try {
         let snap: UsageSnapshot | undefined;
@@ -214,17 +216,23 @@ export class UsagePoller {
             if (!token) throw accountAuthRequired('Claude login unavailable');
             const res = await fetch('https://api.anthropic.com/api/oauth/usage', { headers: { authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', 'user-agent': 'codex-subscription-proxy-usage/1.0' }, signal: AbortSignal.timeout(15_000) });
             if (res.status === 401) { await res.body?.cancel(); throw accountAuthRequired('Claude login rejected'); }
-            if (!res.ok) { await res.body?.cancel(); logSafe('usage-poll', { account: id, status: res.status }); return; }
+            if (!res.ok) { await res.body?.cancel(); throw new UsageLookupError(res.status, res.headers.get('retry-after')); }
             snap = claudeOauthSnapshot(await res.json(), now);
           }
         }
-        if (!snap) return;
+        if (!snap?.windows.length) throw new Error('Usage windows unavailable');
+        this.failures.delete(id);
         this.polled[id] = this.polled[id] ? mergeUsageSnapshots(this.polled[id]!, snap) : snap;
         if (health && this.unhealthy[id] === health) { delete this.unhealthy[id]; this.saveHealth(); logSafe('account-auth-recovered', { account: id }); this.notifyAuth(id, true); }
         appendFileSync(join(this.stateDir, 'usage-history.jsonl'), JSON.stringify({ at: now, account: id, snapshot: snap }) + '\n');
       } catch (error) {
         if (error instanceof AccountAuthenticationError) this.markAuthFailure(id);
-        logSafe('usage-poll', { account: id, failed: true });
+        const count = (this.failures.get(id)?.count ?? 0) + 1;
+        // Admission callers share this per-account backoff. A storm of chats must not prolong a 429.
+        const delay = Math.max(Math.min(300_000, 5000 * 2 ** Math.min(count - 1, 6)), error instanceof UsageLookupError ? error.retryAfterMs ?? 0 : 0);
+        this.failures.set(id, { count, retryAt: Date.now() + delay });
+        logSafe('usage-poll', { account: id, failed: true, status: error instanceof UsageLookupError ? error.status : undefined,
+          failure: error instanceof AccountAuthenticationError ? 'authentication' : error instanceof UsageLookupError ? 'http' : 'unavailable', retry_ms: delay, at: now });
       }
     }));
     try { writeFileSync(join(this.stateDir, 'usage-snapshots.json'), JSON.stringify(this.polled, null, 2)); } catch {}

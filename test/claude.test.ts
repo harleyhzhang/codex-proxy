@@ -4,7 +4,7 @@ import { afterAll, beforeEach, expect, spyOn, test } from 'bun:test';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { ClaudeAccount, claudeBackend, claudeMessages, resolveModel } from '../src/backends/claude';
 import { ClaudeUsageLimitError } from '../src/backends/claude-limits';
-import { type BackendError, estimateVisibleTokens } from '../src/backends/contract';
+import { type BackendError, estimateVisibleTokens, UsageLookupError } from '../src/backends/contract';
 import type { JsonRecord } from '../src/json';
 import type { ResponsesRequest } from '../src/protocol/types';
 import { compactRequest } from '../src/router/capsule';
@@ -12,7 +12,7 @@ import { ProxyTransportError } from '../src/transport';
 import { anthropicFixture, anthropicStream, limitHeaders } from './anthropic-fixture';
 
 const anthropic = anthropicFixture();
-const defaults = { profile: anthropic.state.profile, refresh: anthropic.state.refresh, reply: anthropic.state.reply };
+const defaults = { profile: anthropic.state.profile, refresh: anthropic.state.refresh, reply: anthropic.state.reply, usage: anthropic.state.usage };
 afterAll(() => anthropic.stop());
 beforeEach(() => {
   anthropic.state.seen.length = 0; anthropic.state.replies.length = 0; anthropic.state.refreshes = 0;
@@ -286,6 +286,17 @@ test('usage polling and inference share one refresh, and a profile-rejected toke
     : Response.json({ account: { email: 'work@example.com' }, organization: { uuid: 'org_work' } });
   expect((await account({ expectedEmail: 'work@example.com' }).account.run(hello())).text).toBe('CLAUDE_OK');
   expect(checks).toBe(2); expect(anthropic.state.refreshes).toBe(1);
+});
+
+test('usage endpoint throttling preserves backoff metadata and does not invalidate inference login', async () => {
+  const { account: claude } = account();
+  anthropic.state.usage = () => new Response('{}', { status: 429, headers: { 'retry-after': '60' } });
+  let failure: unknown;
+  try { await claude.readUsage(); } catch (error) { failure = error; }
+  expect(failure).toBeInstanceOf(UsageLookupError);
+  expect(failure).toMatchObject({ status: 429, retryAfterMs: 60_000 });
+  expect((await claude.run(hello())).text).toBe('CLAUDE_OK');
+  expect(anthropic.state.refreshes).toBe(0);
 });
 
 test('a token Anthropic rejects is refreshed once; a rejected refresh or missing login asks for a new sign-in', async () => {

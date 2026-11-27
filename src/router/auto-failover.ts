@@ -22,13 +22,17 @@ export class AutoFailover {
   private queues = new Map<string, Promise<void>>();
   constructor(private routing: AutoRouting) {}
 
-  /** An exhausted local reserve is backpressure, not an exhausted subscription. */
+  /** Reservations and unavailable usage telemetry are backpressure, not exhausted subscriptions. */
   async select(auto: string, conversation?: string, signal?: AbortSignal) {
     let refreshed = false;
+    let waitingForUsage = false;
     for (;;) {
       signal?.throwIfAborted();
       const selected = this.routing.router.resolve(auto, conversation);
-      if (selected.scores.some(s => s.usable)) return selected;
+      if (selected.scores.some(s => s.usable)) {
+        if (waitingForUsage) logSafe('smart-route-usage-recovered', { auto });
+        return selected;
+      }
       if (!refreshed && this.routing.refreshUsage) {
         logSafe('smart-route-refresh', { auto });
         await abortable(this.routing.refreshUsage(), signal);
@@ -36,7 +40,9 @@ export class AutoFailover {
         continue;
       }
       const pressure = this.routing.router.reservationBlocked(auto);
-      if (pressure) {
+      const stale = selected.scores.some(s => s.reason === 'no verified usage' || s.reason.endsWith('needs refresh'));
+      if (pressure || stale && this.routing.refreshUsage) {
+        if (stale && !waitingForUsage) { logSafe('smart-route-usage-wait', { auto }); waitingForUsage = true; }
         await this.routing.router.waitForCapacity(signal);
         if (this.routing.refreshUsage) await abortable(this.routing.refreshUsage(), signal);
         continue;

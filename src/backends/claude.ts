@@ -19,7 +19,7 @@ import { abortable, ProxyTransportError, sleep } from '../transport';
 import { RetryBudget } from './retries';
 import { Admission } from './admission';
 import { claudeLimits, ClaudeUsageLimitError, ClaudeUsageLimits, rateLimitInfo } from './claude-limits';
-import { AccountAuthenticationError, accountAuthRequired, BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, type SubscriptionBackend } from './contract';
+import { AccountAuthenticationError, accountAuthRequired, BackendError, CONTEXT_OVERFLOW_TEXT, contextOverflowError, OVERLOADED_TEXT, overloadedError, retryOnce, UsageLookupError, type SubscriptionBackend } from './contract';
 
 const MODEL_ALIASES: Readonly<Record<string, string>> = { opus: 'claude-opus-5-5', sonnet: 'claude-sonnet-5-5', haiku: 'claude-haiku-5-5' };
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
@@ -397,7 +397,7 @@ export class ClaudeAccount {
       await response.body?.cancel();
       if (response.status === 401 && attempt === 0) { token = await this.authorize(undefined, token); continue; }
       if (response.status === 401) throw signedOut(this.options.configDir);
-      throw new ClaudeError(`Claude usage lookup failed (HTTP ${response.status})`);
+      throw new UsageLookupError(response.status, response.headers.get('retry-after'));
     }
   }
 

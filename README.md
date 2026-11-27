@@ -587,6 +587,14 @@ frames flowing while queued, and cancellation removes only that waiter. Actual s
 `smart-route-blocked` logs the account and reason. An unobserved window keeps its reserve even
 when response headers update a different window. Explicit account selections stay pinned.
 
+If usage telemetry is missing or stale and a refresh source is configured, auto requests also
+stay queued until an eligible account has verified usage again. A failed lookup does not mean
+the subscription is exhausted. The queue remains cancellable and keeps streaming heartbeats;
+an extended telemetry outage can therefore leave the request waiting until recovery or Stop.
+Polling failures use shared per-account exponential backoff (five seconds to five minutes),
+respect `Retry-After`, and log only status, failure category and retry timing. Healthy accounts
+keep polling independently. Stale observations never authorize dispatch or paid fallback.
+
 Paid credit fallback is opt-in per work candidate through `creditWeight` in `smart-routes.json`.
 Without that setting, exhausted included allowance still stops locally. With it, paid routing
 unlocks only when a fresh provider observation proves every account in that auto route has an

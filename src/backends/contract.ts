@@ -74,6 +74,19 @@ export function accountAuthRequired(message: string): AccountAuthenticationError
   return new AccountAuthenticationError(message);
 }
 
+/** Usage telemetry can be throttled independently of inference. Keep status/backoff without bodies. */
+export class UsageLookupError extends Error {
+  readonly retryAfterMs?: number;
+  constructor(readonly status: number, retryAfter: string | null = null) {
+    super(`Usage lookup failed (HTTP ${status})`);
+    if (retryAfter !== null) {
+      const seconds = Number(retryAfter);
+      const delay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+      if (Number.isFinite(delay) && delay >= 0) this.retryAfterMs = delay;
+    }
+  }
+}
+
 /**
  * The one retry policy every backend shares. A retryable refusal is a provider-side transient failure
  * before anything reached Codex, so one fresh attempt is safe; text Codex already shows rules it out.
