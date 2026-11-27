@@ -141,19 +141,27 @@ describe.skipIf(!codexBin)('native Codex end to end through the router', () => {
       Object.assign(backend, team.backend);
       const app = await fixtureRouter();
       try {
-        let declared = false, receivedResult = false;
+        let declared = false, receivedResult = false, execName = 'functions_exec', polls = 0;
         anthropic.state.replies.push(body => {
           const tools = body.tools as { name: string; input_schema: unknown }[];
           const exec = tools.find(tool => tool.name === 'functions_exec' || tool.name === 'exec');
-          declared = !!exec;
-          return anthropicStream([{ type: 'tool_use', id: 'toolu_native_exec', name: exec?.name ?? 'functions_exec', input: { input: 'text(await tools.exec_command({cmd: "printf CODE_MODE_TOOL_OK"}));' } }], 'tool_use');
+          declared = !!exec; execName = exec?.name ?? 'functions_exec';
+          return anthropicStream([{ type: 'tool_use', id: 'toolu_native_exec', name: exec?.name ?? 'functions_exec', input: { input: 'text(await tools.exec_command({cmd: "printf CODE_MODE_TOOL_OK", login: false, yield_time_ms: 1000}));' } }], 'tool_use');
         });
-        anthropic.state.replies.push(body => {
+        anthropic.state.reply = body => {
           const messages = body.messages as { content: { type: string; content?: unknown }[] }[];
-          receivedResult = messages.flatMap(message => message.content)
-            .some(block => block.type === 'tool_result' && JSON.stringify(block.content).includes('CODE_MODE_TOOL_OK'));
-          return say(receivedResult ? 'CODE_MODE_VERIFIED' : 'MISSING_RESULT');
-        });
+          const result = messages.flatMap(message => message.content).filter(block => block.type === 'tool_result').at(-1);
+          const content = result?.content;
+          const text = Array.isArray(content) ? content.filter(isRecord).map(block => typeof block.text === 'string' ? block.text : '').join('\n') : String(content ?? '');
+          receivedResult = text.includes('CODE_MODE_TOOL_OK');
+          if (receivedResult) return say('CODE_MODE_VERIFIED');
+          // Shell startup can yield a session instead of output on a busy machine. Behave like a
+          // real tool loop: poll that same command, rather than treating a pending result as loss.
+          const session = /"session_id"\s*:\s*(\d+)/.exec(text)?.[1];
+          if (session && ++polls < 20) return anthropicStream([{ type: 'tool_use', id: `toolu_native_poll_${polls}`, name: execName,
+            input: { input: `text(await tools.write_stdin({session_id: ${Number(session)}, chars: "", yield_time_ms: 1000}));` } }], 'tool_use');
+          return say('MISSING_RESULT');
+        };
         const run = await runCodex(app.url('/'), 'Use the provided tool, then report its result.', { model: `fixture-team-${model}`, codeMode: true });
         expect(declared).toBe(true);
         expect(receivedResult).toBe(true);
